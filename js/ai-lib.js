@@ -65,8 +65,12 @@ export const PACKAGES = {
       ],
     },
     cpu: 'q8', // the q4 exports use GatherBlockQuantized, which only the WebGPU backend implements
+    // Prompts stay short: the export computes scores for its whole 65,536-word vocabulary at every
+    // prompt position, so a 3,000-token prompt needs about 0.4–0.8 GB on top of the weights, which
+    // made iOS end the app. Long pages are summarised in parts of `partChars` instead.
     maxInputChars: 12_000,
-    contextChars: 6_000,
+    partChars: 2_400,
+    contextChars: 2_500,
   },
   bge: {
     id: 'bge',
@@ -93,7 +97,7 @@ export const PACKAGES = {
     experimental: true,
     name: 'LFM2.5 2.6B (experimental)',
     short: 'LFM2.5 2.6B',
-    role: 'Higher quality for longer summaries, comparisons and synthesis. May be too big for a phone browser: watch the diagnostics.',
+    role: 'Higher quality for longer summaries, comparisons and synthesis. Too big for an iPhone: on a test iPhone, iOS ended the app while loading it. For computers and large tablets.',
     repo: 'LiquidAI/LFM2.5-2.6B-ONNX',
     revision: '66826372fd4fa166f53be0371c9315745c07cace',
     license: 'LFM Open License 1.0',
@@ -116,8 +120,9 @@ export const PACKAGES = {
       ],
     },
     cpu: null, // no export of this model runs on the CPU backend (its 8-bit one is 3.9 GB)
-    maxInputChars: 16_000,
-    contextChars: 8_000,
+    maxInputChars: 12_000,
+    partChars: 2_400,
+    contextChars: 2_500,
   },
 };
 
@@ -360,6 +365,29 @@ export function summaryMessages(title, text) {
         'You summarise web pages for someone reading on a phone. Write 3 to 5 short bullet points, each starting with "- ", covering the main points. Then one line starting with "In short:". Use only the page text. Do not add facts.',
     },
     { role: 'user', content: `Page title: ${title}\n\nPage text:\n${text}` },
+  ];
+}
+
+/** Notes on one part of a long page, to be combined by combineMessages. */
+export function partMessages(title, text, i, n) {
+  return [
+    {
+      role: 'system',
+      content: 'You take brief notes on part of a web page. Write 2 or 3 short bullet points, each starting with "- ", with the main facts in this part. Use only the text given.',
+    },
+    { role: 'user', content: `Page title: ${title}\nPart ${i} of ${n}:\n${text}` },
+  ];
+}
+
+/** Turns the notes from every part into the final summary. */
+export function combineMessages(title, notes) {
+  return [
+    {
+      role: 'system',
+      content:
+        'You summarise web pages for someone reading on a phone, from notes on each part of the page. Write 3 to 5 short bullet points, each starting with "- ", covering the main points of the whole page. Then one line starting with "In short:". Use only the notes.',
+    },
+    { role: 'user', content: `Page title: ${title}\n\nNotes:\n${notes.map((x, i) => `Part ${i + 1}:\n${x.trim()}`).join('\n\n')}` },
   ];
 }
 

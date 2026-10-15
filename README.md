@@ -38,14 +38,14 @@ Open **Settings → On-device AI** (`#/ai`). Nothing downloads until you tap Dow
 |---|---|---|
 | LFM2.5 1.2B Instruct | Primary: summaries and answers | 764 MB (q4f16), 854 MB (q4 without 16-bit floats) |
 | BGE small en v1.5 | Finds saved passages by meaning; runs on the CPU | 35 MB |
-| LFM2.5 2.6B (experimental) | Better summaries and synthesis; may be too big for a phone browser | 1.53 GB |
+| LFM2.5 2.6B (experimental) | Better summaries and synthesis; too big for an iPhone (iOS ended the app while loading it) | 1.53 GB |
 | AI engine | Transformers.js and ONNX Runtime, needed by all | 27 MB (about 6 MB on the wire) |
 
 Without WebGPU, the 1.2B model downloads its 8-bit CPU version (1.5 GB, slow) and the 2.6B can't run. The `q4` exports only work on WebGPU.
 
 What it does:
 
-1. **Summarise:** a button on every reader page, or automatically when a page loads (setting). It summarises up to the first 12,000 characters (16,000 for the 2.6B). Summaries are kept with the page.
+1. **Summarise:** a button on every reader page, or automatically when a page loads (setting). It summarises up to the first 12,000 characters. Pages longer than 2,400 characters are read in parts: short notes on each, then a summary of the notes. Summaries are kept with the page.
 2. **Ask, from saved pages and searches** (`#/ask`): passages from pages read in the reader and from search results are matched by keyword (BM25), and by meaning when BGE is downloaded. The two lists are combined, and the model answers from the best few, citing them as [1], [2], linking to the saved copies. Without a chat model, the matching passages are shown.
 3. **Ask, from the model's own knowledge:** no sources, labelled as possibly wrong (training data to mid-2024).
 
@@ -62,7 +62,14 @@ Diagnostics on the AI page:
 
 Files: `js/ai.js` (page side: downloads, worker, log, retrieval), `js/ai-engine.js` (runs the models, in `js/ai-worker.js` or on the page if WebGPU only works there), `js/ai-store.js` (IndexedDB `sparse-ai`), `js/ai-lib.js` (catalog, chunking, BM25, prompts; tested).
 
-Tested in desktop Chrome: downloads with pause/resume, BGE, and the 1.2B model on WebGPU. **Not yet tested on an iPhone**, where memory limits decide which models fit.
+**Memory on iPhone:**
+- These exports compute a score for every word in the 65,536-word vocabulary at every prompt position. A 3,000-token prompt therefore needs about 0.4–0.8 GB beyond the 764 MB of weights, and iOS ended the app.
+- So prompts are kept to about 600–700 tokens: summaries are made in parts, and answers use about 2,500 characters of saved text.
+- After any prompt over 900 tokens, the model is unloaded to give the memory back. Reloading takes about 3 s.
+
+**Measured on an iPhone, WebGPU with 16-bit floats:**
+- The 1.2B model loads in about 2.8 s and writes 10–23 tokens a second.
+- BGE indexed 344 saved passages in 57 s. That happens once; the results are kept.
 
 ## Activity and network details
 

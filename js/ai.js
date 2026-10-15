@@ -362,6 +362,12 @@ export async function generate(id, messages, { maxTokens = 400, onToken, label =
     r.lastRun = { ...stats, at: Date.now(), label };
     await save(r);
     await log('ok', 'run', `${P[id].short} (${label}): ${AL.describeRun(stats)}`, { pkg: id });
+    // GPU memory used for a long prompt stays reserved after the run; reloading (about 3 s) frees it.
+    if (stats.promptTokens > 900) {
+      current = null;
+      await unload(id).catch(() => {});
+      await log('info', 'memory', `Unloaded ${P[id].short} after a ${stats.promptTokens}-token prompt, to give back the memory it used`, { pkg: id });
+    }
     return stats;
   } catch (e) {
     await noteFailure(id, 'run', e);

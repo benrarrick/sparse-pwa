@@ -102,7 +102,11 @@ export function createEngine(post) {
       const device = await T.env.backends.onnx.webgpu?.device;
       if (!device || device.__sparseWatched) return;
       device.__sparseWatched = true;
-      device.lost.then((info) => log('error', `The GPU device was lost (${info.reason || 'no reason given'}): ${info.message || 'no message'}. Loaded models need reloading.`));
+      device.lost.then((info) =>
+        info.reason === 'destroyed'
+          ? log('info', 'GPU memory released (the model was unloaded)')
+          : log('error', `The GPU device was lost (${info.reason || 'no reason given'}): ${info.message || 'no message'}. Loaded models need reloading.`),
+      );
       device.addEventListener?.('uncapturederror', (ev) => log('error', `GPU error: ${ev.error?.message ?? ev.error}`, { pkg }));
     } catch (e) {
       log('warn', `Could not watch the GPU device: ${e?.message ?? e}`);

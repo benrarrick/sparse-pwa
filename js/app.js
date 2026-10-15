@@ -1236,7 +1236,27 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
   act.step(
     `${auto ? 'Summarising automatically (Settings)' : 'Summarising'} with ${spec.short} on this device: ${t.cut ? `the first ${t.text.length.toLocaleString()} of ${t.of.toLocaleString()} characters` : `${t.text.length.toLocaleString()} characters`}. Nothing is sent anywhere.`,
   );
-  const r = await runModel(pkg, AL.summaryMessages(rec.title, t.text), { out, status, act, id, maxTokens: 320, label: 'summary' });
+  let messages = AL.summaryMessages(rec.title, t.text);
+  if (t.text.length > spec.partChars) {
+    // Long pages: short notes on each part, then a summary of the notes, so no prompt is long
+    // enough to need more memory than iOS allows.
+    const parts = AL.passages(t.text, spec.partChars);
+    act.step(`The page is long, so it is read in ${parts.length} parts: notes on each, then a summary of the notes`);
+    const notes = [];
+    for (const [i, part] of parts.entries()) {
+      if (id !== renderId) return;
+      const scratch = h('div');
+      const pStatus = h('span');
+      fill(out, h('p', { class: 'muted' }, `Reading part ${i + 1} of ${parts.length}… `, pStatus));
+      const n = await runModel(pkg, AL.partMessages(rec.title, part, i + 1, parts.length), { out: scratch, status: pStatus, act, id, maxTokens: 120, label: `summary part ${i + 1}/${parts.length}` });
+      if (!n) return fill(status, pStatus.childNodes.length ? [...pStatus.childNodes] : 'The AI failed.');
+      if (n.stats.stopped) return fill(status, 'Stopped.');
+      notes.push(n.text);
+    }
+    messages = AL.combineMessages(rec.title, notes);
+    fill(out);
+  }
+  const r = await runModel(pkg, messages, { out, status, act, id, maxTokens: 320, label: 'summary' });
   if (r?.text.trim() && !r.stats.stopped) {
     await AI.saveSummary(url, pkg, { text: r.text, at: Date.now(), stats: r.stats, cut: t.cut, chars: t.text.length, of: t.of });
     act.ok('Summary kept on this device with the page');
