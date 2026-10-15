@@ -7,6 +7,9 @@
 //   #/ai          on-device AI: downloads, device checks, diagnostics (all opt-in)
 //   #/ask?q=      ask the on-device AI, from saved pages and searches or on its own
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
+// Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
+// BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
+const APP_VERSION = '2.0';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -596,6 +599,7 @@ async function showHome(id) {
       h('code', null, '!bang'),
       ' to search on DuckDuckGo',
     ),
+    h('p', { class: 'muted small', id: 'version' }, `Sparse v${APP_VERSION}`),
     h(
       'section',
       { class: 'data' },
@@ -2088,6 +2092,7 @@ async function showAI(id) {
           h('details', null, h('summary', { class: 'small' }, 'Why this diagnosis'), h('ul', { class: 'small' }, interruption.reasons.map((r) => h('li', null, r)))),
         )
       : null,
+    h('p', { class: 'small' }, h('a', { href: '#/ai-lab' }, 'AI lab'), ' (experimental model tests, separate from the above)'),
     h('h2', null, 'Status now'),
     statusBox,
     h('h2', null, 'Models'),
@@ -2433,6 +2438,8 @@ function route() {
       return showAI(id);
     case '/ask':
       return showAsk(id, p.get('q') ?? '');
+    case '/ai-lab': // experimental model tests; separate from the app's AI
+      return import('./ai-lab.js').then((m) => id === renderId && m.showLab(main, APP_VERSION));
     default:
       return showHome(id);
   }

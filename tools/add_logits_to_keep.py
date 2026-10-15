@@ -101,7 +101,9 @@ def verify(src, dst):
         err = float(np.abs(new.astype(np.float32) - want.astype(np.float32)).max())
         same_top = bool((new.argmax(-1) == want.argmax(-1)).all())
         print(f"k={k}: new shape {new.shape}, max abs difference {err:.3g}, same top token: {same_top}")
-        if new.shape != want.shape or err > 1e-3 or not same_top:
+        half = any(i.type.tensor_type.elem_type == TensorProto.FLOAT16 for i in onnx.load(dst, load_external_data=False).graph.input)
+        tol = 0.05 if half else 1e-3  # an fp16 graph rounds differently for 1 row than for many
+        if new.shape != want.shape or err > tol or not same_top:
             sys.exit(f"FAILED for k={k}")
     print("OK: the rewritten graph returns exactly the last k positions of the original's scores.")
 
