@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; connect-src 'self' https://api.marginalia.nu https://api.mwmbl.org https://www.mojeek.com https://api.duckduckgo.com https://r.jina.ai https://api.open-meteo.com https://geocoding-api.open-meteo.com; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'"
@@ -26,7 +26,12 @@
     <p id="offline" class="offline" hidden>Offline: showing what is saved on this device</p>
     <main id="main"><p class="status">Loading…</p></main>
     <footer class="netbar">
-      <a href="#/net" aria-label="Network details"><span id="now">Starting…</span><span id="tot"></span></a>
+      <a class="line" href="#/net" aria-label="Network details"><span id="now">Starting…</span><span id="tot"></span></a>
+      <nav class="navbtns" aria-label="Navigation">
+        <button type="button" id="nav-back" aria-label="Back" disabled>‹ Back</button>
+        <button type="button" id="nav-fwd" aria-label="Forward" disabled>Forward ›</button>
+        <button type="button" id="nav-home" aria-label="Home">⌂ Home</button>
+      </nav>
     </footer>
     <noscript>Sparse needs JavaScript.</noscript>
   </body>

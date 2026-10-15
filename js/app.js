@@ -94,6 +94,51 @@ function amount(t) {
 // ---------- bottom bar: what is happening now, and this session's totals ----------
 
 const bar = { now: document.getElementById('now'), tot: document.getElementById('tot') };
+
+// ---------- back / forward / home (a home-screen app has no browser buttons) ----------
+// Each history entry gets an index in history.state, so the buttons know when there is
+// somewhere to go back or forward to.
+
+const navBtn = { back: document.getElementById('nav-back'), fwd: document.getElementById('nav-fwd'), home: document.getElementById('nav-home') };
+let navIndex = 0;
+let navMax = 0;
+
+function trackHistory() {
+  const i = history.state?.i;
+  if (typeof i === 'number') navIndex = i;
+  else {
+    navIndex = navIndex + 1; // a new entry: anything that was ahead of it is gone
+    navMax = navIndex;
+    history.replaceState({ i: navIndex }, '', location.href);
+  }
+  navMax = Math.max(navMax, navIndex);
+  try {
+    sessionStorage.setItem('navMax', String(navMax));
+  } catch {
+    // private mode: the buttons still work for this page load
+  }
+  navBtn.back.disabled = navIndex <= 0;
+  navBtn.fwd.disabled = navIndex >= navMax;
+}
+
+function initNav() {
+  try {
+    navMax = Number(sessionStorage.getItem('navMax')) || 0;
+  } catch {
+    navMax = 0;
+  }
+  if (typeof history.state?.i !== 'number') {
+    history.replaceState({ i: 0 }, '', location.href);
+    navMax = 0;
+  }
+  trackHistory();
+  navBtn.back.addEventListener('click', () => history.back());
+  navBtn.fwd.addEventListener('click', () => history.forward());
+  navBtn.home.addEventListener('click', () => {
+    if (currentPath() === '/') window.scrollTo(0, 0);
+    else location.hash = '#/';
+  });
+}
 let idleTimer;
 const active = new Map();
 
@@ -1279,8 +1324,10 @@ async function start() {
     S.kvGet('netlog', []),
     S.kvGet('nettotals', null).then((t) => t ?? emptyTotals()),
   ]);
+  initNav();
   addEventListener('hashchange', (e) => {
     scrollPos.set(new URL(e.oldURL).hash, window.scrollY);
+    trackHistory();
     route();
   });
   addEventListener('online', () => {
