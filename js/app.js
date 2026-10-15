@@ -23,6 +23,7 @@ const DEFAULTS = {
   cacheHours: 6,
   jinaKey: '',
   showActivity: true,
+  weatherDetail: 'basic',
 };
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -483,20 +484,20 @@ function snippetNodes(snippet) {
   return snippet.map((s) => (s.bold ? h('b', null, s.text) : s.text));
 }
 
-function inlineNodes(nodes, pageUrl) {
+function inlineNodes(nodes, pageUrl, mapHref = (x) => x) {
   const same = (a) => a.split('#')[0] === pageUrl.split('#')[0];
   return nodes.map((n) => {
     if (n.t === 'text') return n.s;
     if (n.t === 'code') return h('code', null, n.s);
-    if (n.t === 'b') return h('strong', null, inlineNodes(n.c, pageUrl));
-    if (n.t === 'i') return h('em', null, inlineNodes(n.c, pageUrl));
-    if (same(n.href)) return h('span', null, inlineNodes(n.c, pageUrl));
-    return h('a', { href: hashFor('/r', { u: n.href }) }, inlineNodes(n.c, pageUrl));
+    if (n.t === 'b') return h('strong', null, inlineNodes(n.c, pageUrl, mapHref));
+    if (n.t === 'i') return h('em', null, inlineNodes(n.c, pageUrl, mapHref));
+    if (same(n.href)) return h('span', null, inlineNodes(n.c, pageUrl, mapHref));
+    return h('a', { href: hashFor('/r', { u: mapHref(n.href) }) }, inlineNodes(n.c, pageUrl, mapHref));
   });
 }
 
-function blockNodes(blocks, pageUrl) {
-  const inl = (c) => inlineNodes(c, pageUrl);
+function blockNodes(blocks, pageUrl, mapHref) {
+  const inl = (c) => inlineNodes(c, pageUrl, mapHref);
   return blocks.map((b) => {
     switch (b.type) {
       case 'h':
@@ -823,28 +824,36 @@ function here() {
   });
 }
 
+/** Sums the requests behind one card, so it can say what it cost. */
+function netCounter(act) {
+  const net = { requests: 0, received: 0, wire: 0, estimated: false };
+  const get = async (url) => {
+    const r = await act.fetch(url);
+    net.requests++;
+    net.received += r.entry.received;
+    net.wire += r.entry.wire ?? r.entry.received;
+    if (r.entry.wireKind !== 'exact') net.estimated = true;
+    return r.json();
+  };
+  return { net, get };
+}
+
+const WEATHER_FRESH = 30 * MIN;
+
 async function showWeather(container, place, id, act) {
   const unit = L.resolveUnit(settings.units, navigator.language);
   const card = h('section', { class: 'card weather' }, h('p', { class: 'muted' }, 'Weather…'));
   container.prepend(card);
   const where = place ? `“${place}”` : 'your location';
-  const key = `wx|${place.toLowerCase()}|${unit}`;
+  const key = `wx2|${place.toLowerCase()}|${unit}`;
   act.step(`Weather: looking on this device for a forecast for ${where}…`);
   let rec = await S.get('results', key);
   try {
-    if (rec && Date.now() - rec.at <= 30 * MIN) act.ok(`Weather: using the forecast saved ${L.relTime(rec.at)}, nothing downloaded`);
+    if (rec && Date.now() - rec.at <= WEATHER_FRESH) act.ok(`Weather: using the forecast saved ${L.relTime(rec.at)}, nothing downloaded`);
     else if (rec && !navigator.onLine) act.ok(`Weather: offline, using the forecast saved ${L.relTime(rec.at)}`);
     else {
       if (rec) act.step(`Weather: the saved forecast is ${L.relTime(rec.at)} old (over 30 min): refreshing`);
-      const net = { requests: 0, received: 0, wire: 0, estimated: false };
-      const get = async (url) => {
-        const r = await act.fetch(url);
-        net.requests++;
-        net.received += r.entry.received;
-        net.wire += r.entry.wire ?? r.entry.received;
-        if (r.entry.wireKind !== 'exact') net.estimated = true;
-        return r.json();
-      };
+      const { net, get } = netCounter(act);
       let loc;
       if (place) {
         act.step(`Weather: looking up ${where} with Open-Meteo…`);
@@ -856,10 +865,10 @@ async function showWeather(container, place, id, act) {
         loc = await here();
         act.ok('Weather: got your location');
       }
-      act.step('Weather: fetching the 3-day forecast…');
+      act.step('Weather: fetching the basic forecast (now, the next hour, 3 days)…');
       const forecast = L.parseForecast(await get(L.forecastUrl(loc.lat, loc.lon, unit)), loc.label, unit);
       if (!forecast) throw new Error('no forecast available');
-      rec = { at: Date.now(), forecast, net };
+      rec = { at: Date.now(), forecast, loc: { lat: loc.lat, lon: loc.lon }, net };
       await S.put('results', key, rec);
       act.ok('Weather: forecast saved on this device');
     }
@@ -872,11 +881,19 @@ async function showWeather(container, place, id, act) {
   }
   if (id !== renderId) return;
   const f = rec.forecast;
-  const day = (d, i) => (i === 0 ? 'Today' : new Date(`${d}T12:00`).toLocaleDateString(undefined, { weekday: 'short' }));
+  const more = h('div', { class: 'wx-more', hidden: true });
+  const moreBtn = h('button', { type: 'button', class: 'button secondary small' }, 'More weather');
+  const moreNote = h('span', { class: 'muted small' });
   fill(
     card,
     h('h2', null, f.label),
-    h('p', { class: 'big' }, `${f.now.temp}${f.unit} `, h('span', null, f.now.desc)),
+    h(
+      'p',
+      { class: 'big' },
+      `${f.now.temp}${f.unit} `,
+      h('span', null, f.now.desc, f.now.feels != null && f.now.feels !== f.now.temp ? ` · feels like ${f.now.feels}°` : ''),
+    ),
+    f.rain ? h('p', { class: 'rain' }, f.rain) : null,
     h(
       'table',
       { class: 'days' },
@@ -884,7 +901,7 @@ async function showWeather(container, place, id, act) {
         h(
           'tr',
           null,
-          h('td', null, day(d.date, i)),
+          h('td', null, dayName(d.date, i)),
           h('td', null, d.desc),
           h('td', null, `${d.hi}° / ${d.lo}°`),
           h('td', { class: 'muted' }, d.rain != null ? `${d.rain}% rain` : ''),
@@ -892,7 +909,159 @@ async function showWeather(container, place, id, act) {
       ),
     ),
     h('p', { class: 'muted small' }, `Wind ${f.now.wind} ${f.wind} · Open-Meteo, updated ${L.relTime(rec.at)} · ${amount(rec.net)}`),
+    more,
+    h('p', { class: 'wx-actions' }, moreBtn, ' ', moreNote),
   );
+  if (!rec.loc) {
+    // Saved by an older version, without coordinates: "More" would need the place looked up again.
+    moreBtn.hidden = true;
+    return;
+  }
+
+  const moreKey = `wxmore|${rec.loc.lat.toFixed(2)},${rec.loc.lon.toFixed(2)}|${unit}`;
+  let detail = await S.get('results', moreKey);
+  if (id !== renderId) return;
+  const fresh = () => detail && Date.now() - detail.at <= WEATHER_FRESH;
+  const lastSize = await S.kvGet('wxMoreSize', null);
+  moreNote.textContent = fresh()
+    ? `saved ${L.relTime(detail.at)}, 0 B`
+    : !navigator.onLine && detail
+      ? `offline: saved copy from ${L.relTime(detail.at)}`
+      : `hourly, 7 days, air quality · ${lastSize ? `≈${B(lastSize)}` : 'about 1–2 KB'}`;
+
+  let open = false;
+  const toggle = async () => {
+    if (open) {
+      open = false;
+      more.hidden = true;
+      moreBtn.textContent = 'More weather';
+      return;
+    }
+    moreBtn.disabled = true;
+    try {
+      if (fresh()) act.ok(`More weather: using the details saved ${L.relTime(detail.at)}, nothing downloaded`);
+      else if (detail && !navigator.onLine) act.ok(`More weather: offline, using the details saved ${L.relTime(detail.at)}`);
+      else {
+        moreNote.textContent = 'downloading…';
+        act.step('More weather: fetching 24 hours, 7 days and conditions now, plus air quality, at the same time…');
+        const { net, get } = netCounter(act);
+        const [main, air] = await Promise.allSettled([get(L.detailUrl(rec.loc.lat, rec.loc.lon, unit)), get(L.airUrl(rec.loc.lat, rec.loc.lon))]);
+        if (main.status === 'rejected') throw main.reason;
+        const d = L.parseDetail(main.value, unit);
+        if (!d) throw new Error('no detailed forecast available');
+        const a = air.status === 'fulfilled' ? L.parseAir(air.value, unit) : null;
+        if (air.status === 'rejected') act.warn(`More weather: air quality failed (${describe(air.reason)}); showing the rest`);
+        detail = { at: Date.now(), detail: d, air: a, net };
+        await S.put('results', moreKey, detail);
+        await S.kvSet('wxMoreSize', net.wire);
+        act.ok(`More weather: saved on this device (${amount(net)})`);
+      }
+      if (id !== renderId) return;
+      fill(more, weatherDetail(detail, f));
+      more.hidden = false;
+      open = true;
+      moreBtn.textContent = 'Less weather';
+      moreNote.textContent = `updated ${L.relTime(detail.at)} · ${amount(detail.net)}`;
+    } catch (e) {
+      act.warn(`More weather failed: ${describe(e)}`);
+      moreNote.textContent = `failed: ${describe(e)}`;
+    } finally {
+      moreBtn.disabled = false;
+    }
+  };
+  moreBtn.addEventListener('click', toggle);
+  if (settings.weatherDetail === 'full') {
+    act.step('More weather: Settings say to always show the full weather');
+    await toggle();
+  }
+}
+
+const dayName = (date, i) => (i === 0 ? 'Today' : new Date(`${date}T12:00`).toLocaleDateString(undefined, { weekday: 'short' }));
+
+function weatherDetail(rec, f) {
+  const d = rec.detail;
+  const a = rec.air;
+  const today = d.days[0] ?? {};
+  const row = (label, value) => (value == null || value === '' ? null : h('tr', null, h('th', null, label), h('td', null, value)));
+  const hours = h(
+    'table',
+    { class: 'hours' },
+    d.hours.map((x, i) =>
+      h(
+        'tr',
+        { class: i % 3 ? 'extra' : null },
+        h('td', null, i === 0 ? 'Now' : x.time),
+        h('td', null, `${x.temp}°`),
+        h('td', null, x.desc),
+        h('td', { class: 'muted' }, x.rain != null ? `${x.rain}%` : ''),
+      ),
+    ),
+  );
+  const allHours = h('button', { type: 'button', class: 'link small' }, 'Show every hour');
+  allHours.addEventListener('click', () => {
+    const on = hours.classList.toggle('all');
+    allHours.textContent = on ? 'Every 3 hours' : 'Show every hour';
+  });
+  return [
+    h('h3', null, 'Now'),
+    h(
+      'table',
+      { class: 'kv' },
+      row('Wind', `${f.now.wind} ${f.wind}${d.now.windDir ? ` from the ${d.now.windDir}` : ''}${d.now.gusts != null ? `, gusts ${d.now.gusts}` : ''}`),
+      row('Humidity', d.now.humidity != null ? `${d.now.humidity}%` : null),
+      row('Cloud cover', d.now.cloud != null ? `${d.now.cloud}%` : null),
+      row('Visibility', d.now.visibility),
+      row('Pressure', d.now.pressure != null ? `${d.now.pressure} hPa` : null),
+      row('UV index now', a?.uv != null ? L.uvText(a.uv) : null),
+      row('Sunrise, sunset', today.sunrise ? `${today.sunrise}, ${today.sunset}` : null),
+    ),
+    a
+      ? [
+          h('h3', null, 'Air quality'),
+          h(
+            'table',
+            { class: 'kv' },
+            row(a.scale, a.index != null ? `${a.index} (${a.label})` : null),
+            row('PM2.5', a.pm25 != null ? `${a.pm25} µg/m³` : null),
+            row('PM10', a.pm10 != null ? `${a.pm10} µg/m³` : null),
+            row('Ozone', a.ozone != null ? `${a.ozone} µg/m³` : null),
+            row('Nitrogen dioxide', a.no2 != null ? `${a.no2} µg/m³` : null),
+          ),
+        ]
+      : null,
+    h('h3', null, 'Next 24 hours ', h('span', { class: 'muted small' }, '(chance of rain)')),
+    hours,
+    allHours,
+    h('h3', null, '7 days'),
+    h(
+      'table',
+      { class: 'days week' },
+      d.days.map((x, i) =>
+        h(
+          'tr',
+          null,
+          h('td', null, dayName(x.date, i)),
+          h(
+            'td',
+            null,
+            x.desc,
+            h(
+              'span',
+              { class: 'muted block small' },
+              [x.wind != null ? `wind to ${x.wind} ${f.wind}` : null, x.uv != null ? `UV ${x.uv}` : null].filter(Boolean).join(' · '),
+            ),
+          ),
+          h('td', null, `${x.hi}° / ${x.lo}°`),
+          h(
+            'td',
+            { class: 'muted' },
+            x.rain != null ? `${x.rain}%` : '',
+            x.amount ? h('span', { class: 'block' }, `${x.amount.toFixed(d.precipUnit === 'in' ? 2 : 1)} ${d.precipUnit}`) : null,
+          ),
+        ),
+      ),
+    ),
+  ];
 }
 
 /**
@@ -914,9 +1083,67 @@ function formatDate(raw) {
   return Number.isNaN(d.getTime()) ? raw : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
+/**
+ * Asks the Internet Archive for its latest copy of `url` (about 0.2 KB) and offers it. Jina reads
+ * archive.org only with an API key; without one the copy can only be opened in Safari.
+ */
+async function archiveOffer(box, url, act, id) {
+  fill(box, h('p', { class: 'muted small' }, 'Looking for an archived copy…'));
+  act.step('Asking the Internet Archive whether it has a copy of this page…');
+  try {
+    const r = await act.fetch(L.waybackLookupUrl(url), { timeout: 20000 });
+    const snap = L.parseWayback(r.json(), url);
+    if (id !== renderId) return;
+    if (!snap) {
+      act.skip('The Internet Archive’s lookup found no copy of this page');
+      return fill(
+        box,
+        h(
+          'p',
+          { class: 'muted small' },
+          'The Internet Archive’s quick lookup found no copy. It sometimes misses copies when it is busy, so the archive itself may still have one.',
+        ),
+        h('p', { class: 'small' }, external(L.waybackViewUrl('2', url), 'Look in the archive in Safari ↗')),
+      );
+    }
+    act.ok(`The Internet Archive has a copy from ${formatDate(snap.at)}`);
+    if (!settings.jinaKey) act.skip('Reading it here needs a Jina key (Jina refuses anonymous requests for archive.org)');
+    fill(
+      box,
+      h('p', null, `Archived copy from ${formatDate(snap.at)}, at the Internet Archive.`),
+      h(
+        'p',
+        null,
+        settings.jinaKey ? [h('a', { href: hashFor('/r', { u: snap.raw }), class: 'button secondary small' }, 'Read it here'), ' '] : null,
+        external(snap.view, 'Open in the archive ↗'),
+      ),
+      settings.jinaKey
+        ? null
+        : h(
+            'p',
+            { class: 'muted small' },
+            'Jina Reader refuses anonymous requests for archive.org pages, so without a Jina key the copy opens in Safari at full size. A free key in Settings lets you read it here as text.',
+          ),
+    );
+  } catch (e) {
+    // The archive's "too many requests" reply carries no CORS header, so it looks like a failed connection.
+    const why = e.network && navigator.onLine ? 'it refused or didn’t answer; it limits how often it can be asked, so try again in a minute' : describe(e);
+    act.warn(`Couldn't check the Internet Archive: ${why}`);
+    if (id !== renderId) return;
+    const retry = h('button', { type: 'button', class: 'link' }, 'Try again');
+    retry.addEventListener('click', () => archiveOffer(box, url, act, id));
+    fill(
+      box,
+      h('p', { class: 'muted small' }, `Couldn't check the Internet Archive: ${why}.`),
+      h('p', { class: 'small' }, retry, ' · ', external(L.waybackViewUrl('2', url), 'Open its latest copy in Safari ↗')),
+    );
+  }
+}
+
 async function showRead(id, raw, reload = false) {
   const url = L.safeHttpUrl(raw);
-  const host = url ? L.hostOf(url) : '';
+  const arch = url ? L.parseWaybackUrl(url) : null;
+  const host = arch ? `${L.hostOf(arch.original)} (archived ${formatDate(arch.at)})` : url ? L.hostOf(url) : '';
   const act = activity(`Opening ${host || 'page'}…`);
   const status = h('div', { class: 'status' });
   const article = h('article', { class: 'reader' });
@@ -955,27 +1182,46 @@ async function showRead(id, raw, reload = false) {
     });
     act.step('Turning the text into a page…');
     const blocks = L.trimNav(L.parseMarkdown(rec.markdown, rec.source || url));
+    const box = h('div', { class: 'archive card', hidden: true });
+    const archived = h('button', { type: 'button', class: 'link' }, 'Archived copy');
+    archived.addEventListener('click', () => {
+      archived.disabled = true;
+      box.hidden = false;
+      archiveOffer(box, url, act, id);
+    });
     fill(
       article,
       h('h1', null, rec.title),
+      arch ? h('p', { class: 'small muted' }, `Archived copy from ${formatDate(arch.at)}, read from the Internet Archive.`) : null,
       h(
         'p',
         { class: 'actions small' },
-        external(url, 'Open original ↗'),
+        arch
+          ? [external(arch.original, 'Open live page ↗'), ' · ', external(L.waybackViewUrl(arch.ts, arch.original), 'Open in the archive ↗')]
+          : [external(url, 'Open original ↗'), ' · ', archived],
         ' · ',
         save,
         rec.published ? h('span', { class: 'muted' }, ` · ${formatDate(rec.published)}`) : null,
       ),
-      blocks.length ? blockNodes(blocks, url) : h('p', { class: 'muted' }, 'The reader found no text on this page. Try opening the original.'),
+      box,
+      blocks.length
+        ? blockNodes(blocks, url, arch ? (href) => L.unarchiveLink(href, arch.original) : undefined)
+        : h('p', { class: 'muted' }, 'The reader found no text on this page. Try opening the original.'),
     );
     act.ok(`Showing ${plural(blocks.length, 'block')} of text (menus at the top removed)`);
     settle();
   };
 
-  const showProblem = (message) => {
+  const showProblem = (message, { archive = false } = {}) => {
     if (id !== renderId) return;
     fill(status, h('p', null, message));
-    fill(article, h('p', null, external(url, 'Open the original page ↗')));
+    const box = h('div', { class: 'archive card' });
+    fill(
+      article,
+      h('p', null, arch ? external(L.waybackViewUrl(arch.ts, arch.original), 'Open the archived copy in Safari ↗') : external(url, 'Open the original page ↗')),
+      archive && !arch ? box : null,
+    );
+    if (archive && !arch) return archiveOffer(box, url, act, id);
   };
 
   act.step('Looking for this page on this device…');
@@ -987,6 +1233,13 @@ async function showRead(id, raw, reload = false) {
     return act.finish('Page opened from this device');
   }
   act.step(rec ? 'Found a saved copy, but you asked to reload' : 'Not on this device yet');
+  if (arch && !settings.jinaKey) {
+    act.skip('Jina Reader refuses anonymous requests for archive.org pages, and there is no Jina key in Settings');
+    showProblem(
+      'Reading archived pages here needs a free Jina API key (Settings): Jina refuses anonymous requests for archive.org. You can still open the copy in Safari, at full size.',
+    );
+    return act.finish('Archived page needs a Jina key');
+  }
   if (!navigator.onLine) {
     if (rec) {
       act.ok('Offline: showing the saved copy');
@@ -1013,8 +1266,8 @@ async function showRead(id, raw, reload = false) {
       showProblem(`Couldn't reach the reader (${e.message}). This page is queued and will load when the connection is back.`);
       return act.finish('Page failed, queued');
     }
-    showProblem(`Couldn't load this page: ${describe(e)}.`);
     act.finish('Page failed');
+    await showProblem(`Couldn't load this page: ${describe(e)}.`, { archive: true });
   }
 }
 
@@ -1302,6 +1555,11 @@ async function showSettings(id) {
       field('Tapping a result opens', select('openIn', { reader: 'Reader view (light)', site: 'The website' })),
       field('DuckDuckGo button opens', select('ddg', { lite: 'DuckDuckGo Lite', html: 'DuckDuckGo HTML' })),
       field('Weather units', select('units', { auto: 'Automatic', c: '°C', f: '°F' })),
+      field(
+        'Weather card shows',
+        select('weatherDetail', { basic: 'The basics (about 0.5 KB)', full: 'Everything (about 2 KB more)' }),
+        'The basics are now, the next hour and 3 days. “More weather” on the card fetches hourly, 7-day and air quality when you want them.',
+      ),
       field(
         'Reuse saved results for',
         (() => {

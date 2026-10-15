@@ -150,7 +150,8 @@ test('weather intent, parsing and units', () => {
     },
     'Leeds',
   );
-  assert.deepEqual(f.now, { temp: 12, desc: 'Overcast', wind: 9 });
+  assert.deepEqual(f.now, { temp: 12, feels: null, desc: 'Overcast', wind: 9 });
+  assert.equal(f.rain, null);
   assert.deepEqual(f.days[0], { date: '2026-10-15', hi: 13, lo: 7, desc: 'Light rain', rain: 80 });
   assert.equal(L.resolveUnit('auto', 'en-US'), 'f');
   assert.equal(L.resolveUnit('auto', 'en-GB'), 'c');
@@ -307,4 +308,96 @@ test('serviceOf and redactUrl', () => {
   assert.equal(L.redactUrl('https://www.mojeek.com/search?q=a+b&api_key=SECRET&fmt=json'), 'https://www.mojeek.com/search?q=a+b&api_key=•••&fmt=json');
   assert.equal(L.redactUrl('https://api.marginalia.nu/mykey/search/a?count=10'), 'https://api.marginalia.nu/•••/search/a?count=10');
   assert.equal(L.redactUrl('https://api.marginalia.nu/public/search/a'), 'https://api.marginalia.nu/public/search/a');
+});
+
+test('rain in the next hour', () => {
+  assert.equal(L.rainSoon([0, 0, 0, 0]), 'No rain expected in the next hour');
+  assert.equal(L.rainSoon([0, 0, 0.3, 0.5]), 'Rain starting in about 30 min (0.8 mm in the next hour)');
+  assert.equal(L.rainSoon([0.2, 0.2, 0.2, 0.2]), 'Rain for the next hour (0.8 mm)');
+  assert.equal(L.rainSoon([0.4, 0, 0, 0]), 'Rain now, easing within the hour (0.4 mm)');
+  assert.equal(L.rainSoon([0, 0.01, 0, 0.02], 'f'), 'Rain starting in about 15 min (0.03 in in the next hour)');
+  assert.equal(L.rainSoon(undefined), null);
+  assert.equal(L.rainSoon([null, null]), null);
+});
+
+test('more weather: detail and air quality', () => {
+  const d = L.parseDetail({
+    current: { relative_humidity_2m: 71, wind_direction_10m: 222, wind_gusts_10m: 43.9, pressure_msl: 1014.5, cloud_cover: 100, visibility: 18480 },
+    hourly: { time: ['2026-10-15T14:00'], temperature_2m: [17.6], weather_code: [3], precipitation_probability: [8] },
+    daily: {
+      time: ['2026-10-15'],
+      weather_code: [51],
+      temperature_2m_max: [17.6],
+      temperature_2m_min: [11.8],
+      precipitation_probability_max: [75],
+      precipitation_sum: [1.2],
+      wind_speed_10m_max: [30.4],
+      uv_index_max: [2.35],
+      sunrise: ['2026-10-15T07:28'],
+      sunset: ['2026-10-15T18:12'],
+    },
+  });
+  assert.deepEqual(d.now, { humidity: 71, windDir: 'SW', gusts: 44, pressure: 1015, cloud: 100, visibility: '18 km' });
+  assert.deepEqual(d.hours[0], { time: '14:00', temp: 18, desc: 'Overcast', rain: 8 });
+  assert.deepEqual(d.days[0], {
+    date: '2026-10-15',
+    hi: 18,
+    lo: 12,
+    desc: 'Light drizzle',
+    rain: 75,
+    amount: 1.2,
+    wind: 30,
+    uv: 2,
+    sunrise: '07:28',
+    sunset: '18:12',
+  });
+  assert.equal(L.parseDetail({}), null);
+  assert.equal(L.compass(0), 'N');
+  assert.equal(L.compass(359), 'N');
+  assert.equal(L.compass(90), 'E');
+  assert.match(L.detailUrl(1, 2, 'f'), /precipitation_unit=inch/);
+
+  const air = { current: { european_aqi: 24, us_aqi: 31, pm2_5: 3.3, pm10: 6, ozone: 68, nitrogen_dioxide: 7.3, uv_index: 0.3 } };
+  assert.deepEqual(L.parseAir(air), { index: 24, scale: 'European AQI', label: 'Fair', pm25: 3.3, pm10: 6, ozone: 68, no2: 7, uv: 0.3 });
+  assert.equal(L.parseAir(air, 'f').label, 'Good');
+  assert.equal(L.parseAir(air, 'f').scale, 'US AQI');
+  assert.equal(L.parseAir({}), null);
+  assert.equal(L.uvText(6.4), '6 (high)');
+  assert.equal(L.uvText(null), null);
+});
+
+test('Internet Archive snapshots', () => {
+  const s = L.parseWayback(
+    {
+      archived_snapshots: {
+        closest: {
+          status: '200',
+          available: true,
+          url: 'http://web.archive.org/web/20261004161959/https://en.wikipedia.org/wiki/Focaccia',
+          timestamp: '20261004161959',
+        },
+      },
+    },
+    'https://en.wikipedia.org/wiki/Focaccia',
+  );
+  assert.equal(s.at, Date.UTC(2026, 9, 4, 16, 19, 59));
+  assert.equal(s.view, 'https://web.archive.org/web/20261004161959/https://en.wikipedia.org/wiki/Focaccia');
+  assert.equal(s.raw, 'https://web.archive.org/web/20261004161959id_/https://en.wikipedia.org/wiki/Focaccia');
+  assert.equal(L.parseWayback({ archived_snapshots: {} }, 'https://x.org/'), null);
+  assert.equal(L.parseWayback({ archived_snapshots: { closest: { status: '404', available: true, timestamp: '2020' } } }, 'https://x.org/'), null);
+  assert.equal(L.waybackLookupUrl('https://a.org/b?c=1'), 'https://archive.org/wayback/available?url=https%3A%2F%2Fa.org%2Fb%3Fc%3D1');
+
+  assert.deepEqual(L.parseWaybackUrl('https://web.archive.org/web/20261004161959id_/https://en.wikipedia.org/wiki/Focaccia'), {
+    ts: '20261004161959',
+    at: Date.UTC(2026, 9, 4, 16, 19, 59),
+    original: 'https://en.wikipedia.org/wiki/Focaccia',
+  });
+  assert.equal(L.parseWaybackUrl('https://web.archive.org/web/2020/example.com/a').original, 'http://example.com/a');
+  assert.equal(L.parseWaybackUrl('https://example.com/web/2020/x'), null);
+
+  const orig = 'https://en.wikipedia.org/wiki/Focaccia';
+  assert.equal(L.unarchiveLink('https://web.archive.org/wiki/Bread#x', orig), 'https://en.wikipedia.org/wiki/Bread#x');
+  assert.equal(L.unarchiveLink('https://web.archive.org/web/2020/https://a.org/', orig), 'https://web.archive.org/web/2020/https://a.org/');
+  assert.equal(L.unarchiveLink('https://b.org/x', orig), 'https://b.org/x');
+  assert.equal(L.serviceOf('https://archive.org/wayback/available?url=x'), 'Internet Archive');
 });

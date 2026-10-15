@@ -250,6 +250,8 @@ const SERVICES = {
   'r.jina.ai': 'Jina Reader',
   'api.open-meteo.com': 'Open-Meteo forecast',
   'geocoding-api.open-meteo.com': 'Open-Meteo places',
+  'air-quality-api.open-meteo.com': 'Open-Meteo air quality',
+  'archive.org': 'Internet Archive',
 };
 
 export function serviceOf(url) {
@@ -343,20 +345,53 @@ export function parseGeocode(json) {
   return { lat: r.latitude, lon: r.longitude, label: [r.name, r.admin1, r.country_code].filter(Boolean).join(', ') };
 }
 
+const unitParams = (p, unit) => {
+  if (unit !== 'f') return p;
+  p.set('temperature_unit', 'fahrenheit');
+  p.set('wind_speed_unit', 'mph');
+  p.set('precipitation_unit', 'inch');
+  return p;
+};
+
+/** The basic forecast: now, rain in the next hour (four 15-minute steps) and 3 days. About 0.5 KB gzipped. */
 export function forecastUrl(lat, lon, unit = 'c') {
   const p = new URLSearchParams({
     latitude: String(lat),
     longitude: String(lon),
-    current: 'temperature_2m,weather_code,wind_speed_10m',
+    current: 'temperature_2m,apparent_temperature,weather_code,wind_speed_10m',
+    minutely_15: 'precipitation',
+    forecast_minutely_15: '4',
     daily: 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
     timezone: 'auto',
     forecast_days: '3',
   });
-  if (unit === 'f') {
-    p.set('temperature_unit', 'fahrenheit');
-    p.set('wind_speed_unit', 'mph');
-  }
-  return `https://api.open-meteo.com/v1/forecast?${p}`;
+  return `https://api.open-meteo.com/v1/forecast?${unitParams(p, unit)}`;
+}
+
+/** The extra detail behind "More weather": conditions now, 24 hours and 7 days. About 1 KB gzipped. */
+export function detailUrl(lat, lon, unit = 'c') {
+  const p = new URLSearchParams({
+    latitude: String(lat),
+    longitude: String(lon),
+    current: 'relative_humidity_2m,wind_direction_10m,wind_gusts_10m,pressure_msl,cloud_cover,visibility',
+    hourly: 'temperature_2m,weather_code,precipitation_probability',
+    forecast_hours: '24',
+    daily: 'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max,uv_index_max,sunrise,sunset',
+    timezone: 'auto',
+    forecast_days: '7',
+  });
+  return `https://api.open-meteo.com/v1/forecast?${unitParams(p, unit)}`;
+}
+
+/** Air quality now (Open-Meteo's separate air-quality service). About 0.4 KB gzipped. */
+export function airUrl(lat, lon) {
+  const p = new URLSearchParams({
+    latitude: String(lat),
+    longitude: String(lon),
+    current: 'european_aqi,us_aqi,pm2_5,pm10,ozone,nitrogen_dioxide,uv_index',
+    timezone: 'auto',
+  });
+  return `https://air-quality-api.open-meteo.com/v1/air-quality?${p}`;
 }
 
 const WMO = {
@@ -391,30 +426,194 @@ const WMO = {
 };
 export const wmoText = (code) => WMO[code] ?? '—';
 
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const round = (v) => (num(v) == null ? null : Math.round(v));
+
+/** "No rain in the next hour", "Rain starting in about 30 min", from four 15-minute amounts. */
+export function rainSoon(steps, unit = 'c') {
+  const vals = (steps ?? []).map(num);
+  if (!vals.length || vals.every((v) => v == null)) return null;
+  const wet = (v) => v != null && v >= (unit === 'f' ? 0.004 : 0.1);
+  const first = vals.findIndex(wet);
+  if (first < 0) return 'No rain expected in the next hour';
+  const total = vals.reduce((n, v) => n + (v ?? 0), 0);
+  const amt = unit === 'f' ? `${total.toFixed(2)} in` : `${total.toFixed(1)} mm`;
+  if (first === 0) return vals.every(wet) ? `Rain for the next hour (${amt})` : `Rain now, easing within the hour (${amt})`;
+  return `Rain starting in about ${first * 15} min (${amt} in the next hour)`;
+}
+
 export function parseForecast(json, label, unit = 'c') {
   const c = json?.current;
   const d = json?.daily;
   if (!c || !d) return null;
-  const r = Math.round;
   return {
     label,
     unit: unit === 'f' ? '°F' : '°C',
     wind: unit === 'f' ? 'mph' : 'km/h',
-    now: { temp: r(c.temperature_2m), desc: wmoText(c.weather_code), wind: r(c.wind_speed_10m) },
+    now: {
+      temp: round(c.temperature_2m),
+      feels: round(c.apparent_temperature),
+      desc: wmoText(c.weather_code),
+      wind: round(c.wind_speed_10m),
+    },
+    rain: rainSoon(json.minutely_15?.precipitation, unit),
     days: (d.time ?? []).map((date, i) => ({
       date,
-      hi: r(d.temperature_2m_max[i]),
-      lo: r(d.temperature_2m_min[i]),
+      hi: round(d.temperature_2m_max[i]),
+      lo: round(d.temperature_2m_min[i]),
       desc: wmoText(d.weather_code[i]),
       rain: d.precipitation_probability_max?.[i] ?? null,
     })),
   };
 }
 
+const COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
+/** 222 → "SW": the direction the wind comes from. */
+export const compass = (deg) => (num(deg) == null ? null : COMPASS[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16]);
+
+/** "2026-10-15T07:28" → "07:28": Open-Meteo's local times for the place, as written. */
+const clock = (t) => (typeof t === 'string' && /T\d\d:\d\d/.test(t) ? t.slice(11, 16) : null);
+
+export function parseDetail(json, unit = 'c') {
+  const c = json?.current;
+  const hr = json?.hourly;
+  const d = json?.daily;
+  if (!c || !hr || !d) return null;
+  const vis = num(c.visibility);
+  return {
+    now: {
+      humidity: round(c.relative_humidity_2m),
+      windDir: compass(c.wind_direction_10m),
+      gusts: round(c.wind_gusts_10m),
+      pressure: round(c.pressure_msl),
+      cloud: round(c.cloud_cover),
+      visibility: vis == null ? null : unit === 'f' ? `${(vis / 1609.344).toFixed(vis < 16093 ? 1 : 0)} mi` : `${(vis / 1000).toFixed(vis < 10000 ? 1 : 0)} km`,
+    },
+    hours: (hr.time ?? []).map((t, i) => ({
+      time: clock(t),
+      temp: round(hr.temperature_2m?.[i]),
+      desc: wmoText(hr.weather_code?.[i]),
+      rain: hr.precipitation_probability?.[i] ?? null,
+    })),
+    days: (d.time ?? []).map((date, i) => ({
+      date,
+      hi: round(d.temperature_2m_max?.[i]),
+      lo: round(d.temperature_2m_min?.[i]),
+      desc: wmoText(d.weather_code?.[i]),
+      rain: d.precipitation_probability_max?.[i] ?? null,
+      amount: num(d.precipitation_sum?.[i]),
+      wind: round(d.wind_speed_10m_max?.[i]),
+      uv: num(d.uv_index_max?.[i]) == null ? null : Math.round(d.uv_index_max[i]),
+      sunrise: clock(d.sunrise?.[i]),
+      sunset: clock(d.sunset?.[i]),
+    })),
+    precipUnit: unit === 'f' ? 'in' : 'mm',
+  };
+}
+
+const EU_AQI = [
+  [20, 'Good'],
+  [40, 'Fair'],
+  [60, 'Moderate'],
+  [80, 'Poor'],
+  [100, 'Very poor'],
+  [Infinity, 'Extremely poor'],
+];
+const US_AQI = [
+  [50, 'Good'],
+  [100, 'Moderate'],
+  [150, 'Unhealthy for sensitive groups'],
+  [200, 'Unhealthy'],
+  [300, 'Very unhealthy'],
+  [Infinity, 'Hazardous'],
+];
+
+/** Air quality on the US scale for US users (°F), the European scale otherwise. */
+export function parseAir(json, unit = 'c') {
+  const c = json?.current;
+  if (!c) return null;
+  const us = unit === 'f';
+  const index = round(us ? c.us_aqi : c.european_aqi);
+  const scale = us ? US_AQI : EU_AQI;
+  const uv = num(c.uv_index);
+  return {
+    index,
+    scale: us ? 'US AQI' : 'European AQI',
+    label: index == null ? null : scale.find(([max]) => index <= max)[1],
+    pm25: num(c.pm2_5),
+    pm10: num(c.pm10),
+    ozone: round(c.ozone),
+    no2: round(c.nitrogen_dioxide),
+    uv: uv == null ? null : Math.round(uv * 10) / 10,
+  };
+}
+
+/** UV index 0–2 low, 3–5 moderate, 6–7 high, 8–10 very high, 11+ extreme. */
+export function uvText(uv) {
+  if (num(uv) == null) return null;
+  const r = Math.round(uv);
+  return `${r} (${r <= 2 ? 'low' : r <= 5 ? 'moderate' : r <= 7 ? 'high' : r <= 10 ? 'very high' : 'extreme'})`;
+}
+
 /** °F for US locales, °C elsewhere, unless the setting says otherwise. */
 export function resolveUnit(setting, locale = 'en-US') {
   if (setting === 'c' || setting === 'f') return setting;
   return /-(US|LR|MM)\b/i.test(locale) ? 'f' : 'c';
+}
+
+// ---------- Internet Archive (Wayback Machine) ----------
+
+/** The availability lookup: about 0.2 KB, and it allows browser calls. */
+export function waybackLookupUrl(url) {
+  return `https://archive.org/wayback/available?${new URLSearchParams({ url })}`;
+}
+
+/** "20261004161959" → epoch ms (UTC), or null. */
+export function waybackTime(ts) {
+  const m = /^(\d{4})(\d\d)(\d\d)(\d\d)?(\d\d)?(\d\d)?$/.exec(String(ts ?? ''));
+  if (!m) return null;
+  const t = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] ?? 0), +(m[5] ?? 0), +(m[6] ?? 0));
+  return Number.isNaN(t) ? null : t;
+}
+
+/** The closest snapshot from a lookup, or null when the archive has none. */
+export function parseWayback(json, original) {
+  const s = json?.archived_snapshots?.closest;
+  if (!s?.available || String(s.status) !== '200' || !/^\d{8,14}$/.test(String(s.timestamp))) return null;
+  return {
+    ts: String(s.timestamp),
+    at: waybackTime(s.timestamp),
+    original,
+    view: waybackViewUrl(s.timestamp, original),
+    raw: waybackRawUrl(s.timestamp, original),
+  };
+}
+
+/** The snapshot as the archive shows it, with its toolbar (for opening in Safari). */
+export const waybackViewUrl = (ts, url) => `https://web.archive.org/web/${ts}/${url}`;
+/** The snapshot exactly as archived, without the toolbar or rewritten links (for the reader). */
+export const waybackRawUrl = (ts, url) => `https://web.archive.org/web/${ts}id_/${url}`;
+
+/** `https://web.archive.org/web/<ts>[id_]/<original>` → { ts, original }, or null. */
+export function parseWaybackUrl(u) {
+  const m = /^https?:\/\/web\.archive\.org\/web\/(\d{4,14})(?:[a-z]{2}_)?\/(.+)$/i.exec(String(u ?? ''));
+  if (!m) return null;
+  const original = safeHttpUrl(/^https?:\/\//i.test(m[2]) ? m[2] : `http://${m[2]}`);
+  return original ? { ts: m[1], at: waybackTime(m[1]), original } : null;
+}
+
+/**
+ * Links inside an archived page. The raw snapshot keeps the page's own links, but relative ones
+ * resolve against web.archive.org; send those back to the original site.
+ */
+export function unarchiveLink(href, original) {
+  try {
+    const u = new URL(href);
+    if (u.hostname !== 'web.archive.org' || u.pathname.startsWith('/web/')) return href;
+    return new URL(u.pathname + u.search + u.hash, original).href;
+  } catch {
+    return href;
+  }
 }
 
 // ---------- reader (Jina Reader) ----------
@@ -476,7 +675,7 @@ export function parseInline(s, base) {
     buf = '';
     out.push(node);
   };
-  for (let i = 0; i < s.length; ) {
+  for (let i = 0; i < s.length;) {
     const ch = s[i];
     if (ch === '\\' && i + 1 < s.length && /[!-/:-@[-`{-~]/.test(s[i + 1])) {
       text(s[i + 1]);
@@ -582,7 +781,7 @@ export function parseMarkdown(md, base) {
     }
     para = [];
   };
-  for (let i = 0; i < lines.length; ) {
+  for (let i = 0; i < lines.length;) {
     const line = lines[i];
     const t = line.trim();
     if (/^(```|~~~)/.test(t)) {

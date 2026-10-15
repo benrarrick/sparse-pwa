@@ -9,7 +9,8 @@ It works because every service it reads sends CORS headers, so a web page may ca
 | Web results | [Mwmbl](https://mwmbl.org) (default), [Marginalia](https://marginalia-search.com), [Mojeek](https://www.mojeek.com/services/search/web-search-api/) | Mojeek needs a paid key (about £1 per 1,000 searches) and **never runs automatically**: searches use the free engines, and a "Try Mojeek" button under the results re-runs that one search on Mojeek. Marginalia's shared `public` key is often busy. |
 | Instant answers | DuckDuckGo Instant Answer API | none |
 | Reader view | [Jina Reader](https://jina.ai/reader) (`r.jina.ai`) | optional: works without one at 20 pages a minute, but Jina refuses anonymous requests from some networks with a 401. A free key from jina.ai, pasted into Settings, fixes that. |
-| Weather | Open-Meteo (forecast and place lookup) | none |
+| Weather | Open-Meteo (forecast, place lookup, air quality) | none |
+| Archived copies | Internet Archive availability lookup (`archive.org/wayback/available`) | none to find a copy; reading it in the app needs a Jina key, because Jina refuses anonymous requests for archive.org |
 
 DuckDuckGo's own results pages can't be read by a web page. The app opens them instead: there's a "DuckDuckGo Lite ↗" link under every result list, and any query containing a `!bang` goes straight to DuckDuckGo.
 
@@ -18,6 +19,8 @@ DuckDuckGo's own results pages can't be read by a web page. The app opens them i
 - **Results:** title, address and snippet, about 4–8 KB per search. If the chosen engine fails or finds nothing, the next one is tried. An engine that failed is skipped for 5 minutes.
 - **Reader view:** tapping a result opens the page as text through Jina Reader. Links inside it open in the reader too. "Open original ↗" opens the real site. A Wikipedia article arrives as about 28 KB.
 - **Cards:** an instant-answer card (Wikipedia abstracts, definitions, simple answers) and a weather card for `weather`, `weather in Leeds` or `paris weather`.
+- **Weather, basic by default:** temperature and what it feels like, rain in the next hour (15-minute steps), and 3 days, in about 0.5 KB. **More weather** on the card fetches the rest only when tapped, about 1.2 KB more: wind direction and gusts, humidity, cloud, visibility, pressure, UV, sunrise and sunset, air quality (US scale with °F, European otherwise), 24 hours (every 3 hours, or every hour with a tap) and 7 days. Both are kept on the device for 30 minutes. Settings can make the card always show everything.
+- **Archived copies:** when the reader can't load a page, the app asks the Internet Archive (about 0.2 KB) for its latest copy and offers it. Every reader page also has an **Archived copy** button that only looks when tapped. With a Jina key the copy opens in the reader as text. Without one it opens in Safari, at full size. The archive's lookup sometimes misses copies, or refuses when asked too often, so a direct link to the archive is always offered as well.
 - **Offline:**
   - The app opens from the service worker cache.
   - Searches and pages are kept on the device (IndexedDB): results for 30 days, up to 300 searches; pages for 30 days, up to 100, unless you tap **Save for offline**.
@@ -90,7 +93,8 @@ There is no server of yours involved, so each service sees only its own part:
 - the search engine you use sees your searches;
 - DuckDuckGo sees them too when instant answers are on;
 - Jina sees the addresses of pages you open in reader view;
-- Open-Meteo sees the places you ask about, or your coordinates for plain `weather`.
+- Open-Meteo sees the places you ask about, or your coordinates for plain `weather`;
+- the Internet Archive sees the address of a page when you ask for an archived copy.
 
 History, cached results and saved pages stay on the device. The page's Content-Security-Policy only allows connections to the services above, and every link out uses `noreferrer`.
 
