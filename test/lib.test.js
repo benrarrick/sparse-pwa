@@ -82,9 +82,13 @@ test('Mwmbl: bold segments survive', () => {
 test('engineOrder skips Mojeek without a key and honours fallback', () => {
   const base = { engine: 'mojeek', mojeekKey: '', fallback: true };
   assert.deepEqual(L.engineOrder(base), ['mwmbl', 'marginalia']);
-  assert.deepEqual(L.engineOrder({ ...base, mojeekKey: 'k' }), ['mojeek', 'mwmbl', 'marginalia']);
+  // Asked for explicitly (the Try Mojeek button): Mojeek alone, no quiet free re-search.
+  assert.deepEqual(L.engineOrder({ ...base, mojeekKey: 'k' }), ['mojeek']);
   assert.deepEqual(L.engineOrder({ ...base, mojeekKey: 'k', fallback: false }), ['mojeek']);
   assert.deepEqual(L.engineOrder({ ...base, engine: 'mwmbl' }, 'marginalia'), ['marginalia', 'mwmbl']);
+  // Never as a fallback, even with a key.
+  assert.deepEqual(L.engineOrder({ engine: 'mwmbl', mojeekKey: 'k', fallback: true }), ['mwmbl', 'marginalia']);
+  assert.deepEqual(L.FREE_ENGINE_IDS, ['mwmbl', 'marginalia']);
 });
 
 test('bangs and DuckDuckGo links', () => {
@@ -257,6 +261,8 @@ test('skippedEngines explains what is left out', () => {
     L.skippedEngines({ engine: 'mwmbl', mojeekKey: 'k', fallback: false }).map((x) => x.id),
     ['mojeek', 'marginalia'],
   );
+  assert.match(L.skippedEngines({ engine: 'mwmbl', mojeekKey: 'k', fallback: true })[0].reason, /paid/);
+  assert.match(L.skippedEngines({ engine: 'mwmbl', mojeekKey: 'k', fallback: true }, 'mojeek')[0].reason, /asked for Mojeek/);
 });
 
 test('network formatting', () => {

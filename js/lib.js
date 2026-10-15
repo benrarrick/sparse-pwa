@@ -98,6 +98,7 @@ export const ENGINES = {
   mojeek: {
     name: 'Mojeek',
     needsKey: true,
+    paid: true, // only used when asked for explicitly (the "Try Mojeek" button), never by default or as a fallback
     url({ q, page = 1, mojeekKey, safe, region }) {
       const p = new URLSearchParams({ q, fmt: 'json', api_key: mojeekKey ?? '', t: '10', s: String((page - 1) * 10 + 1) });
       if (safe) p.set('safe', '1');
@@ -109,7 +110,7 @@ export const ENGINES = {
     },
     parse(json) {
       const r = json?.response;
-      if (!r || r.status !== 'OK') throw new EngineError(`Mojeek: ${r?.status || 'unexpected response'}`);
+      if (!r || r.status !== 'OK') throw new EngineError(r?.status || 'unexpected response');
       const results = tidy((r.results ?? []).map((x) => ({ url: x.url, title: clean(x.title), snippet: plain(x.desc) })));
       const start = Number(r.head?.start ?? 1);
       const total = Number(r.head?.results ?? 0);
@@ -122,7 +123,7 @@ export const ENGINES = {
       return `https://api.mwmbl.org/api/v1/search/?s=${encodeURIComponent(q)}`;
     },
     parse(json) {
-      if (!Array.isArray(json)) throw new EngineError('Mwmbl: unexpected response');
+      if (!Array.isArray(json)) throw new EngineError('unexpected response');
       const segs = (v) =>
         (Array.isArray(v) ? v : [{ value: v }]).map((s) => ({ text: decodeEntities(s?.value ?? ''), bold: !!s?.is_bold })).filter((s) => s.text);
       const results = tidy(
@@ -144,7 +145,7 @@ export const ENGINES = {
       return `https://api.marginalia.nu/${encodeURIComponent(marginaliaKey || 'public')}/search/${encodeURIComponent(q)}?count=10&page=${page}`;
     },
     parse(json, page = 1) {
-      if (!json || !Array.isArray(json.results)) throw new EngineError('Marginalia: unexpected response');
+      if (!json || !Array.isArray(json.results)) throw new EngineError('unexpected response');
       const results = tidy(json.results.map((x) => ({ url: x.url, title: clean(x.title), snippet: plain(x.description) })));
       return { results, more: results.length > 0 && Number(json.page ?? page) < Number(json.pages ?? 0) };
     },
@@ -157,16 +158,31 @@ export const ENGINE_IDS = Object.keys(ENGINES);
 export function engineOrder(settings, chosen = settings.engine) {
   const usable = (id) => ENGINES[id] && (!ENGINES[id].needsKey || !!settings.mojeekKey);
   const first = usable(chosen) ? [chosen] : [];
-  if (!settings.fallback && first.length) return first;
-  return [...first, ...ENGINE_IDS.filter((id) => id !== chosen && usable(id))];
+  // A paid engine was asked for on purpose: report its failure rather than quietly searching again for free.
+  if (first.length && (ENGINES[chosen].paid || !settings.fallback)) return first;
+  // Fallbacks are free engines only: a paid engine runs only when it is the one asked for.
+  return [...first, ...ENGINE_IDS.filter((id) => id !== chosen && usable(id) && !ENGINES[id].paid)];
 }
+
+/** Free engines, for the default-engine setting. */
+export const FREE_ENGINE_IDS = ENGINE_IDS.filter((id) => !ENGINES[id].paid);
+
+/** True when the paid engine can be offered as a "Try" button. */
+export const canTryMojeek = (settings) => !!settings.mojeekKey;
 
 /** Why each engine that won't be tried is left out, for the activity log. */
 export function skippedEngines(settings, chosen = settings.engine) {
   const order = engineOrder(settings, chosen);
   return ENGINE_IDS.filter((id) => !order.includes(id)).map((id) => ({
     id,
-    reason: ENGINES[id].needsKey && !settings.mojeekKey ? 'no API key in Settings' : 'fallback to other engines is off',
+    reason:
+      ENGINES[id].needsKey && !settings.mojeekKey
+        ? 'no API key in Settings'
+        : ENGINES[id].paid
+          ? 'paid, so only used when you tap “Try Mojeek”'
+          : ENGINES[chosen]?.paid
+            ? `you asked for ${ENGINES[chosen].name} specifically`
+            : 'fallback to other engines is off',
   }));
 }
 

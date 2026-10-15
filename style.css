@@ -146,6 +146,14 @@ pre {
 .bar .search button {
   display: none; /* the keyboard's Search key submits */
 }
+.button.secondary {
+  background: var(--card);
+  color: var(--fg) !important;
+  border: 1px solid var(--line);
+}
+.try-paid {
+  margin: 8px 0;
+}
 button.link {
   font: inherit;
   padding: 0;

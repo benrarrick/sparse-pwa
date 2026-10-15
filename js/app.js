@@ -275,7 +275,7 @@ function activity(title) {
 const failedAt = new Map();
 const resultsKey = (q, page, engine) => `${engine}|${page}|${q.trim().toLowerCase()}`;
 
-async function runSearch(q, page, chosen, act) {
+async function runSearch(q, page, chosen, act, knownInstant) {
   for (const s of L.skippedEngines(settings, chosen)) act.skip(`Skipped ${L.ENGINES[s.id].name}: ${s.reason}`);
   // Engines that failed in the last few minutes go last, so a slow one doesn't cost a timeout every search.
   const failing = (id) => Date.now() - (failedAt.get(id) ?? 0) < 5 * MIN;
@@ -287,7 +287,10 @@ async function runSearch(q, page, chosen, act) {
 
   let instant = Promise.resolve(null);
   if (page > 1) act.skip('Instant answer: only on the first page');
-  else if (!settings.instant) act.skip('Instant answer: turned off in Settings');
+  else if (knownInstant !== undefined) {
+    act.skip(`Instant answer: reusing the ${knownInstant ? 'one' : 'result'} from the free search, nothing downloaded`);
+    instant = Promise.resolve(knownInstant);
+  } else if (!settings.instant) act.skip('Instant answer: turned off in Settings');
   else {
     act.step('Asking DuckDuckGo for an instant answer, alongside the search…');
     instant = act
@@ -570,7 +573,9 @@ async function showHome(id) {
     h(
       'p',
       { class: 'muted small' },
-      engine ? `${L.ENGINES[engine].name}${settings.fallback ? ', with fallback' : ''} · ` : 'No engine set · ',
+      engine
+        ? `${L.ENGINES[engine].name}${settings.fallback ? ', with free fallback' : ''}${L.canTryMojeek(settings) ? ', Mojeek on request' : ''} · `
+        : 'No engine set · ',
       'add ',
       h('code', null, '!bang'),
       ' to search on DuckDuckGo',
@@ -663,6 +668,15 @@ async function showSearch(id, q, page, engineParam, force = false) {
   const weather = page === 1 ? L.weatherIntent(q) : null;
   const weatherDone = weather ? showWeather(cards, weather.place, id, act) : null;
 
+  /** Mojeek is paid, so it only runs from this button, never automatically. */
+  const tryMojeek = () =>
+    h(
+      'p',
+      { class: 'try-paid' },
+      h('a', { href: hashFor('/s', { q, e: 'mojeek' }), class: 'button secondary' }, 'Try Mojeek'),
+      h('span', { class: 'muted small' }, ' paid: about £0.001 per search, uses your key'),
+    );
+
   const show = (rec, { fromDevice = false, note = '' } = {}) => {
     if (id !== renderId) return;
     const name = L.ENGINES[rec.engine].name;
@@ -713,10 +727,12 @@ async function showSearch(id, q, page, engineParam, force = false) {
         ),
       ),
     );
-    const others = L.engineOrder({ ...settings, fallback: true }, rec.engine).filter((e) => e !== rec.engine);
+    const others = L.FREE_ENGINE_IDS.filter((e) => e !== rec.engine);
+    if (rec.engine !== 'mojeek' && L.canTryMojeek(settings)) status.append(tryMojeek());
     fill(
       foot,
       rec.more ? h('a', { href: hashFor('/s', { q, p: page + 1, e: rec.engine }), class: 'button' }, 'More results') : null,
+      rec.engine !== 'mojeek' && L.canTryMojeek(settings) ? tryMojeek() : null,
       h(
         'p',
         { class: 'small' },
@@ -731,7 +747,12 @@ async function showSearch(id, q, page, engineParam, force = false) {
   const showProblem = (message) => {
     if (id !== renderId) return;
     fill(status, h('p', null, message));
-    fill(foot, h('p', { class: 'small' }, external(L.ddgUrl(q, settings), `Search DuckDuckGo ${settings.ddg === 'html' ? 'HTML' : 'Lite'} instead ↗`)));
+    fill(
+      foot,
+      chosen !== 'mojeek' && L.canTryMojeek(settings) && navigator.onLine ? tryMojeek() : null,
+      L.ENGINES[chosen].paid ? h('p', null, h('a', { href: hashFor('/s', { q }) }, 'Back to the free results')) : null,
+      h('p', { class: 'small' }, external(L.ddgUrl(q, settings), `Search DuckDuckGo ${settings.ddg === 'html' ? 'HTML' : 'Lite'} instead ↗`)),
+    );
   };
 
   const finish = async (label) => {
@@ -764,7 +785,9 @@ async function showSearch(id, q, page, engineParam, force = false) {
     return finish('Offline, search queued');
   }
   try {
-    show(await runSearch(q, page, chosen, act));
+    // Re-searching with another engine (e.g. "Try Mojeek"): reuse the instant answer already fetched.
+    const earlier = page === 1 && chosen !== settings.engine ? await S.get('results', resultsKey(q, 1, settings.engine)) : null;
+    show(await runSearch(q, page, chosen, act, earlier ? (earlier.instant ?? null) : undefined));
     await finish('Search done');
   } catch (e) {
     if (cached) {
@@ -1232,11 +1255,15 @@ async function showSettings(id) {
       'section',
       null,
       h('h2', null, 'Search'),
-      field('Search engine', select('engine', { mwmbl: 'Mwmbl (free)', marginalia: 'Marginalia (free, often busy)', mojeek: 'Mojeek (needs a key)' })),
+      field(
+        'Search engine',
+        select('engine', { mwmbl: 'Mwmbl (free)', marginalia: 'Marginalia (free, often busy)' }),
+        'Searches always start with a free engine. Mojeek is never used automatically.',
+      ),
       field(
         'Mojeek API key',
         text('mojeekKey', 'paste your key'),
-        'From mojeek.com/services/search/web-search-api. Stays on this device and is sent only to Mojeek. Without it, Mojeek is skipped.',
+        'From mojeek.com/services/search/web-search-api. Mojeek is paid, so it never runs automatically: with a key set, a “Try Mojeek” button appears with your results. The key stays on this device and is sent only to Mojeek.',
       ),
       field(
         'Marginalia API key',
@@ -1352,7 +1379,11 @@ function updateOnline() {
 async function start() {
   history.scrollRestoration = 'manual';
   [settings, netLog, netTotals] = await Promise.all([
-    S.kvGet('settings', {}).then((s) => ({ ...DEFAULTS, ...s })),
+    S.kvGet('settings', {}).then((s) => {
+      const merged = { ...DEFAULTS, ...s };
+      if (!L.FREE_ENGINE_IDS.includes(merged.engine)) merged.engine = DEFAULTS.engine; // the paid engine is never the default
+      return merged;
+    }),
     S.kvGet('netlog', []),
     S.kvGet('nettotals', null).then((t) => t ?? emptyTotals()),
   ]);
