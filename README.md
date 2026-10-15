@@ -65,9 +65,9 @@ Files: `js/ai.js` (page side: downloads, worker, log, retrieval), `js/ai-engine.
 **Memory on iPhone:**
 - These exports compute a score for every word in the 65,536-word vocabulary at every prompt position. A 3,000-token prompt therefore needs about 0.4–0.8 GB beyond the 764 MB of weights, and iOS ended the app.
 - On the test iPhone, 338-token prompts worked, and prompts of about 650 tokens ended the app, even after splitting summaries into parts.
-- So there is a **Longest prompt** setting on the AI page (default 450 tokens). Summary parts and the saved text used for answers are sized to fit it.
+- So there is a **Longest prompt** setting on the AI page (default 300 tokens). Summary parts and the saved text used for answers are sized to fit it.
 - The engine refuses any prompt over the limit with a message, rather than letting iOS end the app.
-- At 450 tokens, a summary covers the first ~5,400 characters of a page, in 5 parts of ~1,100 characters each.
+- At 300 tokens, a summary covers the first ~1,800 characters of a page, in 3 parts of ~600 characters each. Raise the limit to cover more.
 - After any prompt over 900 tokens, the model is unloaded to give the memory back. Reloading takes about 3 s.
 
 **Measured on an iPhone, WebGPU with 16-bit floats:**

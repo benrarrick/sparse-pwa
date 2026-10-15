@@ -30,7 +30,7 @@ const DEFAULTS = {
   weatherDetail: 'basic',
   aiModel: 'lfm12',
   aiAutoSummary: false,
-  aiMaxPrompt: 450,
+  aiPromptLimit: 300, // renamed from aiMaxPrompt (450) so the safer default reaches saved settings
 };
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -1191,7 +1191,7 @@ async function runModel(pkg, messages, { out, status, act, id, maxTokens, label,
     const stats = await AI.generate(pkg, messages, {
       maxTokens,
       label,
-      maxPrompt: settings.aiMaxPrompt,
+      maxPrompt: settings.aiPromptLimit,
       onToken: (t) => {
         text += t;
         if (id === renderId) fill(out, answerNodes(text, sources));
@@ -1230,9 +1230,9 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
   box.hidden = false;
   fill(box, head, out, status);
   const text = AL.markdownToText(rec.markdown);
-  const partChars = AL.textBudget(settings.aiMaxPrompt);
+  const partChars = AL.textBudget(settings.aiPromptLimit);
   // Long pages are read in parts sized to the prompt limit; only as many as the final prompt can combine.
-  const t = AL.trimText(text, Math.min(spec.maxInputChars, partChars * AL.maxParts(settings.aiMaxPrompt)));
+  const t = AL.trimText(text, Math.min(spec.maxInputChars, partChars * AL.maxParts(settings.aiPromptLimit)));
   if (text.length < 200) {
     fill(status, 'There is too little text on this page to summarise.');
     return act.skip('Summary: too little text on the page');
@@ -1676,7 +1676,7 @@ async function showAsk(id, q0) {
       fill(status, 'Searching what is saved on this device…');
       let found;
       try {
-        found = await AI.retrieve(question, { budget: AL.textBudget(settings.aiMaxPrompt) - question.length, max: 4, say: (k, t) => act[k](t) });
+        found = await AI.retrieve(question, { budget: AL.textBudget(settings.aiPromptLimit) - question.length, max: 4, say: (k, t) => act[k](t) });
       } catch (e) {
         act.warn(`Search of saved pages failed: ${e.message}`);
         return fill(status, h('span', { class: 'bad' }, `Searching saved pages failed: ${e.message}. `), h('a', { href: '#/ai' }, 'AI diagnostics'));
@@ -1927,8 +1927,8 @@ async function showAI(id) {
         (() => {
           const s = h(
             'select',
-            { onchange: () => saveSetting('aiMaxPrompt', Number(s.value)) },
-            AL.PROMPT_LIMITS.map((n) => h('option', { value: String(n), selected: settings.aiMaxPrompt === n }, `${n} tokens (about ${AL.textBudget(n).toLocaleString()} characters of text)`)),
+            { onchange: () => saveSetting('aiPromptLimit', Number(s.value)) },
+            AL.PROMPT_LIMITS.map((n) => h('option', { value: String(n), selected: settings.aiPromptLimit === n }, `${n} tokens (about ${AL.textBudget(n).toLocaleString()} characters of text)`)),
           );
           return s;
         })(),
