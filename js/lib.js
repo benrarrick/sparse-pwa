@@ -311,6 +311,16 @@ export function readerUrl(u) {
   return `https://r.jina.ai/${u}`;
 }
 
+/** The human-readable reason from a Jina Reader error body (JSON), or ''. */
+export function jinaError(body) {
+  try {
+    const j = JSON.parse(body);
+    return clean(j.message || j.readableMessage || j.name || '');
+  } catch {
+    return '';
+  }
+}
+
 /** Splits Jina Reader's text output into its header fields and the Markdown body. */
 export function parseJina(text) {
   const marker = 'Markdown Content:';

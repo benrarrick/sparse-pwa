@@ -134,6 +134,15 @@ test('weather intent, parsing and units', () => {
   assert.match(L.forecastUrl(1, 2, 'f'), /temperature_unit=fahrenheit/);
 });
 
+test('jinaError reads the message from an error body', () => {
+  assert.equal(
+    L.jinaError('{"code":401,"name":"AuthenticationFailedError","message":"Invalid API key, please get a new one from https://jina.ai"}'),
+    'Invalid API key, please get a new one from https://jina.ai',
+  );
+  assert.equal(L.jinaError('<html>nope</html>'), '');
+  assert.equal(L.jinaError(''), '');
+});
+
 test('parseJina splits header and body', () => {
   const r = L.parseJina('Title: Example Domain\n\nURL Source: https://example.com/\n\nPublished Time: Tue, 13 Oct 2026\n\nMarkdown Content:\nHello *there*.\n');
   assert.deepEqual(r, { title: 'Example Domain', source: 'https://example.com/', published: 'Tue, 13 Oct 2026', markdown: 'Hello *there*.' });

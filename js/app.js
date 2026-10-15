@@ -18,6 +18,7 @@ const DEFAULTS = {
   instant: true,
   openIn: 'reader',
   cacheHours: 6,
+  jinaKey: '',
 };
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -71,18 +72,19 @@ function twoTap(label, action) {
 // ---------- network ----------
 
 class HttpError extends Error {
-  constructor(status) {
+  constructor(status, body = '') {
     super(`HTTP ${status}`);
     this.status = status;
+    this.body = body;
   }
 }
 
-async function fetchT(url, ms = 15000) {
+async function fetchT(url, ms = 15000, headers = {}) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), ms);
   try {
-    const res = await fetch(url, { signal: ac.signal, credentials: 'omit', referrerPolicy: 'no-referrer' });
-    if (!res.ok) throw new HttpError(res.status);
+    const res = await fetch(url, { signal: ac.signal, credentials: 'omit', referrerPolicy: 'no-referrer', headers });
+    if (!res.ok) throw new HttpError(res.status, (await res.text().catch(() => '')).slice(0, 2000));
     return res;
   } catch (e) {
     if (e instanceof HttpError) throw e;
@@ -150,11 +152,20 @@ async function runSearch(q, page, chosen) {
 async function loadPage(url) {
   let text;
   try {
-    text = await (await fetchT(L.readerUrl(url), 30000)).text();
+    const auth = settings.jinaKey ? { Authorization: `Bearer ${settings.jinaKey}` } : {};
+    text = await (await fetchT(L.readerUrl(url), 30000, auth)).text();
   } catch (e) {
-    if (e instanceof HttpError && e.status === 429) throw new Error('the reader allows 20 pages a minute; wait a moment');
-    if (e instanceof HttpError) throw new Error(`the reader could not fetch this page (${e.status})`);
-    throw e;
+    if (!(e instanceof HttpError)) throw e;
+    const why = L.jinaError(e.body);
+    if (e.status === 429)
+      throw new Error(
+        `Jina Reader is rate-limiting you${why ? ` (${why})` : ''}; wait a minute${settings.jinaKey ? '' : ', or add a free Jina key in Settings'}`,
+      );
+    if (e.status === 401 || e.status === 402 || e.status === 403) {
+      const hint = settings.jinaKey ? 'check the Jina key in Settings' : 'add a free Jina API key in Settings';
+      throw new Error(`Jina Reader refused the request (${e.status}${why ? `: ${why}` : ''}); ${hint}`);
+    }
+    throw new Error(`Jina Reader could not fetch this page (${e.status}${why ? `: ${why}` : ''})`);
   }
   const parsed = L.parseJina(text);
   const old = await S.get('pages', url);
@@ -677,6 +688,11 @@ async function showSettings(id) {
         '“public” is shared by everyone and is often busy. You can email Marginalia for your own key.',
       ),
       checkField('Try other engines when one fails or finds nothing', check('fallback')),
+      field(
+        'Jina Reader API key',
+        text('jinaKey', 'optional'),
+        'Reader view works without a key, but Jina may refuse anonymous requests from some networks (401). A free key from jina.ai fixes that and raises the limit to 200 pages a minute. Stays on this device and is sent only to Jina.',
+      ),
       field('Region', select('region', L.REGIONS), 'Used by Mojeek and the DuckDuckGo button.'),
       checkField('Safe search', check('safe')),
       checkField('Instant answers (DuckDuckGo)', check('instant')),
