@@ -49,6 +49,13 @@ The one model here that does not run on Transformers.js. It came out best in the
 
 **Memory habits.** One model is resident at a time. BGE is released as soon as retrieval finishes, before a chat model loads. Phone models are released two minutes after last use, and straight after a prompt above 85% of the limit.
 
+**Releasing means ending the worker (v2.4).** Unloading a model inside a worker does not give all of its memory back: WASM memory never shrinks (ONNX Runtime keeps what BGE grew it to, and its 27 MB binary stays compiled), and WebLLM's GPU device and heap may outlive its unload. An iPhone ended the app at `load.start` of Llama 3.2 1B, loaded into the worker BGE had just used. So:
+- on a phone (and other low-memory classes) every release (after retrieval, idle, after a long prompt, making room, after the Llama download check) ends the worker, and the next load starts a fresh one after a 500 ms pause; the log says "Unloaded … by ending the AI worker", and `recycles` in the report's worker section counts them;
+- everywhere, Llama 3.2 1B only loads into a worker that has held no model since it started;
+- on a phone the keyword index and BGE vectors are dropped after each retrieval (rebuilt next question), and retrieval hands back only the chosen passages, so the page holds nothing large while the model loads and writes.
+
+Checked in headless Chrome with the iPhone class forced (BGE released by ending the worker; the next question starts a new one). The Llama path was not run (no model on that machine) and nothing was run on an iPhone.
+
 **Checkpoints and what the next launch says.** Before each risky stage the page writes a small versioned checkpoint to `localStorage`: model, backend, token counts, stage, start and last-progress times, visibility. It is deleted when the work ends. A leftover one at the next launch is classified and shown on the AI page and in the log:
 
 | Diagnosis | When |

@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '2.3';
+const APP_VERSION = '2.4';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -1752,7 +1752,7 @@ async function showAsk(id, q0) {
       AI.noteDetail({ question, sources: sources.map((x) => x.title) });
       if (!sources.length) {
         act.skip('Nothing saved matches the question');
-        fill(status, found.all.length ? 'Nothing saved on this device matches the question.' : 'Nothing is saved on this device yet: search, or open pages in the reader, and they become answerable here.');
+        fill(status, found.count ? 'Nothing saved on this device matches the question.' : 'Nothing is saved on this device yet: search, or open pages in the reader, and they become answerable here.');
         if (use) {
           const alt = h('button', { type: 'button', class: 'button secondary small', onclick: () => ((mode.value = 'general'), ask()) }, 'Ask the model’s own knowledge instead');
           srcBox.append(h('p', null, alt));

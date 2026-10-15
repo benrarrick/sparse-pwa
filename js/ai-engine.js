@@ -246,8 +246,14 @@ export function createEngine(post, deps = {}) {
       if (deps.loadW) return (W = await deps.loadW());
       const js = await AS.fileBlob('webllm', 'web-llm.js');
       if (!js) throw new AiError('MODEL_NOT_INSTALLED', 'The WebLLM engine is not on this device. Download the model again: the engine comes with it.');
-      // imported from a blob: URL made from the stored file, so it works offline
-      W = await import(URL.createObjectURL(new Blob([js], { type: 'text/javascript' })));
+      // imported from a blob: URL made from the stored file, so it works offline; once evaluated the 6 MB
+      // copy is let go (the bundle never refers to its own address)
+      const url = URL.createObjectURL(new Blob([js], { type: 'text/javascript' }));
+      try {
+        W = await import(url);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
       log('ok', `WebLLM engine started (${js.size ? Math.round(js.size / 1e6) : '?'} MB)`);
       return W;
     })().catch((e) => {

@@ -322,10 +322,11 @@ let conn = null;
 let connecting = null;
 const pending = new Map();
 const loaded = new Map();
+const hosted = new Set(); // every model this worker has loaded (or tried to) since it started, released or not
 let seq = 0;
 let idleTimer = null;
 let workerState = 'none'; // none · starting · initialised · responsive · busy · unresponsive · terminated · restarted
-const workerStats = { starts: 0, terminations: 0, resets: 0, lastMsgAt: null, lastPongMs: null, build: null };
+const workerStats = { starts: 0, terminations: 0, resets: 0, recycles: 0, lastMsgAt: null, lastPongMs: null, build: null };
 
 function setWorker(s, msg, level = 'info') {
   workerState = s;
@@ -461,6 +462,7 @@ function drop(reason, code = 'WORKER_FAILED') {
   conn = null;
   connecting = null;
   loaded.clear();
+  hosted.clear();
   emit('loaded');
   const err = reason instanceof Error ? reason : new AiError(code, reason);
   for (const key of [...pending.keys()]) failPending(key, err);
@@ -540,6 +542,30 @@ export function restart(why = 'Restarted', code = 'WORKER_FAILED') {
     setWorker('terminated', why, code === 'CANCELLED' ? 'info' : 'warn');
   }
   drop(new AiError(code, why), code);
+}
+
+// Releasing a model inside a worker does not give all of its memory back: WASM memory never shrinks (ONNX
+// Runtime keeps what BGE grew it to, and its 27 MB binary stays compiled), and WebLLM's GPU device and WASM
+// heap may outlive its unload. Ending the worker gives everything back. So on a phone every release ends the
+// worker, and a model only ever loads into a worker that has held nothing. Llama 3.2 1B (the largest, which
+// ended the app at load.start after retrieval had run BGE in the same worker) gets a fresh worker everywhere.
+const RECYCLE_SETTLE_MS = 500; // a moment for the ended worker's memory to be returned before the next load (a guess)
+const releasesByEnding = () => conn?.mode === 'worker' && PO.isLowMemory(cls);
+
+/** Ends the worker before `id` loads, if it has held any model and `id` must start clean. */
+async function freshWorkerFor(id) {
+  if (conn?.mode !== 'worker' || !hosted.size || !(P[id].runtime === 'webllm' || PO.isLowMemory(cls))) return;
+  const held = [...hosted].map((x) => P[x]?.short ?? x).join(', ');
+  workerStats.recycles++;
+  restart(`A fresh AI worker for ${P[id].short}`, 'CANCELLED');
+  if (PO.isLowMemory(cls)) await sleep(RECYCLE_SETTLE_MS);
+  await log('info', 'memory', `Started a fresh AI worker for ${P[id].short}: the last one had held ${held}, and memory released inside a worker is not all returned`, { pkg: id });
+}
+
+/** Releases a model by ending the worker, so all of its memory is returned. */
+function releaseByEnding(id, why) {
+  workerStats.recycles++;
+  restart(`Released ${P[id]?.short ?? id} (${why}) by ending the AI worker`, 'CANCELLED');
 }
 
 /** Tells the worker apart from a busy one: an idle worker answers a ping at once. */
@@ -623,6 +649,7 @@ async function loadStep(ctx, id, { onProgress } = {}) {
     return loaded.get(id);
   }
   preflight(id, 'load');
+  await freshWorkerFor(id);
   await connect();
   await ensureResponsive();
   // one model in memory at a time: the others are released completely before this one loads
@@ -636,6 +663,7 @@ async function loadStep(ctx, id, { onProgress } = {}) {
     restart('Loading took too long', 'WORKER_UNRESPONSIVE');
   }, LOAD_LIMIT_MS);
   try {
+    hosted.add(id); // a failed load can leave as much behind as a finished one
     const info = await request({ type: 'load', id: ctx.id, pkg: id, dtype: rec.dtype, device: rec.device, chunks: AL.dataChunks(P[id], rec.dtype), cls }, { progress: onProgress });
     loaded.set(id, info);
     const r = await state(id);
@@ -656,6 +684,11 @@ async function loadStep(ctx, id, { onProgress } = {}) {
 async function unloadStep(ctx, id, why) {
   if (!loaded.has(id) || !conn) return;
   cpStage('dispose.start', { pkg: id });
+  if (releasesByEnding()) {
+    releaseByEnding(id, why);
+    await log('info', 'memory', `Unloaded ${P[id].short} by ending the AI worker (${why}), so all of its memory is returned`, { pkg: id });
+    return;
+  }
   try {
     await request({ type: 'unload', id: ctx.id, pkg: id, why });
   } catch (e) {
@@ -1102,10 +1135,12 @@ async function fetchWebllm(j, id, spec, rec) {
     await sched.run({ type: 'load', pkg: id, label: 'download' }, async (ctx) => {
       begin(ctx, 'load', id);
       try {
+        await freshWorkerFor(id);
         await connect();
         await ensureResponsive();
         for (const other of [...loaded.keys()]) await ctx.child({ type: 'unload', pkg: other, label: 'make room' }, (c) => unloadStep(c, other, 'making room for another model'));
         cpStage('load.start', { pkg: id, dtype: rec.dtype, device: rec.device, mode: conn.mode, download: true });
+        hosted.add(id);
         await request(
           { type: 'load', id: ctx.id, pkg: id, dtype: rec.dtype, device: rec.device, fetchOnly: true, cls },
           {
@@ -1119,6 +1154,8 @@ async function fetchWebllm(j, id, spec, rec) {
             },
           },
         );
+        // the check loaded it onto the GPU once: give all of that back before anything else runs
+        if (releasesByEnding()) releaseByEnding(id, 'after the download check');
       } finally {
         cpClear(ctx.id);
       }
@@ -1404,9 +1441,20 @@ export async function init() {
 
 // ---------- retrieval ----------
 
-const indexer = SEL.createIndexer();
+let indexer = SEL.createIndexer();
 const vecCache = new Map(); // passage id -> { h, v }
 let vecLoaded = false;
+
+/**
+ * On a phone the keyword index and the vectors are not kept between questions: the page and the AI worker
+ * share one process there, and every megabyte left to the chat model that loads next counts. Rebuilding
+ * them costs a fraction of a second per question.
+ */
+function forgetSearchMemory() {
+  indexer = SEL.createIndexer();
+  vecCache.clear();
+  vecLoaded = false;
+}
 
 async function loadVectors() {
   if (vecLoaded) return;
@@ -1427,6 +1475,7 @@ async function loadVectors() {
  * (always, from an index that is updated rather than rebuilt) fused with meaning match (when BGE is
  * downloaded and allowed). `budget` is a hard limit on characters of evidence, labels included.
  * BGE is released before this returns, so a chat model can load next. `say(kind, text)` narrates.
+ * Returns { count (passages searched), picked, metrics, semantic }.
  * Never throws because the AI is unavailable: it falls back to keywords.
  */
 export async function retrieve(question, { budget = 1000, max = 4, say = () => {}, owner = null } = {}) {
@@ -1439,7 +1488,7 @@ export async function retrieve(question, { budget = 1000, max = 4, say = () => {
   say('step', `Looking through ${pageCount} pages and ${all.length - all.filter((p) => p.kind === 'page').length} search results kept on this device (${all.length} passages)`);
   if (!all.length) {
     m.totalMs = Math.round(performance.now() - t0);
-    return { all, picked: [], metrics: m, semantic: 'off' };
+    return { count: 0, picked: [], metrics: m, semantic: 'off' };
   }
   const idx = indexer.sync(all);
   Object.assign(m, { bm25BuildMs: Math.round(idx.ms), bm25Added: idx.added, bm25Reused: idx.reused, bm25Removed: idx.removed });
@@ -1512,7 +1561,9 @@ export async function retrieve(question, { budget = 1000, max = 4, say = () => {
   m.selectMs = Math.round(performance.now() - tp);
   Object.assign(m, { passages: all.length, considered: fused.length, selected: picked.length, excluded: Math.max(0, fused.length - picked.length), excerpted: picked.filter((p) => p.excerpted).length, evidenceChars: picked.reduce((n, p) => n + p.text.length, 0), budget, totalMs: Math.round(performance.now() - t0) });
   event('ai.retrieval.completed', { level: 'ok', msg: `Retrieval: ${picked.length} of ${fused.length} candidate passages chosen in ${m.totalMs} ms (${m.semantic} meaning match)`, m });
-  return { all, picked, metrics: m, semantic: m.semantic };
+  if (PO.isLowMemory(cls)) forgetSearchMemory();
+  // only the chosen passages go back: the caller keeps the result while the model writes
+  return { count: all.length, picked, metrics: m, semantic: m.semantic };
 }
 
 // ---------- summaries and questions ----------
