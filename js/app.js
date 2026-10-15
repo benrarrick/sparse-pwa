@@ -4,10 +4,14 @@
 //   #/r?u=        reader view of a page, through Jina Reader
 //   #/net         network details: every request, totals per service, how the app loaded
 //   #/settings
+//   #/ai          on-device AI: downloads, device checks, diagnostics (all opt-in)
+//   #/ask?q=      ask the on-device AI, from saved pages and searches or on its own
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
+import * as AI from './ai.js';
+import * as AL from './ai-lib.js';
 
 const DEFAULTS = {
   engine: 'mwmbl',
@@ -24,6 +28,8 @@ const DEFAULTS = {
   jinaKey: '',
   showActivity: true,
   weatherDetail: 'basic',
+  aiModel: 'lfm12',
+  aiAutoSummary: false,
 };
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -568,9 +574,16 @@ async function showHome(id) {
       'header',
       { class: 'bar' },
       h('span', { class: 'brand' }, 'Sparse'),
-      h('nav', { class: 'links' }, h('a', { href: '#/net' }, 'Network'), h('a', { href: '#/settings' }, 'Settings')),
+      h(
+        'nav',
+        { class: 'links' },
+        AI.anyChat() || AI.isReady('bge') ? h('a', { href: '#/ask' }, 'Ask') : null,
+        h('a', { href: '#/net' }, 'Network'),
+        h('a', { href: '#/settings' }, 'Settings'),
+      ),
     ),
     searchForm(),
+    AI.crashOnLaunch() ? h('p', { class: 'small bad' }, AL.crashText(AI.crashOnLaunch()), ' ', h('a', { href: '#/ai' }, 'AI diagnostics')) : null,
     h(
       'p',
       { class: 'muted small' },
@@ -1140,6 +1153,96 @@ async function archiveOffer(box, url, act, id) {
   }
 }
 
+// ---------- on-device AI: shared output ----------
+
+/** Model text as paragraphs and lists; [n] becomes a link to source n when sources are given. */
+function answerNodes(text, sources) {
+  const inline = (t) =>
+    sources
+      ? AL.citations(t).map((part) => {
+          if (part.text != null) return part.text;
+          const src = sources[part.cite - 1];
+          return src?.url ? h('a', { href: hashFor('/r', { u: src.url }), class: 'cite' }, `[${part.cite}]`) : `[${part.cite}]`;
+        })
+      : t;
+  return AL.splitAnswer(text).map((b) => (b.type === 'list' ? h('ul', null, b.items.map((it) => h('li', null, inline(it)))) : h('p', null, inline(b.text))));
+}
+
+const loadNote = (p) => (p.total ? `${Math.round((100 * p.loaded) / p.total)}% of ${AL.size(p.total)}` : AL.size(p.loaded));
+
+/**
+ * Loads a chat model and streams its reply into `out`, narrating in `status` and the activity log.
+ * Resolves with { text, stats }, or null if it failed (the reason is shown and logged).
+ */
+async function runModel(pkg, messages, { out, status, act, id, maxTokens, label, sources }) {
+  const short = AL.PACKAGES[pkg].short;
+  const stopBtn = h('button', { type: 'button', class: 'link', onclick: () => AI.stop() }, 'Stop');
+  try {
+    if (!AI.loadedModels().has(pkg)) {
+      act.step(`Loading ${short} from this device into memory (nothing is downloaded)…`);
+      fill(status, `Loading ${short} into memory…`);
+      await AI.ensureLoaded(pkg, { onProgress: (p) => id === renderId && fill(status, `Loading ${short} into memory: ${loadNote(p)}`) });
+      act.ok(`${short} is ready (${T(AI.loadedModels().get(pkg)?.ms)})`);
+    }
+    if (id !== renderId) return null;
+    fill(status, `${short} is writing… `, stopBtn);
+    let text = '';
+    const stats = await AI.generate(pkg, messages, {
+      maxTokens,
+      label,
+      onToken: (t) => {
+        text += t;
+        if (id === renderId) fill(out, answerNodes(text, sources));
+      },
+    });
+    if (!text.trim()) act.warn(`${short} returned no text`);
+    act.ok(`${short}: ${AL.describeRun(stats)}`);
+    if (id === renderId) fill(status, `${short} on this device · 0 B downloaded · ${AL.describeRun(stats)}`);
+    return { text, stats };
+  } catch (e) {
+    act.warn(`AI failed: ${e.message}`);
+    if (id === renderId)
+      fill(status, h('span', { class: 'bad' }, `The AI failed: ${e.message}. `), h('a', { href: '#/ai' }, 'Details in AI diagnostics'));
+    return null;
+  }
+}
+
+/** The reader's summary card. `cachedOnly` shows a summary made earlier without making a new one. */
+async function summarise(rec, url, box, act, id, { auto = false, redo = false, cachedOnly = false } = {}) {
+  const pkg = AI.chatModel(settings.aiModel);
+  if (!pkg) return;
+  const spec = AL.PACKAGES[pkg];
+  const status = h('p', { class: 'small muted' });
+  const out = h('div', { class: 'answer' });
+  const head = h('h2', null, 'Summary');
+  const old = redo ? null : await AI.getSummary(url, pkg);
+  if (id !== renderId) return;
+  if (old) {
+    box.hidden = false;
+    fill(box, head, out, status);
+    fill(out, answerNodes(old.text));
+    fill(status, `Made ${L.relTime(old.at)} by ${spec.short} on this device${old.cut ? ` from the first ${old.chars.toLocaleString()} of ${old.of.toLocaleString()} characters` : ''} · `, h('button', { type: 'button', class: 'link', onclick: () => summarise(rec, url, box, act, id, { redo: true }) }, 'Redo'));
+    return act.skip(`Summary: made earlier by ${spec.short}, kept on this device`);
+  }
+  if (cachedOnly) return;
+  box.hidden = false;
+  fill(box, head, out, status);
+  const text = AL.markdownToText(rec.markdown);
+  const t = AL.trimText(text, spec.maxInputChars);
+  if (text.length < 200) {
+    fill(status, 'There is too little text on this page to summarise.');
+    return act.skip('Summary: too little text on the page');
+  }
+  act.step(
+    `${auto ? 'Summarising automatically (Settings)' : 'Summarising'} with ${spec.short} on this device: ${t.cut ? `the first ${t.text.length.toLocaleString()} of ${t.of.toLocaleString()} characters` : `${t.text.length.toLocaleString()} characters`}. Nothing is sent anywhere.`,
+  );
+  const r = await runModel(pkg, AL.summaryMessages(rec.title, t.text), { out, status, act, id, maxTokens: 320, label: 'summary' });
+  if (r?.text.trim() && !r.stats.stopped) {
+    await AI.saveSummary(url, pkg, { text: r.text, at: Date.now(), stats: r.stats, cut: t.cut, chars: t.text.length, of: t.of });
+    act.ok('Summary kept on this device with the page');
+  }
+}
+
 async function showRead(id, raw, reload = false) {
   const url = L.safeHttpUrl(raw);
   const arch = url ? L.parseWaybackUrl(url) : null;
@@ -1183,6 +1286,8 @@ async function showRead(id, raw, reload = false) {
     act.step('Turning the text into a page…');
     const blocks = L.trimNav(L.parseMarkdown(rec.markdown, rec.source || url));
     const box = h('div', { class: 'archive card', hidden: true });
+    const summary = h('div', { class: 'ai-out card', hidden: true });
+    const sumBtn = AI.anyChat() ? h('button', { type: 'button', class: 'link', onclick: () => summarise(rec, url, summary, act, id, { redo: !summary.hidden }) }, 'Summarise') : null;
     const archived = h('button', { type: 'button', class: 'link' }, 'Archived copy');
     archived.addEventListener('click', () => {
       archived.disabled = true;
@@ -1201,15 +1306,18 @@ async function showRead(id, raw, reload = false) {
           : [external(url, 'Open original ↗'), ' · ', archived],
         ' · ',
         save,
+        sumBtn ? [' · ', sumBtn] : null,
         rec.published ? h('span', { class: 'muted' }, ` · ${formatDate(rec.published)}`) : null,
       ),
       box,
+      summary,
       blocks.length
         ? blockNodes(blocks, url, arch ? (href) => L.unarchiveLink(href, arch.original) : undefined)
         : h('p', { class: 'muted' }, 'The reader found no text on this page. Try opening the original.'),
     );
     act.ok(`Showing ${plural(blocks.length, 'block')} of text (menus at the top removed)`);
     settle();
+    if (sumBtn) summarise(rec, url, summary, act, id, { auto: settings.aiAutoSummary && !fromDevice, cachedOnly: !(settings.aiAutoSummary && !fromDevice) });
   };
 
   const showProblem = (message, { archive = false } = {}) => {
@@ -1485,6 +1593,399 @@ async function showNet(id) {
   settle();
 }
 
+// ---------- ask: questions for the on-device AI ----------
+
+const sourceLabel = (s) => (s.kind === 'page' ? `${L.hostOf(s.url)} · saved page` : s.kind === 'instant' ? `instant answer for “${s.q}”` : `search result for “${s.q}”`);
+
+function sourceList(sources) {
+  return h(
+    'ol',
+    { class: 'sources small' },
+    sources.map((s) =>
+      h(
+        'li',
+        null,
+        s.url ? h('a', { href: hashFor('/r', { u: s.url }) }, s.title) : s.title,
+        h('span', { class: 'muted' }, ` · ${sourceLabel(s)}${s.from ? ` · matched by ${s.from.join(' and ')}` : ''}`),
+        s.text ? h('span', { class: 'block muted' }, `${s.text.slice(0, 160)}${s.text.length > 160 ? '…' : ''}`) : null,
+      ),
+    ),
+  );
+}
+
+async function showAsk(id, q0) {
+  document.title = 'Ask · Sparse';
+  const asks = await AI.recentAsks();
+  if (id !== renderId) return;
+  const pkg = AI.chatModel(settings.aiModel);
+  const bge = AI.isReady('bge');
+  const act = activity('Ask');
+  const input = h('textarea', { name: 'q', rows: 3, placeholder: pkg ? 'Ask a question' : 'Words to find in saved pages', 'aria-label': 'Question', enterkeyhint: 'send' }, q0);
+  const mode = h(
+    'select',
+    { 'aria-label': 'Answer from' },
+    h('option', { value: 'saved', selected: true }, 'My saved pages and searches'),
+    h('option', { value: 'general', disabled: !pkg }, 'The model’s own knowledge (no sources)'),
+  );
+  const chats = AL.CHAT_IDS.filter((x) => AI.isReady(x));
+  const model =
+    chats.length > 1
+      ? h(
+          'select',
+          { 'aria-label': 'Model', onchange: () => saveSetting('aiModel', model.value) },
+          chats.map((x) => h('option', { value: x, selected: x === pkg }, AL.PACKAGES[x].short)),
+        )
+      : null;
+  const out = h('div');
+  const ask = async () => {
+    const question = input.value.trim();
+    if (!question) return;
+    input.blur();
+    const use = model?.value ?? pkg;
+    const status = h('p', { class: 'small muted' });
+    const answer = h('div', { class: 'answer' });
+    const srcBox = h('div');
+    fill(out, h('div', { class: 'ai-out card' }, h('h2', null, question), answer, status, srcBox));
+    let sources = null;
+    let messages;
+    if (mode.value === 'saved') {
+      fill(status, 'Searching what is saved on this device…');
+      let found;
+      try {
+        found = await AI.retrieve(question, { budget: use ? AL.PACKAGES[use].contextChars : 6000, say: (k, t) => act[k](t) });
+      } catch (e) {
+        act.warn(`Search of saved pages failed: ${e.message}`);
+        return fill(status, h('span', { class: 'bad' }, `Searching saved pages failed: ${e.message}. `), h('a', { href: '#/ai' }, 'AI diagnostics'));
+      }
+      if (id !== renderId) return;
+      sources = found.picked;
+      if (!sources.length) {
+        act.skip('Nothing saved matches the question');
+        fill(status, found.all.length ? 'Nothing saved on this device matches the question.' : 'Nothing is saved on this device yet: search, or open pages in the reader, and they become answerable here.');
+        if (use) {
+          const alt = h('button', { type: 'button', class: 'button secondary small', onclick: () => ((mode.value = 'general'), ask()) }, 'Ask the model’s own knowledge instead');
+          srcBox.append(h('p', null, alt));
+        }
+        return act.finish('Ask: nothing matched');
+      }
+      fill(srcBox, h('h3', null, 'Sources on this device'), sourceList(sources));
+      act.ok(`Using ${plural(sources.length, 'passage')} (${sources.reduce((n, s) => n + s.text.length, 0).toLocaleString()} characters)`);
+      if (!use) {
+        fill(status, 'These are the closest passages. Download a chat model on the AI page to get a written answer.');
+        return act.finish('Ask: passages found (no chat model)');
+      }
+      messages = AL.answerMessages(question, sources);
+    } else {
+      act.step('Answering from the model’s own knowledge: no sources, so check anything important');
+      messages = AL.generalMessages(question);
+    }
+    const r = await runModel(use, messages, { out: answer, status, act, id, maxTokens: 400, label: mode.value === 'saved' ? 'answer from saved' : 'general answer', sources });
+    if (!r) return act.finish('Ask failed');
+    if (mode.value === 'general') status.append(' · from the model’s memory (trained to mid-2024); it can be wrong');
+    await AI.saveAsk({ q: question, mode: mode.value, pkg: use, text: r.text, stats: r.stats, at: Date.now(), sources: sources?.map(({ title, url, kind, q }) => ({ title, url, kind, q })) });
+    act.finish(`Answered on this device · ${AL.describeRun(r.stats)}`);
+  };
+  render(
+    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'Ask'), h('a', { href: '#/ai' }, 'AI settings')),
+    !pkg && !bge
+      ? h(
+          'div',
+          { class: 'card' },
+          h('p', null, 'Answers need a model on this device. Nothing is downloaded until you choose one: ', h('a', { href: '#/ai' }, 'set up on-device AI'), '.'),
+          h('p', { class: 'small muted' }, 'Until then, this finds matching passages in your saved pages and searches by keyword.'),
+        )
+      : null,
+    h(
+      'form',
+      {
+        class: 'ask',
+        onsubmit: (e) => {
+          e.preventDefault();
+          ask();
+        },
+      },
+      input,
+      h('div', { class: 'ask-row' }, mode, model, h('button', { type: 'submit', class: 'button' }, pkg ? 'Ask' : 'Find')),
+      h(
+        'p',
+        { class: 'small muted' },
+        pkg ? `${AL.PACKAGES[pkg].short} answers on this device, offline. ` : '',
+        bge ? 'Saved passages are matched by meaning (BGE) and by keyword.' : 'Saved passages are matched by keyword; BGE on the AI page adds matching by meaning.',
+      ),
+    ),
+    act.el,
+    out,
+    asks.length > 0 &&
+      h(
+        'section',
+        null,
+        h('h2', null, 'Earlier questions'),
+        asks.map((a) =>
+          h(
+            'details',
+            { class: 'earlier' },
+            h('summary', null, a.q, h('span', { class: 'muted small' }, ` · ${L.relTime(a.at)}`)),
+            h('div', { class: 'answer' }, answerNodes(a.text, a.sources)),
+            h('p', { class: 'small muted' }, `${AL.PACKAGES[a.pkg]?.short ?? a.pkg} · ${a.mode === 'saved' ? 'from saved pages' : 'own knowledge'} · ${AL.describeRun(a.stats)}`),
+            a.sources?.length ? sourceList(a.sources) : null,
+          ),
+        ),
+        twoTap('Clear earlier questions', () => AI.clearAsks()),
+      ),
+  );
+  if (q0) ask();
+  else settle();
+}
+
+// ---------- on-device AI: downloads, device checks, diagnostics ----------
+
+let aiUnsub = null;
+
+function pkgCard(id, rec, dev) {
+  const spec = AL.PACKAGES[id];
+  const variant = rec.dtype || spec.kind === 'engine' ? rec : AL.pickVariant(spec, AI.usableGpu(dev));
+  const total = AL.totalSize(AL.filesFor(spec, variant.dtype));
+  const unsupported = spec.kind !== 'engine' && !variant.dtype;
+  const where = spec.kind === 'engine' || unsupported ? '' : `${variant.dtype} on ${variant.device === 'webgpu' ? 'WebGPU' : 'the CPU'}`;
+  const prog = h('progress', { max: total, value: rec.have ?? 0, hidden: !['downloading', 'paused', 'queued'].includes(rec.status) });
+  const line = h('p', { class: 'small', id: `ai-status-${id}` });
+  const statusText = {
+    none: unsupported ? 'Not available on this device' : `Not on this device · ${AL.size(total)}${where ? ` (${where})` : ''}`,
+    queued: 'Waiting to download…',
+    downloading: `Downloading · ${AL.size(rec.have ?? 0)} of ${AL.size(total)}`,
+    paused: `Paused at ${AL.size(rec.have ?? 0)} of ${AL.size(total)}${rec.reason ? `: ${rec.reason}` : ''}`,
+    failed: `Download failed: ${rec.error}`,
+    ready: `On this device · ${AL.size(total)}${where ? ` · ${where}` : ''}${rec.readyAt ? ` · downloaded ${L.relTime(rec.readyAt)}` : ''}`,
+  }[rec.status];
+  fill(line, rec.status === 'failed' ? h('span', { class: 'bad' }, statusText) : statusText);
+  const button = (label, fn, cls = 'button small') => h('button', { type: 'button', class: cls, onclick: fn }, label);
+  const testOut = h('div', { class: 'small' });
+  const buttons = [];
+  if (spec.kind !== 'engine') {
+    if ((rec.status === 'none' || rec.status === 'failed') && !unsupported) buttons.push(button(`Download ${AL.size(total - (rec.have ?? 0))}`, () => AI.download(id)));
+    if (rec.status === 'paused') buttons.push(button('Resume', () => AI.download(id)));
+    if (rec.status === 'queued' || rec.status === 'downloading') buttons.push(button('Pause', () => AI.pause(id), 'button secondary small'));
+    if (rec.status === 'ready') buttons.push(button('Test', () => testModel(id, testOut), 'button secondary small'));
+    if (rec.status !== 'none') buttons.push(twoTap(rec.status === 'ready' ? `Remove (frees ${AL.size(total)})` : 'Cancel and delete', () => AI.remove(id)));
+  }
+  const notes = [];
+  if (rec.crashes) notes.push(h('p', { class: 'small bad' }, `The app stopped ${plural(rec.crashes, 'time')} while using this model${rec.lastCrash ? `, last ${L.relTime(rec.lastCrash.found)} (while ${rec.lastCrash.what === 'load' ? 'loading' : rec.lastCrash.what === 'embed' ? 'indexing' : 'writing'})` : ''}: most likely it needed more memory than iOS allows the app.`));
+  if (rec.lastLoad) notes.push(h('p', { class: 'small muted' }, `Last loaded in ${T(rec.lastLoad.ms)} (${rec.lastLoad.where}, ${rec.lastLoad.mode === 'page' ? 'on the page' : 'in a worker'}), ${L.relTime(rec.lastLoad.at)}`));
+  if (rec.lastRun) notes.push(h('p', { class: 'small muted' }, `Last run (${rec.lastRun.label}): ${AL.describeRun(rec.lastRun)}, ${L.relTime(rec.lastRun.at)}`));
+  if (rec.lastError) notes.push(h('p', { class: 'small bad' }, `Last error (${rec.lastError.phase}, ${L.relTime(rec.lastError.at)}): ${rec.lastError.message}`));
+  if (spec.experimental && rec.status !== 'ready')
+    notes.push(h('p', { class: 'small warn' }, 'Experimental: it needs about 2 GB of memory, which is probably more than iOS lets a web app use. If loading it ends the app, that shows up here on the next launch.'));
+  if (unsupported) notes.push(h('p', { class: 'small bad' }, `Needs WebGPU, which this browser doesn't offer${dev.gpu.fallback ? ' (only a software version)' : ''}, so it can't run here.`));
+  else if (spec.kind === 'chat' && rec.device !== 'webgpu' && !AI.usableGpu(dev))
+    notes.push(h('p', { class: 'small warn' }, `No usable WebGPU here${dev.gpu.fallback ? ' (only a software version)' : ''}, so it runs on the CPU with larger 8-bit weights: expect it to be slow.`));
+  return h(
+    'div',
+    { class: `card pkg${spec.kind === 'engine' ? ' engine' : ''}` },
+    h('h3', null, spec.name),
+    h('p', { class: 'small muted' }, spec.role, spec.license ? ` License: ${spec.license}.` : ''),
+    line,
+    prog,
+    buttons.length ? h('p', { class: 'pkg-actions' }, buttons.flatMap((b, i) => (i ? [' ', b] : [b]))) : null,
+    notes,
+    testOut,
+  );
+}
+
+async function testModel(id, box) {
+  const spec = AL.PACKAGES[id];
+  const say = (...n) => fill(box, ...n);
+  try {
+    say(`Loading ${spec.short}…`);
+    await AI.ensureLoaded(id, { onProgress: (p) => say(`Loading ${spec.short}: ${loadNote(p)}`) });
+    if (spec.kind === 'embed') {
+      const t0 = performance.now();
+      const [a, b, c] = await AI.embed(['The cat sat on the mat.', 'A kitten was resting on the rug.', 'Interest rates rose by half a percent.']);
+      return say(
+        `Works: similar sentences scored ${AL.dot(a, b).toFixed(2)}, unrelated ${AL.dot(a, c).toFixed(2)} (higher means closer), in ${T(performance.now() - t0)}. Loaded in ${T(AI.loadedModels().get(id)?.ms)}.`,
+      );
+    }
+    let text = '';
+    const stats = await AI.generate(id, AL.generalMessages('In one sentence, what does a web browser do?'), {
+      maxTokens: 48,
+      label: 'test',
+      onToken: (t) => {
+        text += t;
+        say(`“${text}”`);
+      },
+    });
+    say(h('span', null, `“${text.trim()}”`), h('span', { class: 'block muted' }, `Works: ${AL.describeRun(stats)}. Loaded in ${T(AI.loadedModels().get(id)?.ms)}.`));
+  } catch (e) {
+    say(h('span', { class: 'bad' }, `Test failed: ${e.message}`), h('span', { class: 'block muted' }, 'The diagnostics log below has the details.'));
+  }
+}
+
+function logItem(e) {
+  return h(
+    'li',
+    { class: { error: 'bad', warn: 'warn', ok: 'ok' }[e.level] ?? '' },
+    h('span', { class: 't' }, new Date(e.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })),
+    h('span', null, `[${e.area}] ${e.msg}`, e.detail ? h('span', { class: 'block muted' }, String(e.detail).split('\n').slice(0, 3).join(' · ')) : null),
+  );
+}
+
+async function showAI(id) {
+  document.title = 'On-device AI · Sparse';
+  const [st, dev, entries] = await Promise.all([AI.states(), AI.device(true), AI.readLog(150)]);
+  if (id !== renderId) return;
+  const crash = AI.crashOnLaunch();
+  const loaded = AI.loadedModels();
+  const dl = AI.downloading();
+  const shown = Object.fromEntries(Object.entries(st).map(([k, v]) => [k, v.status]));
+  const logList = h('ol', { class: 'log ai-log' }, entries.map(logItem));
+  let errorsOnly = false;
+  const filterBtn = h('button', { type: 'button', class: 'link' }, 'Errors and warnings only');
+  filterBtn.addEventListener('click', async () => {
+    errorsOnly = !errorsOnly;
+    filterBtn.textContent = errorsOnly ? 'Show everything' : 'Errors and warnings only';
+    fill(logList, (await AI.readLog(300)).filter((e) => !errorsOnly || e.level === 'error' || e.level === 'warn').map(logItem));
+  });
+  const copyNote = h('span', { class: 'small muted' });
+  const g = dev.gpu;
+  const yes = (v) => (v ? 'yes' : 'no');
+  const rows = [
+    ['WebGPU on the page', g.gpu ? `yes · ${g.adapter}${g.fallback ? ' (software fallback)' : ''}` : `no${g.why ? ` (${g.why})` : ''}`],
+    ['16-bit floats (shader-f16)', g.gpu ? yes(g.f16) : '–'],
+    ['Largest GPU buffer', g.limits ? `${AL.size(g.limits.maxBufferSize)} (binding ${AL.size(g.limits.maxStorageBufferBindingSize)})` : '–'],
+    ['WebGPU in a worker', dev.worker ? (dev.worker.gpu ? 'yes' : `no${dev.worker.why ? ` (${dev.worker.why})` : ''}`) : 'checked when a model first loads'],
+    ['Engine running', AI.engineMode() ? (AI.engineMode() === 'worker' ? 'in a worker' : 'on the page') : 'not started'],
+    ['Storage', dev.storage ? `${AL.size(dev.storage.usage)} used of about ${AL.size(dev.storage.quota)} this app may use` : 'not reported'],
+    ['Storage permanent', dev.persisted == null ? 'not reported' : yes(dev.persisted)],
+    ['Installed to the home screen', yes(dev.standalone)],
+    ['CPU cores', dev.cores ?? 'not reported'],
+    ['Memory', dev.memory ? `about ${dev.memory} GB` : 'not reported (Safari never says)'],
+    ['Browser', dev.ua],
+  ];
+  render(
+    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'On-device AI'), AI.anyChat() || AI.isReady('bge') ? h('a', { href: '#/ask' }, 'Ask') : null),
+    h(
+      'section',
+      null,
+      h('p', null, 'Optional AI that runs on this device: it summarises pages and answers questions from your saved pages and searches, or on its own, with no connection. Nothing downloads until you tap Download.'),
+      h(
+        'ul',
+        { class: 'small' },
+        h('li', null, 'Models come from Hugging Face and the engine from jsDelivr, once. After that, nothing you read or ask leaves the device.'),
+        h('li', null, 'Use Wi-Fi and keep the app open: the screen stays on while it downloads. If the download is interrupted, it carries on from where it stopped.'),
+        h('li', null, 'Phones limit how much memory a web app may use. If a model is too big, iOS ends the app; the next launch notes it here.'),
+      ),
+    ),
+    crash ? h('div', { class: 'card warn-card' }, h('p', null, h('strong', null, 'Last time: '), AL.crashText(crash))) : null,
+    h('h2', null, 'Models'),
+    ['lfm12', 'bge', 'lfm26', 'engine'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
+    h(
+      'section',
+      null,
+      h('h2', null, 'Use'),
+      AL.CHAT_IDS.filter((x) => AI.isReady(x)).length > 1
+        ? h(
+            'label',
+            { class: 'field' },
+            h('span', null, 'Model for summaries and answers'),
+            (() => {
+              const s = h(
+                'select',
+                { onchange: () => saveSetting('aiModel', s.value) },
+                AL.CHAT_IDS.map((x) => h('option', { value: x, selected: settings.aiModel === x }, AL.PACKAGES[x].short)),
+              );
+              return s;
+            })(),
+          )
+        : null,
+      h(
+        'label',
+        { class: 'field check' },
+        (() => {
+          const c = h('input', { type: 'checkbox', checked: settings.aiAutoSummary, onchange: () => saveSetting('aiAutoSummary', c.checked) });
+          return c;
+        })(),
+        h('span', null, 'Summarise pages automatically when they load'),
+        h('small', { class: 'muted' }, 'Otherwise, tap Summarise on a page. Either way, summaries are kept with the page.'),
+      ),
+      h('p', { class: 'small' }, h('a', { href: '#/ask' }, 'Ask a question'), ': from your saved pages and searches, or the model’s own knowledge.'),
+    ),
+    h(
+      'section',
+      null,
+      h('h2', null, 'In memory now'),
+      loaded.size
+        ? h(
+            'ul',
+            { class: 'plain small' },
+            [...loaded].map(([k, info]) =>
+              h('li', null, `${AL.PACKAGES[k].short}: ${info.dtype} on ${info.device === 'webgpu' ? 'WebGPU' : 'the CPU'}, loaded in ${T(info.ms)} `, h('button', { type: 'button', class: 'link', onclick: async () => (await AI.unload(k), route()) }, 'Unload')),
+            ),
+          )
+        : h('p', { class: 'small muted' }, 'Nothing. Models load when first used, and unload after 10 minutes unused.'),
+    ),
+    h('section', null, h('h2', null, 'This device'), h('table', { class: 'kv' }, rows.map(([k, v]) => h('tr', null, h('th', null, k), h('td', null, String(v)))))),
+    h(
+      'section',
+      null,
+      h('h2', null, 'Diagnostics'),
+      h('p', { class: 'small muted' }, 'Every download, load and run, with how long it took and why anything failed. Kept on this device.'),
+      h(
+        'p',
+        { class: 'small' },
+        h(
+          'button',
+          {
+            type: 'button',
+            class: 'link',
+            onclick: async () => {
+              const text = await AI.report();
+              try {
+                await navigator.clipboard.writeText(text);
+                copyNote.textContent = ` Copied (${AL.size(text.length)}).`;
+              } catch {
+                copyNote.textContent = ' Could not copy; the report is shown below instead.';
+                logList.before(h('pre', { class: 'report' }, text));
+              }
+            },
+          },
+          'Copy report',
+        ),
+        copyNote,
+        ' · ',
+        filterBtn,
+        ' · ',
+        twoTap('Clear log', () => AI.clearLog()),
+      ),
+      entries.length ? logList : h('p', { class: 'small muted' }, 'Nothing logged yet.'),
+    ),
+    h(
+      'section',
+      null,
+      h('h2', null, 'Remove'),
+      h('p', { class: 'small' }, twoTap('Remove all AI data from this device', () => AI.removeAll())),
+      h('p', { class: 'small muted' }, 'Deletes every model, the engine, the meaning index, summaries, questions and this log.'),
+    ),
+  );
+  aiUnsub = AI.on((type, data) => {
+    if (currentPath() !== '/ai') return;
+    if (type === 'log') logList.prepend(logItem(data));
+    if (type === 'download' && !data.done) {
+      const el = document.getElementById(`ai-status-${data.id}`);
+      if (el)
+        el.textContent = `Downloading ${Math.round((100 * data.have) / data.total)}% · ${AL.size(data.have)} of ${AL.size(data.total)} · ${AL.size(data.rate)}/s${data.eta ? ` · ${AL.eta(data.eta)} left` : ''}`;
+      const prog = el?.nextElementSibling;
+      if (prog?.tagName === 'PROGRESS') {
+        prog.hidden = false;
+        prog.value = data.have;
+      }
+    }
+    if ((type === 'pkg' && (!data || shown[data.id] !== data.status)) || (type === 'download' && data.done)) {
+      clearTimeout(netPageTimer);
+      netPageTimer = setTimeout(route, 300);
+    }
+  });
+  settle();
+}
+
 async function saveSetting(key, value) {
   settings = { ...settings, [key]: value };
   await S.kvSet('settings', settings);
@@ -1578,6 +2079,22 @@ async function showSettings(id) {
     h(
       'section',
       null,
+      h('h2', null, 'On-device AI'),
+      h(
+        'p',
+        { class: 'small' },
+        AI.anyChat() || AI.isReady('bge')
+          ? `On this device: ${AL.MODEL_IDS.filter((x) => AI.isReady(x))
+              .map((x) => AL.PACKAGES[x].short)
+              .join(', ')}. `
+          : 'Off: nothing is downloaded until you choose a model. ',
+        h('a', { href: '#/ai' }, 'On-device AI'),
+        ': summaries, answers from saved pages, downloads and diagnostics.',
+      ),
+    ),
+    h(
+      'section',
+      null,
       h('h2', null, 'Activity and network'),
       checkField(
         'Show the activity log expanded',
@@ -1619,6 +2136,7 @@ async function showSettings(id) {
         h('li', null, 'Searches go to the engine you chose (Marginalia, Mwmbl or Mojeek), and to DuckDuckGo when instant answers are on.'),
         h('li', null, 'Pages you open in reader view are fetched by Jina Reader (r.jina.ai), which sees their addresses. It allows 20 pages a minute.'),
         h('li', null, 'Weather comes from Open-Meteo, which sees the place, or your coordinates for plain “weather”.'),
+        h('li', null, 'On-device AI, if you turn it on: models download once from Hugging Face, and the engine from jsDelivr. After that, summaries and answers are worked out on this device and nothing you read or ask is sent anywhere.'),
         h('li', null, 'History, saved results and pages stay on this device.'),
       ),
     ),
@@ -1634,6 +2152,9 @@ function currentPath() {
 
 function route() {
   const id = ++renderId;
+  aiUnsub?.();
+  aiUnsub = null;
+  if (AI.running()) AI.stop(); // a reply for a screen that's gone
   const p = new URLSearchParams(location.hash.split('?')[1] ?? '');
   switch (currentPath()) {
     case '/s':
@@ -1644,6 +2165,10 @@ function route() {
       return showNet(id);
     case '/settings':
       return showSettings(id);
+    case '/ai':
+      return showAI(id);
+    case '/ask':
+      return showAsk(id, p.get('q') ?? '');
     default:
       return showHome(id);
   }
@@ -1680,6 +2205,13 @@ async function start() {
   document.getElementById('offline').hidden = navigator.onLine;
   updateTotals();
   setNow(navigator.onLine ? 'Ready' : 'Offline: showing what is saved on this device');
+  await AI.init().catch((e) => console.warn('AI init failed', e));
+  AI.on((type, d) => {
+    if (type !== 'download') return;
+    const name = AL.PACKAGES[d.id]?.short ?? d.id;
+    if (d.done) setNow(d.status === 'ready' ? `AI download: ${name} is on this device` : `AI download: ${name} ${d.status}${d.why ? `: ${d.why}` : ''}`);
+    else setNow(`AI download: ${name} ${Math.round((100 * d.have) / d.total)}% · ${AL.size(d.rate)}/s`);
+  });
   route();
   navigator.storage?.persist?.().catch(() => {});
   setTimeout(() => {

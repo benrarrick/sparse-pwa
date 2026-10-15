@@ -157,6 +157,20 @@ export async function request(url, { timeout = 15000, headers = {}, onProgress }
   return { status: res.status, text, entry, json: () => JSON.parse(text) };
 }
 
+/**
+ * Records a request made outside `request()` (the AI downloads stream hundreds of MB, so they
+ * can't be read whole). `e` has service, url, status, ttfb, ms, received, wire, error.
+ */
+export function record(e) {
+  const entry = { id: nextId++, at: Date.now(), wireKind: 'exact', ...e, url: redactUrl(e.url), phase: e.error ? 'failed' : 'done' };
+  session.requests++;
+  session.received += entry.received;
+  session.wire += entry.wire ?? entry.received;
+  session.ms += entry.ms ?? 0;
+  if (entry.error) session.errors++;
+  emit('done', entry);
+}
+
 /** How the app's own files were loaded on this launch (same-origin, so the browser reports it). */
 export function appLoad() {
   const nav = performance.getEntriesByType('navigation')[0];

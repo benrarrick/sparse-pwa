@@ -1,6 +1,7 @@
 // App-shell service worker. The app opens from this cache instantly, and offline. After each
 // launch it re-downloads the shell in the background and swaps it in only when every file
 // arrived, so the next launch runs the new version. Requests to other sites are never touched.
+// The on-device AI's engine and models are not here: they download only when asked, into IndexedDB.
 const CACHE = 'sparse-shell';
 const FILES = [
   './',
@@ -10,6 +11,11 @@ const FILES = [
   './js/lib.js',
   './js/net.js',
   './js/store.js',
+  './js/ai.js',
+  './js/ai-lib.js',
+  './js/ai-store.js',
+  './js/ai-engine.js',
+  './js/ai-worker.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/apple-touch-icon.png',

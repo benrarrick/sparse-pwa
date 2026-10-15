@@ -252,6 +252,8 @@ const SERVICES = {
   'geocoding-api.open-meteo.com': 'Open-Meteo places',
   'air-quality-api.open-meteo.com': 'Open-Meteo air quality',
   'archive.org': 'Internet Archive',
+  'huggingface.co': 'Hugging Face (AI models)',
+  'cdn.jsdelivr.net': 'jsDelivr (AI engine)',
 };
 
 export function serviceOf(url) {

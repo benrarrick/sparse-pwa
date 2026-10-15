@@ -11,6 +11,7 @@ It works because every service it reads sends CORS headers, so a web page may ca
 | Reader view | [Jina Reader](https://jina.ai/reader) (`r.jina.ai`) | optional: works without one at 20 pages a minute, but Jina refuses anonymous requests from some networks with a 401. A free key from jina.ai, pasted into Settings, fixes that. |
 | Weather | Open-Meteo (forecast, place lookup, air quality) | none |
 | Archived copies | Internet Archive availability lookup (`archive.org/wayback/available`) | none to find a copy; reading it in the app needs a Jina key, because Jina refuses anonymous requests for archive.org |
+| On-device AI (optional) | Models from Hugging Face, the engine (Transformers.js 4.3.0, ONNX Runtime Web) from jsDelivr: downloaded once, only when you tap Download | none |
 
 DuckDuckGo's own results pages can't be read by a web page. The app opens them instead: there's a "DuckDuckGo Lite ↗" link under every result list, and any query containing a `!bang` goes straight to DuckDuckGo.
 
@@ -21,12 +22,47 @@ DuckDuckGo's own results pages can't be read by a web page. The app opens them i
 - **Cards:** an instant-answer card (Wikipedia abstracts, definitions, simple answers) and a weather card for `weather`, `weather in Leeds` or `paris weather`.
 - **Weather, basic by default:** temperature and what it feels like, rain in the next hour (15-minute steps), and 3 days, in about 0.5 KB. **More weather** on the card fetches the rest only when tapped, about 1.2 KB more: wind direction and gusts, humidity, cloud, visibility, pressure, UV, sunrise and sunset, air quality (US scale with °F, European otherwise), 24 hours (every 3 hours, or every hour with a tap) and 7 days. Both are kept on the device for 30 minutes. Settings can make the card always show everything.
 - **Archived copies:** when the reader can't load a page, the app asks the Internet Archive (about 0.2 KB) for its latest copy and offers it. Every reader page also has an **Archived copy** button that only looks when tapped. With a Jina key the copy opens in the reader as text. Without one it opens in Safari, at full size. The archive's lookup sometimes misses copies, or refuses when asked too often, so a direct link to the archive is always offered as well.
+- **On-device AI (optional, off until you download a model):** see below.
 - **Offline:**
   - The app opens from the service worker cache.
   - Searches and pages are kept on the device (IndexedDB): results for 30 days, up to 300 searches; pages for 30 days, up to 100, unless you tap **Save for offline**.
   - A search or page asked for while offline is queued. It runs when the connection comes back, and then appears under "Ready" on the home screen.
 - **Repeat searches:** a search repeated within 6 hours (configurable) loads from the device and uses no data.
 - **Settings:** engine, keys, fallback, region, safe search, instant answers, what tapping a result opens, DuckDuckGo Lite or HTML, weather units.
+
+## On-device AI
+
+Open **Settings → On-device AI** (`#/ai`). Nothing downloads until you tap Download, and every model can be removed again. After the download, everything runs on the device with no connection, and nothing you read or ask is sent anywhere.
+
+| Model | Role | Download (WebGPU) |
+|---|---|---|
+| LFM2.5 1.2B Instruct | Primary: summaries and answers | 764 MB (q4f16), 854 MB (q4 without 16-bit floats) |
+| BGE small en v1.5 | Finds saved passages by meaning; runs on the CPU | 35 MB |
+| LFM2.5 2.6B (experimental) | Better summaries and synthesis; may be too big for a phone browser | 1.53 GB |
+| AI engine | Transformers.js and ONNX Runtime, needed by all | 27 MB (about 6 MB on the wire) |
+
+Without WebGPU, the 1.2B model downloads its 8-bit CPU version (1.5 GB, slow) and the 2.6B can't run. The `q4` exports only work on WebGPU.
+
+What it does:
+
+1. **Summarise:** a button on every reader page, or automatically when a page loads (setting). It summarises up to the first 12,000 characters (16,000 for the 2.6B). Summaries are kept with the page.
+2. **Ask, from saved pages and searches** (`#/ask`): passages from pages read in the reader and from search results are matched by keyword (BM25), and by meaning when BGE is downloaded. The two lists are combined, and the model answers from the best few, citing them as [1], [2], linking to the saved copies. Without a chat model, the matching passages are shown.
+3. **Ask, from the model's own knowledge:** no sources, labelled as possibly wrong (training data to mid-2024).
+
+Downloads:
+- They resume where they stopped: they are saved in 8 MB pieces in IndexedDB, continue with HTTP Range requests, retry with backoff, and wait for the connection to come back.
+- They keep the screen on while running, and check free storage first.
+- Revisions are pinned, file sizes are checked, and the engine files are checked against SHA-256.
+
+Diagnostics on the AI page:
+- **Device check:** WebGPU, 16-bit floats, GPU limits, storage, and whether WebGPU works in a worker.
+- **Log:** every download, load and run, with timings, tokens per second, and the error behind any failure.
+- **Copy report:** puts all of this on the clipboard.
+- **Crashes:** iOS ends a page that uses too much memory without an error the page can see. So a marker is written before each load or run and cleared after; one left over on the next launch is logged as a crash against that model and shown on the home screen.
+
+Files: `js/ai.js` (page side: downloads, worker, log, retrieval), `js/ai-engine.js` (runs the models, in `js/ai-worker.js` or on the page if WebGPU only works there), `js/ai-store.js` (IndexedDB `sparse-ai`), `js/ai-lib.js` (catalog, chunking, BM25, prompts; tested).
+
+Tested in desktop Chrome: downloads with pause/resume, BGE, and the 1.2B model on WebGPU. **Not yet tested on an iPhone**, where memory limits decide which models fit.
 
 ## Activity and network details
 
@@ -94,7 +130,8 @@ There is no server of yours involved, so each service sees only its own part:
 - DuckDuckGo sees them too when instant answers are on;
 - Jina sees the addresses of pages you open in reader view;
 - Open-Meteo sees the places you ask about, or your coordinates for plain `weather`;
-- the Internet Archive sees the address of a page when you ask for an archived copy.
+- the Internet Archive sees the address of a page when you ask for an archived copy;
+- Hugging Face and jsDelivr see that you downloaded the AI files, once. The AI itself sends nothing anywhere.
 
 History, cached results and saved pages stay on the device. The page's Content-Security-Policy only allows connections to the services above, and every link out uses `noreferrer`.
 
