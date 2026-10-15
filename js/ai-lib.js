@@ -149,6 +149,9 @@ export const PACKAGES = {
     license: 'Llama 3.2 Community License',
     source: 'Hugging Face and GitHub, through WebLLM',
     contextWindow: 2048, // tokens of conversation WebLLM reserves memory for
+    // shown under the limit fields. Measured with ordinary English text on one desktop GPU through WebLLM: correct answers up to
+    // 476 prompt tokens, an empty answer at 624, and the GPU lost at about 1,000. Not measured on a phone.
+    limitNote: 'In a test on a computer, answers were right up to about 480 prompt tokens and went wrong above that, and about 1,000 lost the GPU. A phone may differ.',
     // 16 layers × 8 key/value heads × 64 values × 2 (keys and values) × 2 bytes (16-bit) per token
     graph: { vocab: 128_256, lastTokenLogits: true, logitsBytes: 4, logitsCast: false, kvBytesPerToken: 16 * 8 * 64 * 2 * 2 },
   },

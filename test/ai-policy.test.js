@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import * as PO from '../js/ai-policy.js';
+import { PACKAGES } from '../js/ai-lib.js';
 
 const IPHONE = { userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148', maxTouchPoints: 5 };
 const IPAD_AS_MAC = { userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15', maxTouchPoints: 5 };
@@ -20,16 +21,41 @@ test('device classes: iPhone, iPadOS posing as a Mac, other phones, desktops', (
   assert.ok(PO.isLowMemory('ios') && PO.isLowMemory('mobile') && !PO.isLowMemory('desktop'));
 });
 
-test('every chat model has ordered token budgets, the same on every device', () => {
+test('every chat model has starting token limits, the same on every device', () => {
   for (const id of ['lfm350', 'lfm230', 'llama32']) {
     const p = PO.profileFor(id);
     assert.equal(p.status, 'ok', id);
-    assert.ok(p.maxInput > 0 && p.maxNew > 0 && p.maxTotal >= p.maxInput + PO.MIN_USEFUL_NEW_TOKENS, id);
-    assert.ok(p.maxTotal <= p.maxInput + p.maxNew, `${id}: total never above input + new`);
+    assert.ok(p.maxInput >= PO.MIN_INPUT_TOKENS && p.maxNew >= PO.MIN_USEFUL_NEW_TOKENS, id);
+    assert.equal(p.maxTotal, p.maxInput + p.maxNew, 'the combined limit is the two added up');
+    assert.ok(p.maxTotal <= p.ceiling, `${id}: starts inside its own ceiling`);
     assert.deepEqual(PO.profileFor(id, 'ios'), PO.profileFor(id, 'desktop'), 'no device classes');
   }
   assert.equal(PO.profileFor('nope').status, 'unsupported');
   for (const gone of ['lfm12', 'lfm26']) assert.equal(PO.profileFor(gone).status, 'unsupported', `${gone} is no longer offered`);
+});
+
+test('clampLimits: the person sets the prompt and answer limits, within sense', () => {
+  const d = PO.clampLimits('lfm350', {});
+  assert.deepEqual([d.maxInput, d.maxNew, d.maxTotal], [600, 200, 800], 'nothing set: the starting values');
+  assert.deepEqual(PO.clampLimits('lfm350', undefined), d);
+  const own = PO.clampLimits('lfm350', { maxInput: 1000, maxNew: 300 });
+  assert.deepEqual([own.maxInput, own.maxNew, own.maxTotal], [1000, 300, 1300]);
+  assert.ok(own.maxMs > d.maxMs, 'more allowed, more time allowed');
+  assert.equal(PO.clampLimits('lfm350', { maxInput: 50, maxNew: 5 }).maxInput, PO.MIN_INPUT_TOKENS, 'never below a usable minimum');
+  assert.equal(PO.clampLimits('lfm350', { maxInput: 50, maxNew: 5 }).maxNew, PO.MIN_USEFUL_NEW_TOKENS);
+  // together they never pass the ceiling: the answer gives way first, then the prompt
+  const big = PO.clampLimits('llama32', { maxInput: 1500, maxNew: 1500 });
+  assert.equal(big.maxTotal, 2048);
+  assert.equal(big.maxInput, 1500);
+  assert.equal(big.maxNew, 548);
+  const huge = PO.clampLimits('llama32', { maxInput: 9999, maxNew: 9999 });
+  assert.equal(huge.maxInput, 2048 - PO.MIN_USEFUL_NEW_TOKENS);
+  assert.equal(huge.maxNew, PO.MIN_USEFUL_NEW_TOKENS);
+  // junk falls back to the starting value
+  for (const bad of ['abc', NaN, null, -5, 0]) assert.equal(PO.clampLimits('lfm350', { maxInput: bad, maxNew: bad }).maxInput, 600, String(bad));
+  assert.equal(PO.clampLimits('lfm350', { maxInput: '700.9', maxNew: '90' }).maxInput, 700, 'text from a field is accepted');
+  assert.equal(PO.clampLimits('nope', {}), null);
+  assert.equal(PO.clampLimits('bge', {}), null);
 });
 
 test('checkBudget fails closed and enforces input + new <= total', () => {
@@ -106,4 +132,8 @@ test('checkpoints advance and record visibility', () => {
   c = PO.withVisibility(c, 'visible', 900);
   assert.equal(c.hiddenMs, 600, 'time spent hidden is accumulated');
   for (const s of PO.STAGES) assert.equal(typeof s, 'string');
+});
+
+test('a WebLLM model can never be asked for more than the window WebLLM reserves for it', () => {
+  assert.ok(PO.profileFor('llama32').ceiling <= PACKAGES.llama32.contextWindow);
 });

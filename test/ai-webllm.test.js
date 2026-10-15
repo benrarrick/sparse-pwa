@@ -7,7 +7,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ID = 'Llama-3.2-1B-Instruct-q4f16_1-MLC';
 
 /** A stand-in for WebLLM: words are tokens; replies one token per tick; records what it was asked. */
-function fakeWebllm({ models = [ID], reloadFail = null, wordsPerToken = 1, noTokenizer = false } = {}) {
+function fakeWebllm({ models = [ID], reloadFail = null, wordsPerToken = 1, noTokenizer = false, createFail = null } = {}) {
   const calls = { reload: [], unload: 0, interrupt: 0, create: [], config: null };
   class MLCEngine {
     constructor(cfg) {
@@ -36,6 +36,7 @@ function fakeWebllm({ models = [ID], reloadFail = null, wordsPerToken = 1, noTok
     }
     async create(req) {
       calls.create.push(req);
+      if (createFail) throw createFail();
       const self = this;
       const prompt = req.messages.reduce((n, x) => n + x.content.split(/\s+/).filter(Boolean).length, 0);
       return (async function* () {
@@ -157,4 +158,16 @@ test('WebLLM unload releases it', async () => {
   await s.engine.handle({ type: 'unload', id: 'u1', pkg: 'llama32' });
   assert.equal(s.calls.unload, 1);
   assert.deepEqual(s.engine.models(), []);
+});
+
+test('WebLLM: a lost GPU is reported, the dead model is dropped, and the real error message survives', async () => {
+  // WebLLM's own errors can have a read-only `code`; assigning to it must not hide the message
+  const s = setup({ createFail: () => Object.defineProperty(new Error('Object has already been disposed'), 'code', { get: () => 'X', configurable: false }) });
+  await load(s, 'l1');
+  await gen(s, 'g1', 20);
+  const err = s.of('error', 'g1')[0];
+  assert.match(err.message, /already been disposed/, 'the real message, not a TypeError about a getter');
+  assert.equal(err.code, 'GPU_DEVICE_LOST');
+  assert.equal(s.of('gpu-lost').length, 1, 'the page is told');
+  assert.deepEqual(s.engine.models(), [], 'the model is gone, so it is loaded again next time');
 });

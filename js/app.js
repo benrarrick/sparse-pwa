@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '2.2';
+const APP_VERSION = '2.3';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -1293,7 +1293,7 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
   act.step(
     `${auto ? 'Summarising automatically (Settings)' : 'Summarising'} with ${spec.short} on this device: ${plan.strategy === 'single' ? 'the whole page' : plan.note} · ${plan.calls === 1 ? '1 pass' : `${plan.calls} passes`}. Nothing is sent anywhere.`,
   );
-  const summaryTokens = Math.min(lim.maxNew, 160);
+  const summaryTokens = lim.maxNew;
   const base = { out, status, act, id, fit: true, meta: { strategy: plan.strategy, coverage: Math.round(plan.coverage * 100) / 100, calls: plan.calls, sections: plan.sections, sectionsUsed: plan.sectionsUsed, pageChars: plan.of } };
   let messages = AL.summaryMessages(title, plan.text, { excerpted: plan.strategy !== 'single' });
   if (plan.strategy === 'hierarchical') {
@@ -1776,7 +1776,7 @@ async function showAsk(id, q0) {
       act.step('Answering from the model’s own knowledge: no sources, so check anything important');
       messages = AL.generalMessages(question);
     }
-    const r = await runModel(use, messages, { out: answer, status, act, id, maxTokens: 128, label: mode.value === 'saved' ? 'answer from saved' : 'general answer', sources, fit: mode.value === 'saved', alive, meta: { sources: sources?.length ?? 0 } });
+    const r = await runModel(use, messages, { out: answer, status, act, id, maxTokens: AI.limitsFor(use).maxNew, label: mode.value === 'saved' ? 'answer from saved' : 'general answer', sources, fit: mode.value === 'saved', alive, meta: { sources: sources?.length ?? 0 } });
     if (!alive()) return;
     if (!r) {
       if (sources?.length) srcHead.textContent = 'Closest passages on this device (the AI could not write an answer)';
@@ -1873,6 +1873,7 @@ function pkgCard(id, rec, dev) {
   if (rec.status !== 'none') buttons.push(twoTap(rec.status === 'ready' ? `Remove (frees ${AL.size(total)})` : 'Cancel and delete', () => AI.remove(id)));
   if (unsupported && rec.status === 'none')
     notes.push(h('p', { class: 'small bad' }, spec.runtime === 'webllm' ? 'Needs WebGPU with 16-bit floats, which this browser’s GPU doesn’t offer.' : `Needs WebGPU, which this browser doesn't offer${dev.gpu.fallback ? ' (only a software version)' : ''}.`));
+  const limitsRow = spec.kind === 'chat' ? limitFields(id) : null;
   if (rec.crashes) notes.push(h('p', { class: 'small warn' }, `The app was ended unexpectedly ${plural(rec.crashes, 'time')} while using this${rec.lastCrash ? `, last ${L.relTime(rec.lastCrash.found)} (at “${rec.lastCrash.stage ?? '?'}”)` : ''}. iOS does not say why; the log below shows what was recorded.`));
   if (rec.lastError) notes.push(h('p', { class: 'small bad' }, `Last error (${rec.lastError.phase}, ${L.relTime(rec.lastError.at)}): ${rec.lastError.message}`));
   return h(
@@ -1883,8 +1884,41 @@ function pkgCard(id, rec, dev) {
     line,
     prog,
     buttons.length ? h('p', { class: 'pkg-actions' }, buttons.flatMap((b, i) => (i ? [' ', b] : [b]))) : null,
+    limitsRow,
     notes,
     testOut,
+  );
+}
+
+/** The prompt and answer limits for one model: two number fields that save as they are changed. */
+function limitFields(id) {
+  const b = AI.limitBounds(id);
+  const now = AI.limitsFor(id);
+  const num = (value, min) => h('input', { type: 'number', inputmode: 'numeric', class: 'num', min, max: b.ceiling, step: 10, value });
+  const inPrompt = num(now.maxInput, b.minInput);
+  const inAnswer = num(now.maxNew, b.minNew);
+  const hint = h('span', { class: 'small muted' });
+  const reset = h('button', { type: 'button', class: 'link', hidden: !AI.limitsChanged(id), onclick: () => (AI.resetLimits(id), route()) }, 'Reset');
+  const show = (note = '') => {
+    const l = AI.limitsFor(id);
+    inPrompt.value = l.maxInput;
+    inAnswer.value = l.maxNew;
+    reset.hidden = !AI.limitsChanged(id);
+    hint.textContent = `${note}${AL.PACKAGES[id].limitNote ? `${AL.PACKAGES[id].limitNote} ` : ''}About ${AL.textBudget(l.maxInput).toLocaleString()} characters of page text fit the prompt. Prompt and answer together can be up to ${b.ceiling.toLocaleString()} tokens for this model. Longer ones use more memory: if the app is ended while the AI works, lower them.`;
+  };
+  const save = () => {
+    const asked = { maxInput: Number(inPrompt.value), maxNew: Number(inAnswer.value) };
+    const applied = AI.setLimits(id, asked);
+    show(applied && (applied.maxInput !== asked.maxInput || applied.maxNew !== asked.maxNew) ? 'Adjusted to fit the limits. ' : 'Saved. ');
+  };
+  inPrompt.addEventListener('change', save);
+  inAnswer.addEventListener('change', save);
+  show();
+  return h(
+    'div',
+    { class: 'limits' },
+    h('p', { class: 'small' }, h('label', null, 'Longest prompt ', inPrompt, ' tokens'), ' ', h('label', null, 'Longest answer ', inAnswer, ' tokens'), ' ', reset),
+    h('p', null, hint),
   );
 }
 

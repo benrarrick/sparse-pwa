@@ -18,7 +18,7 @@
 import * as AS from './ai-store.js';
 import { PACKAGES, parseModelUrl, AI_BUILD } from './ai-lib.js';
 import { createScheduler, Cancelled } from './ai-ops.js';
-import { profileFor, checkBudget, estimateAllocations } from './ai-policy.js';
+import { profileFor, clampLimits, checkBudget, estimateAllocations } from './ai-policy.js';
 import { AiError, classifyError } from './ai-diag.js';
 
 const now = () => performance.now();
@@ -47,6 +47,22 @@ export async function probeGpu() {
     return { ...out, why: `WebGPU probe failed: ${e?.message ?? e}` };
   }
 }
+
+/** Adds fields (a code) to an error. Some libraries' errors have a read-only `code`: those are wrapped, keeping the message and stack. */
+export function withFields(err, fields) {
+  const e = err instanceof Error ? err : new Error(String(err));
+  try {
+    return Object.assign(e, fields);
+  } catch {
+    const w = new Error(e.message, { cause: e });
+    w.name = e.name;
+    w.stack = e.stack;
+    return Object.assign(w, fields);
+  }
+}
+
+/** Errors that mean WebLLM's GPU device is gone (it unloads itself when that happens). */
+const GPU_GONE = /device was lost|already been disposed|deleted object|mapAsync|Buffer was unmapped|device.*(destroyed|lost)/i;
 
 /** Cuts the end of `text` to about `keep` characters, at a paragraph or sentence end when one is near. */
 export function trimTail(text, keep) {
@@ -214,7 +230,7 @@ export function createEngine(post, deps = {}) {
     try {
       pipe = await T.pipeline(spec.kind === 'chat' ? 'text-generation' : 'feature-extraction', spec.repo, opts);
     } catch (e) {
-      throw Object.assign(e instanceof Error ? e : new Error(String(e)), { code: gpuLost ? 'GPU_DEVICE_LOST' : classifyError(e, { stage: 'load.start' }) });
+      throw withFields(e, { code: gpuLost ? 'GPU_DEVICE_LOST' : classifyError(e, { stage: 'load.start' }) });
     }
     // what the exported graph can do is read from the session, not assumed
     const names = pipe.model?.sessions?.model?.inputNames ?? pipe.model?.sessions?.decoder_model_merged?.inputNames ?? null;
@@ -266,7 +282,7 @@ export function createEngine(post, deps = {}) {
       await engine.reload(spec.modelId, { context_window_size: spec.contextWindow ?? 1536, temperature: 0 });
     } catch (e) {
       await engine.unload().catch(() => {});
-      throw Object.assign(e instanceof Error ? e : new Error(String(e)), { code: classifyError(e, { stage: 'load.start' }) });
+      throw withFields(e, { code: classifyError(e, { stage: 'load.start' }) });
     }
     const info = { device, dtype: spec.dtype, ms: Math.round(clock() - t0), lastTokenLogits: true, inputs: null, runtime: 'webllm' };
     if (fetchOnly) {
@@ -306,16 +322,9 @@ export function createEngine(post, deps = {}) {
     }
   }
 
-  /** Limits for this run: what the page asked for, never above the model's own. */
+  /** Limits for this run: what the page asked for (the person's settings), made sensible and kept under the model's ceiling. */
   function limitsFor(pkg, requested) {
-    const p = profileFor(pkg);
-    const hard = { maxInput: p.maxInput, maxNew: p.maxNew, maxTotal: p.maxTotal, maxMs: p.maxMs };
-    return {
-      maxInput: Math.min(requested?.maxInput ?? hard.maxInput, hard.maxInput),
-      maxNew: Math.min(requested?.maxNew ?? hard.maxNew, hard.maxNew),
-      maxTotal: Math.min(requested?.maxTotal ?? hard.maxTotal, hard.maxTotal),
-      maxMs: Math.min(requested?.maxMs ?? hard.maxMs, hard.maxMs),
-    };
+    return clampLimits(pkg, requested) ?? { maxInput: 0, maxNew: 0, maxTotal: 0, maxMs: 0 };
   }
 
   async function generate({ id, pkg, messages, maxTokens = 128, limits: asked = null, fit = false, vis = 'visible' }, ctx) {
@@ -419,8 +428,14 @@ export function createEngine(post, deps = {}) {
     const stopped = !!stopper.interrupted;
     const stopReason = error ? 'error' : timedOut ? 'timeout' : stopped || finish === 'abort' ? 'stopped' : tokens >= check.maxNew || finish === 'length' ? 'length' : 'eos';
     if (error) {
+      // WebLLM unloads itself when its GPU device is lost: the model is gone, so say so and let the page reload it
+      if (m.engine && GPU_GONE.test(String(error?.message ?? error))) {
+        gpuLost = true;
+        models.delete(pkg);
+        post({ type: 'gpu-lost', reason: 'webllm', message: String(error?.message ?? error).slice(0, 300) });
+      }
       // partial text already streamed stays with the page; the error says where it stopped
-      throw Object.assign(error instanceof Error ? error : new Error(String(error)), { code: gpuLost ? 'GPU_DEVICE_LOST' : classifyError(error, { stage: first == null ? 'prefill' : 'decode' }), tokens });
+      throw withFields(error, { code: gpuLost ? 'GPU_DEVICE_LOST' : classifyError(error, { stage: first == null ? 'prefill' : 'decode' }), tokens });
     }
     const stats = {
       device: m.info.device,

@@ -264,7 +264,7 @@ export function buildReport(d) {
   push('INSTALLED MODELS');
   for (const r of d.models ?? []) push(`  ${r.id}: ${r.status}${r.dtype ? ` ${r.dtype}/${r.device}` : ''}${r.revision ? ` rev ${r.revision.slice(0, 8)}` : ''}${r.have ? `, ${r.have} bytes` : ''}${r.failures ? `, ${r.failures} failures` : ''}`);
   push('', 'TOKEN LIMITS (prompt / answer / total / time)');
-  for (const [id, l] of Object.entries(d.limits ?? {})) push(`  ${id}: ${l.maxInput} / ${l.maxNew} / ${l.maxTotal} / ${Math.round(l.maxMs / 1000)} s`);
+  for (const [id, l] of Object.entries(d.limits ?? {})) push(`  ${id}: ${l.maxInput} / ${l.maxNew} / ${l.maxTotal} / ${Math.round(l.maxMs / 1000)} s${l.changed ? ' (changed by the person)' : ''}`);
   push('', 'LAST INTERRUPTION AT LAUNCH');
   if (d.interruption) {
     const i = d.interruption;

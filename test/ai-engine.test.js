@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createEngine, trimTail } from '../js/ai-engine.js';
+import { createEngine, trimTail, withFields } from '../js/ai-engine.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -137,35 +137,41 @@ test('a model cannot be released while it is generating', async () => {
 test('the prompt is counted exactly and the budget is enforced before anything runs', async () => {
   const s = setup();
   await load(s, 'l1');
-  await gen(s, 'g1', 700); // 700 words + template: over the 600-token input limit
+  await gen(s, 'g1', 700); // 700 words + template: over the 600-token starting limit
   const err = s.of('error', 'g1')[0];
   assert.equal(err.code, 'TOKEN_BUDGET_EXCEEDED');
   assert.ok(!s.trace.includes('+generate'), 'the model was never invoked');
   assert.equal(s.of('done').length, 0);
-  // a limit asked for by the page can never exceed the model's own
-  await gen(s, 'g2', 700, { limits: { maxInput: 5000, maxNew: 5000, maxTotal: 9999, maxMs: 1e9 } });
-  assert.equal(s.of('error', 'g2')[0].code, 'TOKEN_BUDGET_EXCEEDED');
-  // ... but it can ask for a lower one
-  await gen(s, 'g3', 500, { limits: { maxInput: 300 } });
-  assert.equal(s.of('error', 'g3')[0].code, 'TOKEN_BUDGET_EXCEEDED');
+  // the person can raise the prompt limit (the page passes it), up to the model's ceiling
+  await gen(s, 'g2', 700, { limits: { maxInput: 900, maxNew: 100 }, maxTokens: 10 });
+  assert.equal(s.of('done', 'g2').length, 1);
+  assert.equal(s.of('stage', 'g2').find((m) => m.stage === 'prompt.tokenized').limits.maxInput, 900);
+  await gen(s, 'g3', 5000, { limits: { maxInput: 99999, maxNew: 99999 } });
+  assert.equal(s.of('error', 'g3')[0].code, 'TOKEN_BUDGET_EXCEEDED', 'but never past the ceiling');
+  // ... or lower it
+  await gen(s, 'g4', 500, { limits: { maxInput: 300 } });
+  assert.equal(s.of('error', 'g4')[0].code, 'TOKEN_BUDGET_EXCEEDED');
   // at the limit it is allowed
-  await gen(s, 'g4', 590, { maxTokens: 10 });
-  assert.equal(s.of('done', 'g4').length, 1);
+  await gen(s, 'g5', 590, { maxTokens: 10 });
+  assert.equal(s.of('done', 'g5').length, 1);
 });
 
-test('input + new tokens never exceed the combined limit', async () => {
+test('prompt + answer never exceed the combined limit', async () => {
   const s = setup();
   await load(s, 'l1');
-  await gen(s, 'g1', 580, { maxTokens: 500 }); // 588 prompt tokens; the model's total is 760
+  await gen(s, 'g1', 580, { maxTokens: 500 }); // 588 prompt tokens; 600 + 200 = 800 together
   const done = s.of('done', 'g1')[0];
   assert.equal(done.stats.promptTokens, 588);
-  assert.ok(done.stats.promptTokens + done.stats.maxNew <= 760);
-  assert.equal(done.stats.maxNew, 172);
-  assert.equal(done.stats.clamped, true);
-  assert.equal(done.stats.tokens, 172);
+  assert.equal(done.stats.maxNew, 200, 'the answer limit');
+  assert.ok(done.stats.promptTokens + done.stats.maxNew <= 800);
+  assert.equal(done.stats.tokens, 200);
   assert.equal(done.stats.stopReason, 'length');
   assert.equal(done.stats.lastTokenLogits, true, 'read from the loaded graph, not assumed');
   assert.equal(done.stats.est.positions, 1);
+  // a smaller combined limit leaves less room for the answer than was asked for
+  await gen(s, 'g2', 190, { maxTokens: 500, limits: { maxInput: 200, maxNew: 50 } });
+  const d2 = s.of('done', 'g2')[0];
+  assert.equal(d2.stats.maxNew, 50);
 });
 
 test('a prompt that cannot be measured is refused, not run', async () => {
@@ -335,4 +341,14 @@ test('ping answers at once, even while a long generation is queued', async () =>
   assert.equal(pong.state, 'generating');
   assert.equal(pong.active.type, 'generate');
   await g;
+});
+
+test('withFields adds a code to any error, including one whose code is read-only', () => {
+  const plain = withFields(new Error('boom'), { code: 'A', tokens: 3 });
+  assert.deepEqual([plain.message, plain.code, plain.tokens], ['boom', 'A', 3]);
+  const locked = Object.defineProperty(new TypeError('locked'), 'code', { get: () => 'X' });
+  const w = withFields(locked, { code: 'B' });
+  assert.deepEqual([w.message, w.name, w.code], ['locked', 'TypeError', 'B']);
+  assert.equal(w.cause, locked);
+  assert.equal(withFields('just text', { code: 'C' }).message, 'just text');
 });

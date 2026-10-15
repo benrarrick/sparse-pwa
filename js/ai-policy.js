@@ -31,27 +31,45 @@ export const isLowMemory = (cls) => cls === 'ios' || cls === 'mobile';
 // ---------- limits ----------
 
 /**
- * Budgets are in tokens counted with the model's own tokenizer, system prompt and chat template included.
- * `maxTotal` is a real combined limit, below maxInput + maxNew: the longer the prompt, the less room for the answer.
- * One set per model, the same on every device. These are the numbers to edit if a model runs out of memory
+ * Token budgets, counted with the model's own tokenizer (system prompt and chat template included).
+ * Each model starts with a prompt limit and an answer limit; the person can change both on the AI page (`clampLimits`),
+ * and the combined limit is simply their sum. `ceiling` is the most the two may add up to: the model's context
+ * window, or what is sensible to ask of a phone. These are the numbers to lower if a model runs out of memory
  * (an iPhone ended the app on a 1.2B model at about 650 tokens in total).
  */
-const lim = (maxInput, maxNew, maxTotal, maxMs, extra = {}) => ({ status: 'ok', backends: ['webgpu'], maxInput, maxNew, maxTotal, maxMs, ...extra });
+const lim = (maxInput, maxNew, maxMs, ceiling) => ({ status: 'ok', backends: ['webgpu'], maxInput, maxNew, maxMs, ceiling });
 
 export const SAFETY = {
-  lfm350: lim(600, 200, 760, 120_000),
-  lfm230: lim(500, 200, 650, 120_000),
-  llama32: lim(800, 256, 1000, 180_000),
+  lfm350: lim(600, 200, 120_000, 4096),
+  lfm230: lim(500, 200, 120_000, 4096),
+  llama32: lim(450, 200, 180_000, 2048), // 2,048 is the conversation window WebLLM reserves for it (ai-lib.js)
   // BGE embeds passages in batches; the limits are on batch size, characters per passage and passages per question.
   bge: { status: 'ok', backends: ['wasm'], maxBatch: 4, maxChars: 1200, maxPerRun: 64, maxMs: 120_000 },
 };
 
 /** Never lower than this: a prompt of the instructions alone is about 60 tokens. */
 export const MIN_USEFUL_NEW_TOKENS = 24;
+export const MIN_INPUT_TOKENS = 100;
 
-/** The limits for a model, or an unsupported stub for one that is not in the catalog. (`cls` is ignored: no device classes.) */
+/** The starting limits for a model, or an unsupported stub for one that is not in the catalog. (`cls` is ignored: no device classes.) */
 export function profileFor(pkg) {
-  return SAFETY[pkg] ?? { status: 'unsupported', why: 'unknown model' };
+  const p = SAFETY[pkg];
+  return p ? { ...p, maxTotal: p.maxInput && p.maxNew ? p.maxInput + p.maxNew : undefined } : { status: 'unsupported', why: 'unknown model' };
+}
+
+/**
+ * The limits to use for a model: what was asked for (the person's settings), made sensible. The prompt is at least
+ * 100 tokens, the answer at least 24, and together they never pass the model's ceiling. Anything missing or not a
+ * number falls back to the starting value. `maxTotal` is prompt + answer; time allowed grows with either, up to 5 minutes.
+ */
+export function clampLimits(pkg, asked = {}) {
+  const p = SAFETY[pkg];
+  if (!p?.maxInput) return null;
+  const whole = (v, fallback) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : fallback);
+  const maxInput = Math.min(Math.max(whole(asked?.maxInput, p.maxInput), MIN_INPUT_TOKENS), p.ceiling - MIN_USEFUL_NEW_TOKENS);
+  const maxNew = Math.min(Math.max(whole(asked?.maxNew, p.maxNew), MIN_USEFUL_NEW_TOKENS), p.ceiling - maxInput);
+  const maxMs = Math.min(300_000, Math.round(p.maxMs * Math.max(1, maxNew / p.maxNew, maxInput / p.maxInput)));
+  return { maxInput, maxNew, maxTotal: maxInput + maxNew, maxMs };
 }
 
 /**

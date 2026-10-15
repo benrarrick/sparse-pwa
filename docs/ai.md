@@ -10,14 +10,15 @@ This describes how the optional on-device AI is kept from destabilising the app,
 
 ## Models
 
-| Model | Weights | Needs | Token limits (prompt / answer / total, time) |
+| Model | Weights | Needs | Starting limits (prompt / answer tokens) and the most they may add up to |
 |---|---|---|---|
-| LFM2.5 **350M** Instruct | 258 MB (q4f16) or 297 MB (q4) | WebGPU | 600 / 200 / 760, 120 s |
-| LFM2.5 **230M** Instruct | 216 MB (q4) | WebGPU | 500 / 200 / 650, 120 s |
-| Llama **3.2 1B** Instruct (WebLLM) | 711 MB (q4f16_1, WebLLM's own store) + 6 MB engine | WebGPU with 16-bit floats | 800 / 256 / 1,000, 180 s |
+| LFM2.5 **350M** Instruct | 258 MB (q4f16) or 297 MB (q4) | WebGPU | 600 / 200, together up to 4,096 |
+| LFM2.5 **230M** Instruct | 216 MB (q4) | WebGPU | 500 / 200, together up to 4,096 |
+| Llama **3.2 1B** Instruct (WebLLM) | 711 MB (q4f16_1, WebLLM's own store) + 6 MB engine | WebGPU with 16-bit floats | 450 / 200, together up to 2,048 |
 | BGE small en v1.5 | 35 MB, CPU | none | batches of 4, ≤ 1,200 characters each, ≤ 64 passages per question |
 
-- The limits are guesses that were more cautious before (220 tokens on a phone) and are now the same everywhere. They are the numbers to lower if a model runs out of memory on a device: `SAFETY` in `js/ai-policy.js`.
+- **You set the limits.** Each model's card on the AI page has two fields, the longest prompt and the longest answer, in tokens. They are saved on the device, Reset puts the starting values back, and a value that cannot work (below 100 / 24 tokens, or the two adding up past the ceiling) is adjusted and says so. Summaries and answers use the answer field as their length limit, and the text taken from a page is sized from the prompt field. The starting values are guesses, the same everywhere, in `SAFETY` in `js/ai-policy.js`.
+- **Llama through WebLLM, measured on one computer** (ordinary English text, greedy decoding): correct at 180, 328 and 476 prompt tokens; an empty answer at 624; garbage or a lost GPU above that (about 1,000). That is why its starting prompt limit is 450 and why its card says so. Not measured on a phone, where the limits may be lower.
 - Every Transformers.js entry has a pinned commit of the Hugging Face repository. Repository ids, file names, sizes and tensor names were checked against the live repositories (see [what was measured](#what-was-measured-about-memory)).
 - A model removed from the app (1.2B, 2.6B) has its files deleted at the next start, and the old developer-mode and quarantine settings are cleared.
 - **Licence:** the LFM2.5 models are under the *LFM Open License 1.0* (Liquid AI; the model cards link the terms, which include conditions for commercial use). Llama 3.2 is under the Llama 3.2 Community License. BGE small is MIT. Transformers.js, ONNX Runtime and WebLLM are Apache-2.0 / MIT. Models are downloaded by you to your own device; this repository does not redistribute them (it does keep the WebLLM library in `vendor/`).
@@ -38,7 +39,7 @@ The one model here that does not run on Transformers.js. It came out best in the
 
 ## Limits and diagnosis
 
-**Token budgets (fail closed).** Before any inference the engine counts the prompt with the model's own tokenizer (system prompt, chat template, sources, question and all). If counting fails, nothing runs (`TOKENIZATION_FAILED`). It then enforces `input ≤ maxInput` and `input + new ≤ maxTotal`, and an answer is never allowed less than 24 tokens of room. A prompt over the limit is refused, or, where the caller allows it (source text, summary parts), its end is cut to fit, counting again after each cut. The page can only ask for lower limits than the model's own.
+**Token budgets (fail closed).** Before any inference the engine counts the prompt with the model's own tokenizer (system prompt, chat template, sources, question and all). If counting fails, nothing runs (`TOKENIZATION_FAILED`). It then enforces `input ≤ maxInput` and `input + new ≤ maxTotal`, and an answer is never allowed less than 24 tokens of room. A prompt over the limit is refused, or, where the caller allows it (source text, summary parts), its end is cut to fit, counting again after each cut. The limits are the person's settings (made sensible, and never past the model's ceiling); the engine applies the same rules as the page.
 
 **One operation at a time.** Loading, embedding, generating, switching models, unloading and resetting go through one scheduler (`js/ai-ops.js`) with an explicit queue (at most 8 waiting). The same scheduler runs again inside the engine, so a second request there is queued and logged, never run alongside. Stop is never queued behind the work it stops.
 

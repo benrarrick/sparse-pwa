@@ -25,6 +25,7 @@ const K = {
   cp: 'sparse-ai-cp', // the checkpoint of the work in progress
   legacy: 'sparse-ai-busy', // the older, single-marker crash detection
   interruption: 'sparse-ai-interruption', // the diagnosis made at the last launch
+  limits: 'sparse-ai-limits', // the prompt and answer limits a person has set, per model
 };
 /** Errors that say nothing about the model's health (refused up front, or stopped on purpose). */
 const BENIGN = new Set(['CANCELLED', 'BACKGROUNDED', 'TOKEN_BUDGET_EXCEEDED', 'TOKENIZATION_FAILED', 'MODEL_NOT_INSTALLED', 'MODEL_INCOMPATIBLE', 'NOT_FOREGROUND', 'VERSION_MISMATCH', 'QUEUE_FULL', 'GPU_UNAVAILABLE']);
@@ -204,10 +205,29 @@ export function chatBlockers() {
 export const profile = (id) => PO.profileFor(id);
 export const lowMemory = () => PO.isLowMemory(cls);
 export { explain };
-export const limitsFor = (id) => {
-  const p = PO.profileFor(id);
-  return { maxInput: p.maxInput, maxNew: p.maxNew, maxTotal: p.maxTotal, maxMs: p.maxMs };
-};
+
+// ---------- prompt and answer limits: set per model on the AI page ----------
+
+let userLimits = jget(K.limits, {});
+
+/** The limits in force for a model: the person's settings (made sensible), else its starting values. */
+export const limitsFor = (id) => PO.clampLimits(id, userLimits[id]);
+export const defaultLimits = (id) => PO.clampLimits(id, {});
+export const limitBounds = (id) => ({ ceiling: PO.profileFor(id).ceiling, minInput: PO.MIN_INPUT_TOKENS, minNew: PO.MIN_USEFUL_NEW_TOKENS });
+export const limitsChanged = (id) => !!userLimits[id];
+
+/** Saves a model's prompt and answer limits; returns what was actually applied (it can differ: the two may not pass the model's ceiling). */
+export function setLimits(id, { maxInput, maxNew }) {
+  const applied = PO.clampLimits(id, { maxInput, maxNew });
+  if (!applied) return null;
+  const d = defaultLimits(id);
+  if (applied.maxInput === d.maxInput && applied.maxNew === d.maxNew) delete userLimits[id];
+  else userLimits[id] = { maxInput: applied.maxInput, maxNew: applied.maxNew };
+  jset(K.limits, userLimits);
+  event('ai.limits.changed', { msg: `${P[id]?.short ?? id}: prompt up to ${applied.maxInput} tokens, answer up to ${applied.maxNew}`, pkg: id, m: { maxInput: applied.maxInput, maxNew: applied.maxNew, asked: { maxInput, maxNew } } });
+  return applied;
+}
+export const resetLimits = (id) => setLimits(id, {});
 
 // ---------- checkpoints: written BEFORE each risky stage ----------
 
@@ -1267,6 +1287,7 @@ export async function removeAll() {
   for (const k of [...Object.values(K), ...OLD_KEYS]) jdel(k);
   cp = null;
   interruptionRec = null;
+  userLimits = {};
   gpuLost = false;
   lastInference = null;
   vecCache.clear();
@@ -1519,7 +1540,7 @@ export const clearAsks = () => AS.del('notes', 'asks').catch(() => {});
 export const status = () => ({
   op: sched.snapshot(),
   worker: workerInfo(),
-  loaded: [...loaded.entries()].map(([id, i]) => ({ id, ...i })),
+  loaded: [...loaded.entries()].map(([id, i]) => ({ ...i, id })), // `id` last: the engine's reply carries its own request id too
   cls,
   gpuLost,
   versionMismatch,
@@ -1549,7 +1570,7 @@ export async function diagnostics({ detail = false } = {}) {
     worker: workerInfo(),
     loaded: [...loaded.keys()],
     models: Object.values(st).map((r) => ({ id: r.id, status: r.status, dtype: r.dtype, device: r.device, revision: P[r.id]?.revision, have: r.have, failures: r.failures, crashes: r.crashes })),
-    limits: Object.fromEntries(AL.CHAT_IDS.map((id) => [id, limitsFor(id)])),
+    limits: Object.fromEntries(AL.CHAT_IDS.map((id) => [id, { ...limitsFor(id), changed: limitsChanged(id) }])),
     interruption: interruptionRec,
     lastInference,
     performance: performanceSummary(entries),

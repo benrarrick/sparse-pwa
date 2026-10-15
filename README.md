@@ -49,11 +49,11 @@ Licences: LFM Open License 1.0 for the LFM models, Llama 3.2 Community License f
 3. **Ask from the model's own knowledge**, labelled as possibly wrong.
 
 **Keeping the app steady** (iOS can end a page that uses too much memory, with no error to catch)
-- Each model has **token limits** (prompt, answer, combined), counted with the model's own tokenizer and enforced inside the engine; they are in one place, `SAFETY` in `js/ai-policy.js`, and the same on every device.
+- Each model has a **longest prompt** and a **longest answer** (in tokens), counted with the model's own tokenizer and enforced inside the engine. You can change both for each model on the AI page; they are kept on the device, and together they can't pass what the model can hold. The starting values are in `SAFETY` in `js/ai-policy.js`, the same on every device.
 - **One operation at a time**, one model in memory at a time; the AI stops if the app goes to the background; a half-updated app is detected.
 - **Checkpoints** are written before each risky stage. If the app is ended in the middle of one, the next launch says so on the AI page and in the log, with a plain diagnosis (backgrounded, closed, GPU lost, unexplained). Nothing is switched off because of it.
 
-**The AI page** shows each model with Download / Pause / Test / Remove, the model chooser, a one-line status, and the log (every download, load and run, with where and why anything failed), with **Copy report** / **Copy as JSON**. Reports hold ids, counts and timings, never page text or questions. See docs/ai.md.
+**The AI page** shows each model with Download / Pause / Test / Remove and its prompt and answer limits as editable fields, the model chooser, a one-line status, and the log (every download, load and run, with where and why anything failed), with **Copy report** / **Copy as JSON**. Reports hold ids, counts and timings, never page text or questions. See docs/ai.md.
 
 **Downloads** (Transformers.js models) resume where they stopped, keep the screen on, check free storage first, pin revisions and verify sizes and the engine's SHA-256. Llama's weights are fetched by WebLLM itself.
 
