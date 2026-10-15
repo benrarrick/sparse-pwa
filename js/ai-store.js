@@ -119,6 +119,12 @@ export function clearStore(store) {
 
 export const addLog = (entry) => tx('log', 'readwrite', (s) => void s.add(entry));
 
+/** Several entries in one transaction (the logger writes in batches, off the token path). */
+export const addLogs = (entries) =>
+  tx('log', 'readwrite', (s) => {
+    for (const e of entries) s.add(e);
+  });
+
 /** The newest `limit` entries, newest first. */
 export function readLog(limit = 300) {
   return tx('log', 'readonly', (s) =>

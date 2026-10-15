@@ -1,0 +1,31 @@
+[
+ {
+  "q": "sourdough",
+  "at": 1761000000000,
+  "results": [
+   {
+    "title": "Sourdough bread",
+    "url": "https://example.org/sourdough",
+    "snippet": [
+     {
+      "text": "A short snippet about sourdough bread"
+     }
+    ]
+   },
+   {
+    "title": "Easy sourdough for beginners",
+    "url": "https://other.example/easy",
+    "snippet": [
+     {
+      "text": "Mix flour, water and starter, wait and bake."
+     }
+    ]
+   }
+  ],
+  "instant": {
+   "heading": "Sourdough",
+   "text": "Sourdough is a bread made by fermenting dough using naturally occurring yeasts and lactobacilli.",
+   "url": "https://en.wikipedia.org/wiki/Sourdough"
+  }
+ }
+]

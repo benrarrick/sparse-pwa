@@ -1,0 +1,27 @@
+[
+ {
+  "q": "What temperature should I bake sourdough at?",
+  "expect": "230 C",
+  "url": "https://example.org/sourdough"
+ },
+ {
+  "q": "How much did the Harbour Line cost in the end?",
+  "expect": "3.4 billion euros",
+  "url": "https://example.org/rail"
+ },
+ {
+  "q": "When does the Harbour Line open?",
+  "expect": "9 September 2025",
+  "url": "https://example.org/rail"
+ },
+ {
+  "q": "What happens when the cache returns error E_CACHE_LOCKED?",
+  "expect": "/var/run/cache.lock",
+  "url": "https://example.org/cache"
+ },
+ {
+  "q": "What is the capital of Australia?",
+  "expect": null,
+  "url": null
+ }
+]

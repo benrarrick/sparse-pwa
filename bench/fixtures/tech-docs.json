@@ -1,0 +1,13 @@
+{
+ "title": "Configuring the cache",
+ "facts": [
+  "cache.maxSize",
+  "256",
+  "3600",
+  "E_CACHE_FULL",
+  "/var/run/cache.lock",
+  "512 bytes",
+  "16 MB"
+ ],
+ "md": "# Configuring the cache\n\nThe cache module stores responses on disk and in memory. It is enabled by default in version 3.\n\n## Settings\n\nSet `cache.maxSize` to the maximum size in megabytes. The default is 256. Set `cache.ttl` to the number of seconds an entry stays fresh; the default is 3600.\n\n## Eviction\n\nWhen the cache is full, the least recently used entries are removed first. Pinned entries are never removed. Use `cache.pin(key)` to pin an entry.\n\n## Troubleshooting\n\nIf you see error E_CACHE_FULL, increase `cache.maxSize` or reduce `cache.ttl`. If you see error E_CACHE_LOCKED, another process holds the lock file at `/var/run/cache.lock`; delete it only if that process has exited.\n\n## Limits\n\nThe maximum key length is 512 bytes and the maximum value size is 16 MB. Keys longer than 512 bytes raise error E_KEY_TOO_LONG.\n"
+}

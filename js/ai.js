@@ -1,30 +1,69 @@
-// On-device AI, page side. Nothing here runs until you download a model on the AI page:
+// On-device AI, page side. Nothing here runs until you download a model on the AI page.
 //   - device checks (WebGPU, 16-bit floats, storage)
 //   - resumable downloads into IndexedDB (ai-store.js), with pause, retry and removal
-//   - the engine connection (a Web Worker running ai-engine.js, or the page as a fallback)
-//   - crash markers: iOS ends a page that uses too much memory without any error the page can
-//     catch, so a marker is written before each load or run and cleared after; one still there
-//     on the next launch means the app was ended mid-way, and it is logged as a crash
-//   - the diagnostics log, and retrieval over saved pages and searches (keywords + BGE vectors)
+//   - the engine connection (a Web Worker running ai-engine.js; the page itself only where that is
+//     safe) and its health
+//   - ONE operation at a time (ai-ops.js): loading, embedding, generating, unloading and resetting
+//     queue here, and are enforced again inside the engine
+//   - safety (ai-policy.js): per-model profiles and token budgets, checkpoints written before each
+//     risky stage, a diagnosis of the last launch's interruption, and quarantine of configurations
+//     that were interrupted unexpectedly
+//   - the diagnostics log (ai-diag.js): structured events, kept on the device and bounded
+//   - retrieval over saved pages and searches (keywords + BGE vectors), and summaries
 import * as AL from './ai-lib.js';
 import * as AS from './ai-store.js';
 import * as S from './store.js';
+import * as PO from './ai-policy.js';
+import * as SEL from './ai-select.js';
+import { createScheduler, Cancelled } from './ai-ops.js';
+import { createLogger, newId, AiError, classifyError, explain, performanceSummary, buildReport } from './ai-diag.js';
 import { record } from './net.js';
 import { serviceOf } from './lib.js';
 
 const P = AL.PACKAGES;
-const BUSY = 'sparse-ai-busy';
+const K = {
+  cp: 'sparse-ai-cp', // the checkpoint of the work in progress
+  quarantine: 'sparse-ai-quarantine',
+  history: 'sparse-ai-history',
+  safety: 'sparse-ai-safety', // developer mode and the models opted in to
+  legacy: 'sparse-ai-busy', // the older, single-marker crash detection
+  interruption: 'sparse-ai-interruption', // the diagnosis made at the last launch
+};
+/** Errors that say nothing about the model's health (refused up front, or stopped on purpose). */
+const BENIGN = new Set(['CANCELLED', 'BACKGROUNDED', 'TOKEN_BUDGET_EXCEEDED', 'TOKENIZATION_FAILED', 'MODEL_NOT_INSTALLED', 'MODEL_QUARANTINED', 'MODEL_NOT_ENABLED', 'MODEL_INCOMPATIBLE', 'NOT_FOREGROUND', 'VERSION_MISMATCH', 'QUEUE_FULL', 'GPU_UNAVAILABLE']);
 const CHUNK = 8 * 1024 * 1024;
 const STALL_MS = 45_000;
-const IDLE_UNLOAD_MS = 10 * 60 * 1000;
+const LOAD_LIMIT_MS = 240_000;
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
     const t = setTimeout(resolve, ms);
     signal?.addEventListener('abort', () => (clearTimeout(t), reject(signal.reason ?? new Error('aborted'))), { once: true });
   });
 
+const jget = (k, d) => {
+  try {
+    return JSON.parse(localStorage.getItem(k) ?? 'null') ?? d;
+  } catch {
+    return d;
+  }
+};
+const jset = (k, v) => {
+  try {
+    localStorage.setItem(k, JSON.stringify(v));
+  } catch {
+    // private mode: safety state lasts only for this session
+  }
+};
+const jdel = (k) => {
+  try {
+    localStorage.removeItem(k);
+  } catch {
+    // as above
+  }
+};
+
 const listeners = new Set();
-/** Subscribe to 'log', 'pkg', 'download', 'loaded' and 'load-progress' events. Returns an unsubscribe. */
+/** Subscribe to 'log', 'pkg', 'download', 'loaded', 'load-progress', 'op' and 'safety' events. Returns an unsubscribe. */
 export function on(fn) {
   listeners.add(fn);
   return () => listeners.delete(fn);
@@ -40,45 +79,46 @@ function emit(type, data) {
 
 // ---------- diagnostics log ----------
 
-let recent = [];
+const sid = newId('s');
 let persist = false; // the AI database is only created once you opt in
 
-export async function log(level, area, msg, extra = {}) {
-  const e = { t: Date.now(), level, area, msg, ...extra };
-  recent = [e, ...recent].slice(0, 300);
-  (level === 'error' ? console.error : level === 'warn' ? console.warn : console.log)(`[AI ${area}] ${msg}`);
-  emit('log', e);
-  if (persist)
-    try {
-      await AS.addLog(e);
-      if (Math.random() < 0.05) await AS.trimLog(600);
-    } catch {
-      // storage full or unavailable: the in-memory copy still shows on screen
-    }
-  return e;
+const logger = createLogger({
+  base: { sid, build: AL.AI_BUILD },
+  write: async (batch) => {
+    if (!persist) return;
+    await AS.addLogs(batch);
+    if (Math.random() < 0.1) await AS.trimLog(600);
+  },
+  sink: (e) => {
+    (e.level === 'error' ? console.error : e.level === 'warn' ? console.warn : console.log)(`[AI ${e.area}] ${e.msg}`);
+    emit('log', e);
+  },
+});
+
+/** Records a structured event (see ai-diag.js). */
+export const event = (ev, fields) => logger.event(ev, fields);
+
+/** The older, free-text form: log(level, area, msg, fields). */
+export function log(level, area, msg, extra = {}) {
+  return logger.event(`ai.${area}.note`, { level, area, msg, ...extra });
 }
 
 export async function readLog(limit = 300) {
-  if (!persist) return recent;
-  return AS.readLog(limit).catch(() => recent);
+  if (!persist) return logger.recent();
+  await logger.flush();
+  return AS.readLog(limit).catch(() => logger.recent());
 }
 
 export async function clearLog() {
-  recent = [];
+  logger.clear();
   if (persist) await AS.clearStore('log');
 }
 
 // ---------- package records ----------
 
 const ready = new Set();
+const recs = new Map(); // id -> record, for synchronous checks (variant, status)
 export const isReady = (id) => ready.has(id);
-export const anyChat = () => AL.CHAT_IDS.some((id) => ready.has(id));
-
-/** The chat model to use: the preferred one if it's downloaded, else any downloaded one. */
-export function chatModel(preferred) {
-  if (ready.has(preferred) && P[preferred]?.kind === 'chat') return preferred;
-  return AL.CHAT_IDS.find((id) => ready.has(id)) ?? null;
-}
 
 export async function state(id) {
   if (!persist) return { id, status: 'none' };
@@ -94,6 +134,7 @@ export async function states() {
 async function save(rec) {
   persist = true;
   await AS.put('pkgs', rec.id, rec);
+  recs.set(rec.id, rec);
   if (rec.status === 'ready') ready.add(rec.id);
   else ready.delete(rec.id);
   emit('pkg', rec);
@@ -101,10 +142,12 @@ async function save(rec) {
 
 // ---------- device ----------
 
-/** WebGPU worth using: a software fallback (SwiftShader) is slower than the CPU path. */
-export const usableGpu = (d) => (d.gpu.gpu && !d.gpu.fallback ? d.gpu : null);
+/** WebGPU worth using: a software fallback (SwiftShader) is slower than the CPU path, so it counts only in developer testing mode. */
+export const usableGpu = (d) => (d.gpu.gpu && (!d.gpu.fallback || safety.dev) ? d.gpu : null);
 
 let deviceInfo = null;
+const cls = PO.deviceClass(undefined, jget('sparse-ai-class', null));
+export const deviceClassName = () => cls;
 
 export async function device(force = false) {
   if (deviceInfo && !force) return deviceInfo;
@@ -124,9 +167,182 @@ export async function device(force = false) {
     isolated: globalThis.crossOriginIsolated ?? false,
     standalone: matchMedia('(display-mode: standalone)').matches || navigator.standalone === true,
     ua: navigator.userAgent,
+    cls,
   };
   return deviceInfo;
 }
+
+// ---------- safety state: developer mode, opt-ins, quarantine, history ----------
+
+const safety = { dev: false, optIn: [], ...jget(K.safety, {}) };
+let quarantine = new Map(Object.entries(jget(K.quarantine, {})));
+let history = jget(K.history, {});
+let gpuLost = false;
+let versionMismatch = false;
+let lastInference = null;
+let interruption = jget(K.interruption, null);
+
+const policyState = () => ({ cls, dev: safety.dev, optIn: new Set(safety.optIn), quarantine, gpuLost });
+const saveSafety = () => {
+  jset(K.safety, safety);
+  emit('safety');
+};
+
+export const getDev = () => safety.dev;
+export function setDev(on) {
+  safety.dev = !!on;
+  saveSafety();
+  event('ai.safety.developer_mode', { level: 'warn', msg: `Developer testing mode turned ${on ? 'on' : 'off'}` });
+}
+export const optedIn = (id) => safety.optIn.includes(id);
+export function setOptIn(id, on) {
+  safety.optIn = [...new Set(on ? [...safety.optIn, id] : safety.optIn.filter((x) => x !== id))];
+  saveSafety();
+  event('ai.safety.opt_in', { msg: `${P[id]?.short ?? id}: experimental use turned ${on ? 'on' : 'off'}`, pkg: id });
+}
+
+/** Whether a downloaded model may run now (profile, opt-in, quarantine, GPU), and why not. */
+export function mayRun(id) {
+  const r = recs.get(id);
+  if (!r?.dtype || r.status !== 'ready') return { ok: false, code: 'MODEL_NOT_INSTALLED', why: `${P[id]?.short ?? id} is not downloaded` };
+  // a weights file this browser's engine already failed to load is not tried again until it is replaced
+  if (r.incompatible && r.incompatible.dtype === r.dtype && r.incompatible.device === r.device)
+    return { ok: false, code: 'MODEL_INCOMPATIBLE', why: `The ${r.dtype} weights could not be loaded on ${r.device === 'webgpu' ? 'WebGPU' : 'the CPU'} here (${r.incompatible.message}). Remove ${P[id].short} and download it again to retry` };
+  return PO.mayRun(id, r.device, r.dtype, policyState());
+}
+
+/** The chat model to use: the preferred one if it may run, else a provisional one that may. Never an experimental one unless chosen. */
+export function chatModel(preferred) {
+  const ok = (id) => ready.has(id) && P[id]?.kind === 'chat' && mayRun(id).ok;
+  if (preferred && ok(preferred)) return preferred;
+  return AL.CHAT_IDS.find((id) => ok(id) && PO.profileFor(id, cls).status === 'provisional') ?? null;
+}
+export const anyChat = (preferred) => chatModel(preferred) !== null;
+
+/** Downloaded chat models that cannot run right now, with the reason: for the "AI is unavailable" notice. */
+export function chatBlockers() {
+  return AL.CHAT_IDS.filter((id) => ready.has(id))
+    .map((id) => ({ id, ...mayRun(id) }))
+    .filter((x) => !x.ok);
+}
+
+export const profile = (id) => PO.profileFor(id, cls);
+export const lowMemory = () => PO.isLowMemory(cls);
+export { explain };
+/** Prompt limits a person may pick for a model: lower than the profile's, or higher only in developer mode. */
+export const limitChoices = (id) => PO.promptLimitChoices(PO.profileFor(id, cls), safety.dev);
+export const limitsFor = (id, promptLimit) => PO.effectiveLimits(PO.profileFor(id, cls), { promptLimit, dev: safety.dev });
+
+export const quarantined = () => [...quarantine.entries()].map(([key, q]) => ({ key, ...q }));
+
+/** Developer mode only: clears a quarantine so the configuration can be tested again. */
+export function retest(key) {
+  if (!safety.dev) throw new AiError('MODEL_QUARANTINED', 'Turn on developer testing mode to retest a model that was switched off');
+  const q = quarantine.get(key);
+  quarantine.delete(key);
+  jset(K.quarantine, Object.fromEntries(quarantine));
+  event('ai.quarantine.released', { level: 'warn', msg: `Retest allowed for ${key}`, key, category: q?.category });
+  emit('safety');
+}
+
+function setQuarantine(key, q) {
+  quarantine.set(key, q);
+  jset(K.quarantine, Object.fromEntries(quarantine));
+  event('ai.quarantine.added', { level: 'error', msg: `Switched off ${key}: ${q.category}`, key, category: q.category, confidence: q.confidence });
+  emit('safety');
+}
+
+function noteOutcome(key, outcome, detail) {
+  history[key] = PO.noteOutcome(history[key], outcome, detail);
+  jset(K.history, history);
+}
+
+// ---------- checkpoints: written BEFORE each risky stage ----------
+
+let cp = null;
+let cpWrittenAt = 0;
+const cpWrite = (force = true) => {
+  if (!cp) return;
+  if (!force && Date.now() - cpWrittenAt < 1000) return;
+  cpWrittenAt = Date.now();
+  jset(K.cp, cp);
+};
+function cpStart(info) {
+  cp = PO.newCheckpoint({ sid, vis: document.visibilityState, runtime: AL.AI_BUILD, mode: conn?.mode ?? null, ...info });
+  cpWrite();
+}
+function cpStageNow(stage, extra, force = true) {
+  if (!cp) return;
+  cp = PO.advance(cp, stage, extra);
+  cpWrite(force);
+}
+/** Ends the checkpoint. Only its own operation may do so (an abandoned one finishing late must not wipe a newer one). */
+function cpClear(owner = null) {
+  if (!cp || (owner && cp.op !== owner)) return;
+  cp = null;
+  jdel(K.cp);
+}
+/** A stage message counts only while its operation (or one of its steps) is the one running. */
+function isLive(id) {
+  const a = sched.snapshot().active?.id;
+  return !!a && !!id && (id === a || String(id).startsWith(`${a}.`) || opParent.get(id) === a);
+}
+const cpStage = cpStageNow;
+function onVisibility() {
+  const v = document.visibilityState;
+  if (cp) {
+    cp = PO.withVisibility(cp, v);
+    cpWrite();
+    event('ai.app.visibility', { msg: `App ${v === 'hidden' ? 'went to the background' : 'came back'} during ${cp.type}`, op: cp.op, stage: cp.stage, m: { state: v } });
+  }
+  // iOS suspends or ends background pages: stop work that needs the screen rather than be caught mid-way
+  if (v === 'hidden' && current) {
+    event('ai.operation.backgrounded', { level: 'warn', msg: 'The app went to the background, so the AI was stopped', op: current, code: 'BACKGROUNDED' });
+    stop('backgrounded');
+  }
+}
+function onPageHide(e) {
+  if (cp && !e.persisted) {
+    cp = { ...cp, closing: true };
+    cpWrite();
+  }
+}
+
+// ---------- scheduler: one operation at a time ----------
+
+const ev0 = (e) => e.ev.split('.').pop();
+const opParent = new Map();
+const opMeta = new Map(); // op id -> { queueMs }
+let current = null; // the running generation's id
+
+const sched = createScheduler({
+  onEvent: (e) => {
+    if (e.parent) opParent.set(e.op, e.parent);
+    if (opParent.size > 200) opParent.delete(opParent.keys().next().value);
+    if (e.ev === 'ai.operation.started') {
+      opMeta.set(e.op, { queueMs: e.queueMs ?? 0 });
+      if (opMeta.size > 200) opMeta.delete(opMeta.keys().next().value);
+    }
+    if (!e.parent && (ev0(e) === 'completed' || ev0(e) === 'failed' || ev0(e) === 'cancelled'))
+      setTimeout(() => {
+        if (!sched.busy && cp) {
+          event('ai.checkpoint.stale_cleared', { level: 'warn', msg: `A checkpoint for ${cp.type} (stage ${cp.stage}) was left behind after the operation ended, and was cleared`, op: cp.op, stage: cp.stage });
+          cp = null;
+          jdel(K.cp);
+        }
+      }, 50);
+    const { ev, ...rest } = e;
+    const level = ev === 'ai.operation.failed' || ev === 'ai.operation.timeout' ? 'error' : ev === 'ai.operation.cancelled' || ev === 'ai.operation.abandoned' ? 'warn' : 'info';
+    // queued/stage chatter is kept to the log only for the top-level operations
+    if (ev === 'ai.operation.stage') return emit('op', sched.snapshot());
+    event(ev, { level, msg: `${e.type}${e.label && e.label !== e.type ? ` (${e.label})` : ''}: ${ev.split('.').pop()}${e.msg ? ` · ${e.msg}` : ''}`, ...rest, m: { queueMs: e.queueMs, depth: e.depth, requested: e.requested, ms: e.ms } });
+    emit('op', sched.snapshot());
+  },
+  maxQueue: 8,
+});
+
+export const opState = () => sched.snapshot();
+export const busy = () => sched.busy || sched.depth > 0;
 
 // ---------- engine connection ----------
 
@@ -135,11 +351,18 @@ let connecting = null;
 const pending = new Map();
 const loaded = new Map();
 let seq = 0;
-let current = null; // the running generation's key
 let idleTimer = null;
+let workerState = 'none'; // none · starting · initialised · responsive · busy · unresponsive · terminated · restarted
+const workerStats = { starts: 0, terminations: 0, resets: 0, lastMsgAt: null, lastPongMs: null, build: null };
+
+function setWorker(s, msg, level = 'info') {
+  workerState = s;
+  event(`ai.worker.${s}`, { level, msg: msg ?? `AI engine: ${s}`, m: { mode: conn?.mode, starts: workerStats.starts, terminations: workerStats.terminations } });
+}
 
 export const loadedModels = () => new Map(loaded);
 export const engineMode = () => conn?.mode ?? null;
+export const workerInfo = () => ({ state: workerState, mode: conn?.mode ?? null, ...workerStats, gpuLost, versionMismatch });
 
 function settle(key, value) {
   const p = pending.get(key);
@@ -155,56 +378,126 @@ function failPending(key, err) {
   p.reject(err);
 }
 
+function stageEvent(m) {
+  const live = isLive(m.id);
+  const cpStage = (...a) => (live ? cpStageNow(...a) : undefined);
+  const mem = m.mem && Object.values(m.mem).some((v) => v != null) ? { jsHeap: m.mem.jsHeap, jsHeapLimit: m.mem.jsHeapLimit } : undefined;
+  const f = (id) => ({ op: m.id, parent: opParent.get(m.id) ?? null, stage: m.stage, ...(id ? modelFields(id) : {}) });
+  const id = m.pkg ?? cp?.pkg;
+  switch (m.stage) {
+    case 'load.start':
+      return event('ai.model.load.started', { msg: `Loading ${P[id]?.short ?? id} (${m.dtype} on ${m.device})`, ...f(id), m: { memory: mem } });
+    case 'load.ready':
+      return event('ai.model.load.completed', { level: 'ok', msg: `Loaded in ${(m.ms / 1000).toFixed(1)} s`, ...f(id), m: { ms: m.ms, mode: conn?.mode, memory: mem } });
+    case 'tokenize':
+      return cpStage('tokenize', undefined);
+    case 'prompt.tokenized':
+      cpStage('prefill', { inputTokens: m.inputTokens, maxNew: m.maxNew }, true);
+      return event('ai.prompt.tokenized', {
+        msg: `Prompt is ${m.inputTokens} tokens (limit ${m.limits?.maxInput}); up to ${m.maxNew} may be written (total limit ${m.limits?.maxTotal})`,
+        ...f(cp?.pkg),
+        m: { inputTokens: m.inputTokens, maxNew: m.maxNew, total: m.total, limits: m.limits, tokenizeMs: m.tokenizeMs, trimmed: m.trimmed, estimated: m.est, memory: mem },
+      });
+    case 'prefill':
+      return event('ai.inference.prefill.started', { msg: 'Prompt processing started (it ends at the first token: the runtime reports nothing in between)', ...f(cp?.pkg), m: { inputTokens: m.inputTokens, memory: mem } });
+    case 'first_token':
+      cpStage('first_token');
+      return event('ai.inference.first_token', { msg: `First token after ${m.ms} ms`, ...f(cp?.pkg), m: { ms: m.ms, inferredFrom: 'prefill started' } });
+    case 'decode':
+      return cpStage('decode', { tokens: m.tokens }, false);
+    case 'generate.done':
+      return cpStage('generate.done', { tokens: m.tokens });
+    case 'embed.batch':
+      return cpStage('embed.batch', { tokens: m.done }, false);
+    case 'embed.done':
+      return cpStage('embed.done');
+    case 'dispose.start':
+      cpStage('dispose.start');
+      return event('ai.model.dispose.started', { msg: `Releasing ${P[m.pkg]?.short ?? m.pkg} (${m.why ?? 'unload'})`, ...f(m.pkg), m: { memory: mem } });
+    case 'dispose.done':
+      cpStage('dispose.done');
+      return event('ai.model.dispose.completed', { msg: `Released in ${m.ms} ms`, ...f(m.pkg), m: { ms: m.ms, memory: mem } });
+    default:
+  }
+}
+
 function onMessage(m) {
+  workerStats.lastMsgAt = Date.now();
   switch (m.type) {
+    case 'ready':
+      workerStats.build = m.build;
+      if (m.build !== AL.AI_BUILD) {
+        versionMismatch = true;
+        event('ai.worker.version_mismatch', { level: 'error', msg: `The AI worker is build ${m.build} but the page is ${AL.AI_BUILD}: the app is only partly updated`, code: 'VERSION_MISMATCH' });
+        emit('safety');
+      }
+      return;
     case 'log':
-      return void log(m.level, 'engine', m.msg);
+      return void logger.event('ai.worker.log', { level: m.level, area: 'engine', msg: m.msg, m: m.data });
+    case 'sched': {
+      // the engine's own queue: it only matters if the page let two requests overlap
+      const e = m.e;
+      if (e.ev === 'ai.operation.timeout' || e.ev === 'ai.operation.abandoned') event(e.ev, { level: 'error', msg: `Engine: ${e.type} ${e.ev.split('.').pop()} at ${e.stage}`, op: e.op, stage: e.stage, code: 'INFERENCE_TIMEOUT', m: { ms: e.ms } });
+      else if (e.ev === 'ai.operation.queued' && e.requested > 1) event('ai.engine.overlap', { level: 'warn', msg: `The engine received a ${e.type} request while busy (${e.requested} requests); it queued them`, op: e.op, m: { requested: e.requested } });
+      return;
+    }
+    case 'stage':
+      return stageEvent(m);
+    case 'gpu-lost':
+      gpuLost = true;
+      if (cp) cpStage(cp.stage, { gpuLost: true });
+      sched.markFailed({ code: 'GPU_DEVICE_LOST', at: Date.now() });
+      event('ai.worker.gpu_lost', { level: 'error', msg: `The GPU device was lost (${m.reason}): ${m.message}`, code: 'GPU_DEVICE_LOST', op: cp?.op, stage: cp?.stage });
+      emit('safety');
+      return;
     case 'progress':
       emit('load-progress', m);
-      return pending.get(`load:${m.pkg}`)?.progress?.(m);
+      return pending.get(m.id)?.progress?.(m);
     case 'loaded':
-      return settle(`load:${m.pkg}`, m);
     case 'unloaded':
-      return settle(`unload:${m.pkg}`, m);
     case 'probe':
-      return settle('probe', m);
-    case 'token':
-      return pending.get(m.id)?.token?.(m.text);
     case 'done':
     case 'vectors':
       return settle(m.id, m);
+    case 'pong':
+      workerStats.lastPongMs = Date.now() - m.t;
+      return settle(m.id, m);
+    case 'token':
+      return pending.get(m.id)?.token?.(m.text);
     case 'error': {
-      const key = m.id ?? (m.phase === 'load' || m.phase === 'unload' ? `${m.phase}:${m.pkg}` : m.phase);
-      const err = Object.assign(new Error(m.message), { name: m.name, phase: m.phase, detail: m.stack });
-      return failPending(key, err);
+      const err = Object.assign(new AiError(m.code && m.code !== 'UNKNOWN' ? m.code : classifyError({ message: m.message, name: m.name }, { stage: m.stage ?? m.phase }), m.message), { name: m.name, phase: m.phase, detail: m.stack, stage: m.stage });
+      return failPending(m.id, err);
     }
     default:
   }
 }
 
-function request(key, msg, handlers = {}) {
+function request(msg, handlers = {}) {
+  const id = msg.id ?? `r${++seq}`;
   return new Promise((resolve, reject) => {
-    pending.set(key, { resolve, reject, ...handlers });
+    pending.set(id, { resolve, reject, ...handlers });
     try {
-      conn.send(msg);
+      conn.send({ ...msg, id });
     } catch (e) {
-      failPending(key, e);
+      failPending(id, e);
     }
   });
 }
 
-function drop(reason) {
+/** Forgets the engine (it has stopped, or was stopped): nothing is loaded, every waiting request fails. */
+function drop(reason, code = 'WORKER_FAILED') {
   conn = null;
   connecting = null;
-  current = null;
   loaded.clear();
   emit('loaded');
-  for (const key of [...pending.keys()]) failPending(key, reason);
+  const err = reason instanceof Error ? reason : new AiError(code, reason);
+  for (const key of [...pending.keys()]) failPending(key, err);
 }
 
 async function pageConnection() {
   const { createEngine } = await import('./ai-engine.js');
   const engine = createEngine((m) => queueMicrotask(() => onMessage(m)));
+  queueMicrotask(() => onMessage({ type: 'ready', build: AL.AI_BUILD }));
   return { mode: 'page', send: (m) => void engine.handle(m), terminate() {} };
 }
 
@@ -212,35 +505,35 @@ function connect() {
   return (connecting ??= (async () => {
     const dev = await device();
     let w;
+    setWorker('starting', 'Starting the AI worker');
+    workerStats.starts++;
     try {
-      w = new Worker(new URL('./ai-worker.js', import.meta.url), { type: 'module' });
+      w = new Worker(new URL(`./ai-worker.js?b=${AL.AI_BUILD}`, import.meta.url), { type: 'module' });
     } catch (e) {
-      await log('warn', 'engine', `Could not start a worker (${e.message}); running the AI on the page`);
-      conn = await pageConnection();
-      return conn;
+      return fallbackToPage(`Could not start a worker (${e.message})`);
     }
     w.addEventListener('message', (e) => onMessage(e.data));
     w.addEventListener('error', (e) => {
       e.preventDefault?.();
-      log('error', 'engine', `The AI worker stopped: ${e.message || 'no details given (often a sign it ran out of memory)'}`);
-      drop(new Error('The AI worker stopped unexpectedly'));
+      event('ai.worker.error', { level: 'error', msg: `The AI worker stopped: ${e.message || 'no details given (often a sign it ran out of memory)'}`, code: 'WORKER_FAILED', op: cp?.op, stage: cp?.stage });
+      setWorker('terminated', 'The AI worker stopped on its own', 'error');
+      workerStats.terminations++;
+      drop(new AiError('WORKER_FAILED', 'The AI worker stopped unexpectedly'));
     });
     w.addEventListener('messageerror', () => log('error', 'engine', 'A message from the AI worker could not be read'));
     conn = { mode: 'worker', send: (m) => w.postMessage(m), terminate: () => w.terminate() };
-    const probe = await Promise.race([request('probe', { type: 'probe' }), sleep(20000).then(() => null)]);
+    const probe = await Promise.race([request({ type: 'probe' }), sleep(20000).then(() => null)]);
     if (!probe) {
-      await log('error', 'engine', 'The AI worker did not answer within 20 s; running the AI on the page instead');
       w.terminate();
-      pending.delete('probe');
-      conn = await pageConnection();
-      return conn;
+      workerStats.terminations++;
+      return fallbackToPage('The AI worker did not answer within 20 s');
     }
     dev.worker = probe;
     if (!probe.gpu && usableGpu(dev)) {
-      await log('warn', 'engine', `WebGPU works on the page but not in a worker here (${probe.why}), so the AI runs on the page; the screen may pause while it works`);
       w.terminate();
-      conn = await pageConnection();
-    } else await log('info', 'engine', `AI worker started (WebGPU in the worker: ${probe.gpu ? 'yes' : 'no'})`);
+      return fallbackToPage(`WebGPU works on the page but not in a worker here (${probe.why})`);
+    }
+    setWorker('initialised', `AI worker started (WebGPU in the worker: ${probe.gpu ? 'yes' : 'no'}, ${cls})`);
     return conn;
   })().catch((e) => {
     connecting = null;
@@ -248,58 +541,130 @@ function connect() {
   }));
 }
 
-/** Ends the engine (and any model in memory). Used for a hard stop and for "Remove all". */
-export function restart(why = 'Restarted') {
-  conn?.terminate();
-  drop(new Error(why));
+/** Running the engine on the page freezes the screen while it works, and is not qualified on phones. */
+async function fallbackToPage(why) {
+  if (PO.isLowMemory(cls)) {
+    event('ai.worker.blocked', { level: 'error', msg: `${why}. On this kind of device the AI does not run on the page itself, so it is off; saved pages can still be searched.`, code: 'WORKER_FAILED' });
+    conn = null;
+    setWorker('terminated', why, 'error');
+    throw new AiError('WORKER_FAILED', `${why}. The AI is off on this device rather than running on the page itself.`);
+  }
+  await log('warn', 'engine', `${why}; running the AI on the page, so the screen may pause while it works`);
+  conn = await pageConnection();
+  setWorker('initialised', 'AI engine running on the page');
+  return conn;
 }
 
-function markBusy(what, pkg, detail) {
+/** Ends the engine (and any model in memory). Safe at any time: pending work fails with `code`. */
+export function restart(why = 'Restarted', code = 'WORKER_FAILED') {
+  const had = !!conn;
   try {
-    localStorage.setItem(BUSY, JSON.stringify({ what, pkg, detail, at: Date.now() }));
+    conn?.terminate();
   } catch {
-    // private mode: crash detection is off
+    // already gone
+  }
+  if (had) {
+    workerStats.terminations++;
+    setWorker('terminated', why, code === 'CANCELLED' ? 'info' : 'warn');
+  }
+  drop(new AiError(code, why), code);
+}
+
+/** Tells the worker apart from a busy one: an idle worker answers a ping at once. */
+async function ensureResponsive() {
+  if (!conn || conn.mode !== 'worker') return;
+  const t = Date.now();
+  const pong = await Promise.race([request({ type: 'ping', t }), sleep(5000).then(() => null)]);
+  if (pong) {
+    if (workerState !== 'responsive' && workerState !== 'busy') setWorker('responsive', `AI worker answered in ${Date.now() - t} ms`);
+    return;
+  }
+  setWorker('unresponsive', 'The idle AI worker did not answer a ping within 5 s', 'error');
+  restart('The AI engine stopped responding', 'WORKER_UNRESPONSIVE');
+  workerStats.resets++;
+  await connect();
+  setWorker('restarted', 'A fresh AI worker was started', 'warn');
+}
+
+const modelFields = (id) => {
+  const r = recs.get(id);
+  return { pkg: id, rev: P[id]?.revision?.slice(0, 8), dtype: r?.dtype, backend: r?.device, mode: conn?.mode ?? null };
+};
+
+/** Frees the engine after a failure that may have left it in a bad state, and records it. */
+function recycleIfNeeded(code, why) {
+  if (['GPU_DEVICE_LOST', 'POSSIBLE_MEMORY_EXHAUSTION', 'MODEL_DISPOSE_FAILED', 'WORKER_FAILED', 'WORKER_UNRESPONSIVE', 'INFERENCE_FAILED', 'INFERENCE_TIMEOUT', 'MODEL_LOAD_FAILED', 'MODEL_INCOMPATIBLE'].includes(code) && conn) {
+    workerStats.resets++;
+    event('ai.worker.reset', { level: 'warn', msg: `AI engine restarted after ${code}: ${why}`, code });
+    restart(`Restarted after ${code}`, code);
   }
 }
-function clearBusy() {
-  try {
-    localStorage.removeItem(BUSY);
-  } catch {
-    // as above
-  }
+
+/** Reset button: abandons whatever is running, drops the queue, restarts the engine clean. */
+export function resetEngine() {
+  return sched.recover(async () => {
+    workerStats.resets++;
+    gpuLost = false;
+    sched.clearFailed();
+    restart('Reset by you', 'CANCELLED');
+    cp = null;
+    jdel(K.cp);
+    current = null;
+    event('ai.worker.reset', { level: 'warn', msg: 'AI engine reset on request' });
+    emit('safety');
+  });
 }
+
+// ---------- model memory policy ----------
 
 function touch() {
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(async () => {
-    for (const id of loaded.keys())
-      if (P[id].kind === 'chat' && !current) {
-        await unload(id).catch(() => {});
-        log('info', 'memory', `Unloaded ${P[id].short} after 10 minutes unused, to free memory`);
-      }
-  }, IDLE_UNLOAD_MS);
+  if (!loaded.size) return;
+  const retain = Math.min(...[...loaded.keys()].map((id) => PO.profileFor(id, cls).retainMs ?? 120_000));
+  idleTimer = setTimeout(() => {
+    sched
+      .run({ type: 'unload', label: 'idle unload' }, async (ctx) => {
+        for (const id of [...loaded.keys()]) {
+          await unloadStep(ctx, id, 'unused for a while');
+          event('ai.memory.idle_unload', { msg: `Unloaded ${P[id].short} after ${Math.round(retain / 1000)} s unused, to free memory`, ...modelFields(id) });
+        }
+      })
+      .catch(() => {});
+  }, retain);
 }
 
-export async function ensureLoaded(id, { onProgress } = {}) {
+function preflight(id, kind) {
+  const spec = P[id];
+  if (!ready.has(id) || recs.get('engine')?.status !== 'ready') throw new AiError('MODEL_NOT_INSTALLED', `${spec.short} is not downloaded. Download it on the AI page.`, { pkg: id });
+  const rec = recs.get(id);
+  if (rec.device === 'wasm' && rec.dtype !== spec.cpu) throw new AiError('MODEL_INCOMPATIBLE', `The downloaded ${rec.dtype} weights can't run on the CPU. Remove ${spec.short} and download it again.`, { pkg: id });
+  const r = mayRun(id);
+  if (!r.ok) throw new AiError(r.code, r.why, { pkg: id });
+  if (versionMismatch) throw new AiError('VERSION_MISMATCH');
+  if (kind !== 'unload' && document.visibilityState === 'hidden') throw new AiError('NOT_FOREGROUND');
+  return r;
+}
+
+async function loadStep(ctx, id, { onProgress } = {}) {
   if (loaded.has(id)) {
     touch();
     return loaded.get(id);
   }
-  const rec = await state(id);
-  if (rec.status !== 'ready') throw new Error(`${P[id].short} is not downloaded. Download it on the AI page.`);
-  if ((await state('engine')).status !== 'ready') throw new Error('The AI engine is not downloaded. Download it on the AI page.');
-  if (rec.device === 'wasm' && rec.dtype !== P[id].cpu) {
-    const e = new Error(`The downloaded ${rec.dtype} weights can't run on the CPU. Remove ${P[id].short} and download it again.`);
-    await noteFailure(id, 'load', e);
-    throw e;
-  }
+  preflight(id, 'load');
   await connect();
-  if (P[id].kind === 'chat') for (const other of [...loaded.keys()]) if (P[other].kind === 'chat') await unload(other);
+  await ensureResponsive();
+  // one model in memory at a time: the others are released completely before this one loads
+  for (const other of [...loaded.keys()]) await ctx.child({ type: 'unload', pkg: other, label: 'make room' }, (c) => unloadStep(c, other, 'making room for another model'));
+  const rec = await state(id);
   const where = `${rec.dtype} on ${rec.device === 'webgpu' ? 'WebGPU' : 'the CPU'}`;
   await log('info', 'load', `Loading ${P[id].short} from this device (${AL.size(rec.total)}, ${where}, ${conn.mode})…`, { pkg: id });
-  markBusy('load', id, where);
+  cpStage('load.start', { pkg: id, dtype: rec.dtype, device: rec.device, mode: conn.mode });
+  const hard = setTimeout(() => {
+    event('ai.worker.unresponsive', { level: 'error', msg: `Loading ${P[id].short} took over ${LOAD_LIMIT_MS / 1000} s; restarting the engine`, code: 'WORKER_UNRESPONSIVE', stage: cp?.stage });
+    restart('Loading took too long', 'WORKER_UNRESPONSIVE');
+  }, LOAD_LIMIT_MS);
   try {
-    const info = await request(`load:${id}`, { type: 'load', pkg: id, dtype: rec.dtype, device: rec.device, chunks: AL.dataChunks(P[id], rec.dtype) }, { progress: onProgress });
+    const info = await request({ type: 'load', id: ctx.id, pkg: id, dtype: rec.dtype, device: rec.device, chunks: AL.dataChunks(P[id], rec.dtype), cls }, { progress: onProgress });
     loaded.set(id, info);
     const r = await state(id);
     Object.assign(r, { loads: (r.loads ?? 0) + 1, lastLoad: { ms: info.ms, at: Date.now(), mode: conn?.mode, where } });
@@ -312,98 +677,251 @@ export async function ensureLoaded(id, { onProgress } = {}) {
     await noteFailure(id, 'load', e);
     throw e;
   } finally {
-    clearBusy();
+    clearTimeout(hard);
   }
 }
 
-async function noteFailure(id, phase, e) {
-  const r = await state(id);
-  if (r.status !== 'none') {
-    Object.assign(r, { failures: (r.failures ?? 0) + 1, lastError: { phase, message: e.message, at: Date.now() } });
-    await save(r);
-  }
-  await log('error', phase, `${P[id]?.short ?? id}: ${e.message}`, { pkg: id, detail: e.detail });
-}
-
-export async function unload(id) {
+async function unloadStep(ctx, id, why) {
   if (!loaded.has(id) || !conn) return;
-  await request(`unload:${id}`, { type: 'unload', pkg: id });
+  cpStage('dispose.start', { pkg: id });
+  try {
+    await request({ type: 'unload', id: ctx.id, pkg: id, why });
+  } catch (e) {
+    // a model that cannot be released cleanly is not trusted: the whole engine goes
+    event('ai.model.dispose.failed', { level: 'error', msg: `Releasing ${P[id].short} failed: ${e.message}`, code: 'MODEL_DISPOSE_FAILED', ...modelFields(id) });
+    restart('Releasing a model failed', 'MODEL_DISPOSE_FAILED');
+    return;
+  }
   loaded.delete(id);
   emit('loaded');
   await log('info', 'memory', `Unloaded ${P[id].short}`, { pkg: id });
 }
 
-/** Writes a reply. Calls onToken with each new piece of text; resolves with the run's figures. */
-export async function generate(id, messages, { maxTokens = 400, onToken, label = 'run', maxPrompt = null, fit = false } = {}) {
-  await ensureLoaded(id);
-  const key = `g${++seq}`;
-  current = key;
-  markBusy('generate', id, label);
-  let last = Date.now();
-  let warned = false;
-  const watch = setInterval(() => {
-    if (!warned && Date.now() - last > 90_000) {
-      warned = true;
-      log('warn', 'run', `${P[id].short} has produced nothing for 90 s; it may be stuck. Stop it and try a shorter text.`, { pkg: id });
-    }
-  }, 5000);
-  try {
-    const { stats } = await request(
-      key,
-      { type: 'generate', id: key, pkg: id, messages, maxTokens, maxPrompt, fit },
-      {
-        token: (t) => {
-          last = Date.now();
-          onToken?.(t);
-        },
-      },
-    );
-    const r = await state(id);
-    r.lastRun = { ...stats, at: Date.now(), label };
+async function noteFailure(id, phase, e) {
+  const r = await state(id);
+  if (r.status !== 'none') {
+    Object.assign(r, { failures: (r.failures ?? 0) + 1, lastError: { phase, message: e.message, code: e.code, at: Date.now() } });
+    if (phase === 'load' && e.code === 'MODEL_INCOMPATIBLE' && r.dtype) r.incompatible = { dtype: r.dtype, device: r.device, message: String(e.message).slice(0, 160), at: Date.now() };
     await save(r);
-    await log('ok', 'run', `${P[id].short} (${label}): ${AL.describeRun(stats)}`, { pkg: id });
-    // GPU memory used for a long prompt stays reserved after the run; reloading (about 3 s) frees it.
-    if (stats.promptTokens > 900) {
-      current = null;
-      await unload(id).catch(() => {});
-      await log('info', 'memory', `Unloaded ${P[id].short} after a ${stats.promptTokens}-token prompt, to give back the memory it used`, { pkg: id });
-    }
-    return stats;
-  } catch (e) {
-    await noteFailure(id, 'run', e);
-    throw e;
-  } finally {
-    clearInterval(watch);
-    clearBusy();
-    if (current === key) current = null;
-    touch();
   }
+  const code = e.code ?? classifyError(e, { stage: cp?.stage ?? phase });
+  event('ai.operation.error', { level: 'error', msg: `${P[id]?.short ?? id}: ${e.message}`, code, stage: cp?.stage ?? phase, op: cp?.op, ...modelFields(id), detail: e.detail });
 }
 
-/** Stops the running generation. If the model doesn't stop within 8 s, the engine is restarted. */
-export function stop() {
-  const key = current;
-  if (!key || !conn) return;
-  conn.send({ type: 'stop', id: key });
-  log('info', 'run', 'Stop requested');
+const cfgKey = (id) => {
+  const r = recs.get(id);
+  return PO.configKey(id, r?.device, r?.dtype);
+};
+
+/** Opens an operation's checkpoint (before anything risky happens). */
+function begin(ctx, type, id, extra = {}) {
+  const r = recs.get(id);
+  cpStart({ op: ctx.id, type, pkg: id, dtype: r?.dtype, device: r?.device, ...extra });
+}
+
+// ---------- the public operations (each is queued; one runs at a time) ----------
+
+/** Loads a model (queued behind anything running). */
+export function ensureLoaded(id, { onProgress, owner } = {}) {
+  return sched.run({ type: 'load', pkg: id, label: 'load', owner }, async (ctx) => {
+    begin(ctx, 'load', id);
+    try {
+      const info = await loadStep(ctx, id, { onProgress });
+      return info;
+    } catch (e) {
+      recycleIfNeeded(e.code, e.message);
+      throw e;
+    } finally {
+      cpClear(ctx.id);
+    }
+  });
+}
+
+export function unload(id) {
+  return sched.run({ type: 'unload', pkg: id, label: 'unload' }, async (ctx) => {
+    begin(ctx, 'unload', id);
+    try {
+      await unloadStep(ctx, id, 'unloaded on request');
+    } finally {
+      cpClear(ctx.id);
+    }
+  });
+}
+
+/**
+ * Writes a reply. Calls onToken with each new piece of text; resolves with the run's figures.
+ * `maxPrompt` can only lower the profile's input limit (unless developer mode is on). `fit` lets
+ * the engine cut the END of the last message to fit, counting exactly.
+ */
+export function generate(id, messages, { maxTokens = 128, onToken, onProgress, label = 'run', maxPrompt = null, fit = false, owner = null, meta = {} } = {}) {
+  return sched.run({ type: 'generate', pkg: id, label, owner }, async (ctx) => {
+    begin(ctx, 'generate', id);
+    const key = ctx.id;
+    const opStarted = Date.now();
+    let last = Date.now();
+    let warned = false;
+    const watch = setInterval(() => {
+      if (!warned && Date.now() - last > 90_000) {
+        warned = true;
+        log('warn', 'run', `${P[id].short} has produced nothing for 90 s; it may be stuck. Stop it and try a shorter text.`, { pkg: id });
+      }
+    }, 5000);
+    let hard = null;
+    try {
+      preflight(id, 'generate');
+      await ctx.child({ type: 'load', pkg: id, label: 'load' }, (c) => loadStep(c, id, { onProgress }));
+      if (ctx.cancelled()) throw new Cancelled('Stopped');
+      const limits = limitsFor(id, maxPrompt);
+      current = key;
+      cpStage('tokenize', { maxNew: Math.min(maxTokens, limits.maxNew) });
+      // the engine stops itself at maxMs; if it cannot (stuck in one long call), the page ends it
+      hard = setTimeout(() => {
+        event('ai.worker.unresponsive', { level: 'error', msg: `${P[id].short} did not finish within ${Math.round((limits.maxMs + 20_000) / 1000)} s; restarting the engine`, code: 'WORKER_UNRESPONSIVE', op: key, stage: cp?.stage });
+        restart('The AI took too long', 'WORKER_UNRESPONSIVE');
+      }, limits.maxMs + 20_000);
+      setWorker('busy', `${P[id].short} is working`);
+      const { stats } = await request(
+        { type: 'generate', id: key, pkg: id, messages, maxTokens, limits, fit, dev: safety.dev, vis: document.visibilityState },
+        {
+          token: (t) => {
+            last = Date.now();
+            onToken?.(t);
+          },
+        },
+      );
+      clearTimeout(hard);
+      workerState = 'responsive';
+      const tps = stats.tokens && stats.ms > (stats.ttft ?? 0) ? (stats.tokens / ((stats.ms - (stats.ttft ?? 0)) / 1000)) : null;
+      const completed = !stats.stopped && stats.stopReason !== 'timeout';
+      const r = await state(id);
+      r.lastRun = { ...stats, at: Date.now(), label };
+      await save(r);
+      const m = { ...stats, tps: tps && Math.round(tps * 10) / 10, completed, queueMs: opMeta.get(key)?.queueMs ?? 0, label, ...meta, totalMs: Date.now() - opStarted, mem: undefined, est: undefined, estimated: stats.est };
+      lastInference = event('ai.inference.completed', {
+        level: stats.stopReason === 'timeout' ? 'error' : 'ok',
+        msg: `${P[id].short} (${label}): ${AL.describeRun(stats)}${stats.stopReason === 'timeout' ? ' · timed out' : ''}`,
+        status: completed ? 'ok' : stats.stopReason,
+        op: key,
+        stage: 'generate.done',
+        ...modelFields(id),
+        m,
+      });
+      noteOutcome(cfgKey(id), completed || stats.stopped ? 'ok' : 'failed', { stage: 'generate.done' });
+      if (stats.stopReason === 'timeout') throw new AiError('INFERENCE_TIMEOUT', `Stopped after ${Math.round(limits.maxMs / 1000)} s`, { partial: true });
+      // a long prompt leaves memory reserved: give it back right away on phones
+      if (PO.isLowMemory(cls) && stats.promptTokens > limits.maxInput * 0.85) {
+        current = null;
+        await ctx.child({ type: 'unload', pkg: id, label: 'give back memory' }, (c) => unloadStep(c, id, 'after a long prompt'));
+        await log('info', 'memory', `Unloaded ${P[id].short} after a ${stats.promptTokens}-token prompt, to give back the memory it used`, { pkg: id });
+      }
+      return stats;
+    } catch (e) {
+      clearTimeout(hard);
+      const code = e.code && e.code !== 'UNKNOWN' ? e.code : classifyError(e, { stage: cp?.stage, gpuLost });
+      e.code = code;
+      const stage = cp?.stage ?? e.stage ?? null;
+      event('ai.inference.failed', {
+        level: code === 'CANCELLED' || code === 'BACKGROUNDED' ? 'warn' : 'error',
+        msg: `${P[id]?.short ?? id}: ${e.message}`,
+        status: code === 'CANCELLED' ? 'cancelled' : 'error',
+        code,
+        op: key,
+        stage,
+        ...modelFields(id),
+        m: { inputTokens: cp?.inputTokens, tokens: cp?.tokens, label },
+        detail: e.detail,
+      });
+      if (!BENIGN.has(code)) {
+        noteOutcome(cfgKey(id), 'failed', { code, stage });
+        await noteFailure(id, 'run', e);
+      }
+      recycleIfNeeded(code, e.message);
+      throw e;
+    } finally {
+      clearInterval(watch);
+      clearTimeout(hard);
+      if (workerState === 'busy') workerState = 'responsive';
+      cpClear(ctx.id);
+      if (current === key) current = null;
+      touch();
+    }
+  });
+}
+
+/**
+ * Runs `fn` with BGE loaded, in one queued operation, and releases BGE afterwards (before any
+ * chat model loads). fn receives { embed(texts, {query}) }.
+ */
+export function withEmbedder(fn, { owner = null, label = 'embed' } = {}) {
+  return sched.run({ type: 'embed', pkg: 'bge', label, owner }, async (ctx) => {
+    begin(ctx, 'embed', 'bge');
+    let n = 0;
+    try {
+      preflight('bge', 'embed');
+      await ctx.child({ type: 'load', pkg: 'bge', label: 'load' }, (c) => loadStep(c, 'bge'));
+      const e = {
+        embed: async (texts, { query = false } = {}) => {
+          if (document.visibilityState === 'hidden') throw new AiError('BACKGROUNDED');
+          if (ctx.cancelled()) throw new AiError('CANCELLED');
+          const { vecs, ms, cut } = await request({ type: 'embed', id: `${ctx.id}.${++n}`, pkg: 'bge', texts, query });
+          return Object.assign(vecs, { ms, cut });
+        },
+        cancelled: () => ctx.cancelled(),
+      };
+      const out = await fn(e);
+      noteOutcome(cfgKey('bge'), 'ok', {});
+      return out;
+    } catch (err) {
+      const code = err.code && err.code !== 'UNKNOWN' ? err.code : classifyError(err, { stage: cp?.stage, gpuLost });
+      err.code = code;
+      event('ai.embed.failed', { level: code === 'CANCELLED' || code === 'BACKGROUNDED' ? 'warn' : 'error', msg: `Embedding failed: ${err.message}`, code, op: ctx.id, stage: cp?.stage, ...modelFields('bge') });
+      if (!BENIGN.has(code)) {
+        noteOutcome(cfgKey('bge'), 'failed', { code, stage: cp?.stage });
+        await noteFailure('bge', 'embed', err);
+      }
+      recycleIfNeeded(code, err.message);
+      throw err;
+    } finally {
+      if (loaded.has('bge') && conn) {
+        try {
+          await ctx.child({ type: 'unload', pkg: 'bge', label: 'release BGE' }, (c) => unloadStep(c, 'bge', 'retrieval finished: freeing memory before any chat model loads'));
+        } catch {
+          // the engine was already gone
+        }
+      }
+      cpClear(ctx.id);
+    }
+  });
+}
+
+/** BGE vectors for some texts (normalised, 384 numbers each). One queued operation. */
+export const embed = (texts, { query = false } = {}) => withEmbedder((e) => e.embed(texts, { query }), { label: 'embed' });
+
+/**
+ * Stops work. A running generation is told to stop (its text so far is kept by the caller); with an
+ * `owner`, that owner's waiting operations are dropped too. If the running operation does not end
+ * within 8 s (a model load cannot be interrupted, for one), the engine is restarted.
+ */
+export function stop(why = 'user', owner = null) {
+  if (owner != null) cancelQueued(owner);
+  const act = sched.snapshot().active;
+  const key = current ?? (act && (owner == null || act.owner === owner) ? act.id : null);
+  if (!key) return;
+  if (current === key && conn) conn.send({ type: 'stop', id: key });
+  sched.cancel(key, 'Stopped');
+  event('ai.inference.stop_requested', { level: 'info', msg: `Stop requested (${why})`, op: key, stage: cp?.stage, m: { why } });
   setTimeout(() => {
-    if (current === key) {
-      log('warn', 'run', 'The model did not stop within 8 s, so the AI engine was restarted');
-      restart('Stopped');
+    if (sched.snapshot().active?.id === key && conn) {
+      event('ai.worker.unresponsive', { level: 'error', msg: 'The AI did not stop within 8 s, so the AI engine was restarted', code: 'WORKER_UNRESPONSIVE', op: key, stage: cp?.stage });
+      restart('Stopped', 'WORKER_UNRESPONSIVE');
     }
   }, 8000);
 }
 
-export const running = () => !!current;
+/** Drops waiting operations started by `owner` (a screen that went away), without touching the running one. */
+export const cancelQueued = (owner) => sched.cancel((o) => o.owner === owner && o.startedAt == null, 'Cancelled');
 
-/** BGE vectors for some texts (normalised, 384 numbers each). */
-export async function embed(texts, { query = false } = {}) {
-  await ensureLoaded('bge');
-  const key = `e${++seq}`;
-  const { vecs } = await request(key, { type: 'embed', id: key, pkg: 'bge', texts, query });
-  touch();
-  return vecs;
-}
+export const running = () => !!current;
 
 // ---------- downloads ----------
 
@@ -690,7 +1208,7 @@ async function fetchFile(j, f, fr, cb) {
   }
 }
 
-/** Removes a package's files. Removing the last model removes the engine too. */
+/** Removes a package's files. Removing the last model removes the engine too. Quarantine is kept. */
 export async function remove(id) {
   if (job?.id === id) {
     job.stopReason = 'Removed';
@@ -703,17 +1221,21 @@ export async function remove(id) {
   const r = await state(id);
   await AS.removePackage(id);
   ready.delete(id);
-  if (id === 'bge') await AS.clearStore('vectors');
+  recs.delete(id);
+  if (id === 'bge') {
+    await AS.clearStore('vectors');
+    vecCache.clear();
+  }
   if (P[id].kind === 'chat') await AS.delPrefix('notes', `sum|${id}|`);
   await log('ok', 'storage', `Removed ${P[id].name}${r.have ? `: freed about ${AL.size(r.have)}` : ''}`, { pkg: id });
   emit('pkg', { id, status: 'none' });
   if (id !== 'engine' && !(await Promise.all(AL.MODEL_IDS.map(state))).some((x) => x.status !== 'none')) {
-    restart('No models left');
+    restart('No models left', 'CANCELLED');
     await remove('engine');
   }
 }
 
-/** Deletes every AI file, vector, summary and log entry, and the database itself. */
+/** Deletes every AI file, vector, summary and log entry, the safety history, and the database itself. */
 export async function removeAll() {
   queue.splice(0);
   if (job) {
@@ -721,34 +1243,88 @@ export async function removeAll() {
     job.ctrl.abort(new Error('Removed'));
     await job.promise;
   }
-  restart('All AI data removed');
+  sched.cancel(() => true, 'All AI data removed');
+  restart('All AI data removed', 'CANCELLED');
   await AS.destroy();
   try {
     await caches.delete('transformers-cache');
   } catch {
     // no Cache Storage
   }
-  clearBusy();
+  for (const k of Object.values(K)) jdel(k);
+  cp = null;
+  quarantine = new Map();
+  history = {};
+  interruptionRec = null;
+  safety.dev = false;
+  safety.optIn = [];
+  gpuLost = false;
+  lastInference = null;
+  vecCache.clear();
   ready.clear();
+  recs.clear();
   persist = false;
-  recent = [];
+  logger.clear();
   await log('ok', 'storage', 'Removed all AI data from this device');
   emit('pkg', null);
 }
 
 // ---------- startup ----------
 
-let lastCrash = null;
-export const crashOnLaunch = () => lastCrash;
+let interruptionRec = interruption;
+
+export const lastInterruption = () => (interruptionRec && !interruptionRec.acknowledged ? interruptionRec : null);
+export function ackInterruption() {
+  if (!interruptionRec) return;
+  interruptionRec = { ...interruptionRec, acknowledged: true };
+  jset(K.interruption, interruptionRec);
+  emit('safety');
+}
+
+/** True when automatic summaries may run: nothing has been switched off for safety. */
+export const autoAllowed = () => quarantine.size === 0 && !gpuLost && !versionMismatch;
+
+/**
+ * Looks at the checkpoint (or the older busy marker) that the last launch left behind, decides what it
+ * most likely means, and acts on it: counts it, switches the configuration off when the evidence
+ * calls for it, and keeps a note for the AI page. A leftover checkpoint is not proof of a crash.
+ */
+async function recoverFromInterruption(old, legacy) {
+  jdel(K.cp);
+  jdel(K.legacy);
+  const stale = old && old.v !== PO.POLICY_VERSION;
+  const c = old && !stale ? old : { legacy: true, v: 1, type: legacy?.what ?? old?.type, pkg: legacy?.pkg ?? old?.pkg, stage: 'unknown', started: legacy?.at ?? old?.started ?? Date.now(), progress: legacy?.at ?? old?.progress ?? Date.now(), vis: 'unknown', hiddenMs: 0 };
+  const key = c.pkg && c.device && c.dtype ? `${c.pkg}@${(c.rev ?? '').slice(0, 8)}|${c.device}|${c.dtype}` : null;
+  const diag = PO.classifyInterruption(c, { history: key ? (history[key] ?? {}) : {} });
+  const unexplained = diag.category === 'UNEXPECTED_INTERRUPTION' || diag.category === 'POSSIBLE_MEMORY_EXHAUSTION';
+  event('ai.recovery.interrupted', {
+    level: unexplained && diag.quarantine ? 'error' : 'warn',
+    msg: diag.message,
+    code: diag.category,
+    op: c.op,
+    stage: c.stage,
+    pkg: c.pkg,
+    dtype: c.dtype,
+    backend: c.device,
+    m: { confidence: diag.confidence, quarantine: diag.quarantine, reasons: diag.reasons, inputTokens: c.inputTokens, maxNew: c.maxNew, tokens: c.tokens, vis: c.vis, hiddenMs: c.hiddenMs, startedAt: c.started, progressAt: c.progress, previousSession: c.sid },
+  });
+  if (key && unexplained) noteOutcome(key, 'interrupted', { category: diag.category, stage: c.stage });
+  if (key && diag.quarantine) {
+    setQuarantine(key, { at: Date.now(), category: diag.category, confidence: diag.confidence, reasons: diag.reasons, stage: c.stage, pkg: c.pkg, dtype: c.dtype, device: c.device, inputTokens: c.inputTokens });
+  }
+  const r = c.pkg ? await AS.get('pkgs', c.pkg).catch(() => null) : null;
+  if (r && r.status !== 'none') {
+    Object.assign(r, { crashes: (r.crashes ?? 0) + (unexplained ? 1 : 0), lastCrash: { stage: c.stage, category: diag.category, found: Date.now() } });
+    await AS.put('pkgs', r.id, r);
+  }
+  interruptionRec = { ...diag, checkpoint: c, at: Date.now(), acknowledged: false };
+  jset(K.interruption, interruptionRec);
+}
 
 /** Run once at app start. Does nothing (and creates nothing) if the AI was never used. */
 export async function init() {
-  let marker = null;
-  try {
-    marker = JSON.parse(localStorage.getItem(BUSY) || 'null');
-  } catch {
-    marker = null;
-  }
+  const old = jget(K.cp, null);
+  const legacy = jget(K.legacy, null);
   let exists = true;
   try {
     const dbs = await indexedDB.databases?.();
@@ -756,21 +1332,16 @@ export async function init() {
   } catch {
     exists = true;
   }
-  if (!exists && !marker) return;
+  if (!exists && !old && !legacy) return;
   persist = true;
-  if (marker) {
-    clearBusy();
-    lastCrash = marker;
-    const r = await state(marker.pkg);
-    if (r.status !== 'none') {
-      Object.assign(r, { crashes: (r.crashes ?? 0) + 1, lastCrash: { ...marker, found: Date.now() } });
-      await AS.put('pkgs', r.id, r);
-    }
-    await log('error', 'crash', AL.crashText(marker), { pkg: marker.pkg, detail: `started ${new Date(marker.at).toLocaleString()}` });
-  }
+  document.addEventListener('visibilitychange', onVisibility);
+  addEventListener('pagehide', onPageHide);
+  event('ai.app.launch', { msg: `AI session started (${cls}, build ${AL.AI_BUILD})`, m: { cls, standalone: matchMedia('(display-mode: standalone)').matches || navigator.standalone === true } });
+  if (old || legacy) await recoverFromInterruption(old, legacy);
   for (const id of Object.keys(P)) {
     const r = await AS.get('pkgs', id).catch(() => null);
     if (!r) continue;
+    recs.set(id, r);
     if (r.status === 'ready') ready.add(id);
     if (r.status === 'downloading' || r.status === 'queued') {
       Object.assign(r, { status: 'paused', reason: 'Interrupted: the app was closed during the download. Tap Resume.' });
@@ -793,61 +1364,130 @@ export async function init() {
     keepAwake(true);
     job.nudge?.();
   });
+  emit('safety');
 }
 
-// ---------- retrieval, summaries, questions ----------
+// ---------- retrieval ----------
+
+const indexer = SEL.createIndexer();
+const vecCache = new Map(); // passage id -> { h, v }
+let vecLoaded = false;
+
+async function loadVectors() {
+  if (vecLoaded) return;
+  vecLoaded = true;
+  let bad = 0;
+  for (const [id, rec] of await AS.all('vectors').catch(() => [])) {
+    if (SEL.validVector(rec?.v)) vecCache.set(id, rec);
+    else {
+      bad++;
+      AS.del('vectors', id).catch(() => {});
+    }
+  }
+  if (bad) event('ai.storage.vectors_discarded', { level: 'warn', msg: `${bad} stored vectors were damaged and were discarded; they will be rebuilt when needed`, code: 'STORAGE_ERROR', m: { count: bad } });
+}
 
 /**
  * Finds the passages from saved pages and searches that best match a question: keyword match
- * (always) fused with meaning match (when BGE is downloaded). `say(kind, text)` narrates.
+ * (always, from an index that is updated rather than rebuilt) fused with meaning match (when BGE is
+ * downloaded and allowed). `budget` is a hard limit on characters of evidence, labels included.
+ * BGE is released before this returns, so a chat model can load next. `say(kind, text)` narrates.
+ * Never throws because the AI is unavailable: it falls back to keywords.
  */
-export async function retrieve(question, { budget = 6000, max = 6, say = () => {} } = {}) {
+export async function retrieve(question, { budget = 1000, max = 4, say = () => {}, owner = null } = {}) {
+  const m = {};
+  const t0 = performance.now();
   const [results, pages] = await Promise.all([S.entries('results'), S.entries('pages')]);
-  const all = AL.collectPassages(results, pages);
+  const all = SEL.collectPassages(results, pages);
+  m.collectMs = Math.round(performance.now() - t0);
   const pageCount = new Set(all.filter((p) => p.kind === 'page').map((p) => p.url)).size;
   say('step', `Looking through ${pageCount} pages and ${all.length - all.filter((p) => p.kind === 'page').length} search results kept on this device (${all.length} passages)`);
-  if (!all.length) return { all, picked: [] };
-  const index = AL.bm25Index(all.map((p) => `${p.title} ${p.text}`));
-  const words = AL.bm25Search(index, question, 30).map((x) => x.i);
+  if (!all.length) {
+    m.totalMs = Math.round(performance.now() - t0);
+    return { all, picked: [], metrics: m, semantic: 'off' };
+  }
+  const idx = indexer.sync(all);
+  Object.assign(m, { bm25BuildMs: Math.round(idx.ms), bm25Added: idx.added, bm25Reused: idx.reused, bm25Removed: idx.removed });
+  const tk = performance.now();
+  const hits = indexer.search(question, 30);
+  m.keywordMs = Math.round(performance.now() - tk);
+  const words = hits.map((x) => x.i);
   say(words.length ? 'ok' : 'skip', `Keyword match: ${words.length ? `${words.length} passages share words with the question` : 'no passage shares a word with the question'}`);
   let meaning = [];
-  if (ready.has('bge')) {
-    const stored = new Map(await AS.all('vectors').catch(() => []));
-    const missing = all.filter((p) => stored.get(p.id)?.h !== AL.hash(p.text));
-    if (missing.length) {
-      say('step', `Meaning match: indexing ${missing.length} new passages with BGE (once; the results are kept on this device)…`);
-      markBusy('embed', 'bge', `${missing.length} passages`);
-      const t0 = performance.now();
-      try {
-        for (let i = 0; i < missing.length; i += 8) {
-          const batch = missing.slice(i, i + 8);
-          const vecs = await embed(batch.map((p) => p.text));
-          for (const [k, p] of batch.entries()) {
-            const rec = { h: AL.hash(p.text), v: vecs[k] };
-            stored.set(p.id, rec);
-            await AS.put('vectors', p.id, rec);
+  m.semantic = 'off';
+  if (ready.has('bge') && mayRun('bge').ok) {
+    m.semantic = 'on';
+    await loadVectors();
+    const hasVec = (p) => vecCache.get(p.id)?.h === AL.hash(p.text);
+    m.cachedVectors = all.filter(hasVec).length;
+    const cands = SEL.embedCandidates(all, hits, hasVec, PO.profileFor('bge', cls).maxPerRun ?? 64);
+    try {
+      const tb = performance.now();
+      if (cands.length) say('step', `Meaning match: indexing ${cands.length} passages with BGE (kept on this device afterwards)…`);
+      const qv = await withEmbedder(
+        async (e) => {
+          m.bgeReadyMs = Math.round(performance.now() - tb);
+          const te = performance.now();
+          let fresh = 0;
+          for (let i = 0; i < cands.length; i += 16) {
+            const batch = cands.slice(i, i + 16);
+            const vecs = await e.embed(batch.map((ix) => all[ix].text));
+            for (const [k, ix] of batch.entries()) {
+              const rec = { h: AL.hash(all[ix].text), v: vecs[k] };
+              vecCache.set(all[ix].id, rec);
+              await AS.put('vectors', all[ix].id, rec);
+              fresh++;
+            }
+            emit('index-progress', { done: Math.min(i + 16, cands.length), total: cands.length });
           }
-          emit('index-progress', { done: Math.min(i + 8, missing.length), total: missing.length });
+          m.embedMs = Math.round(performance.now() - te);
+          m.newVectors = fresh;
+          const [q] = await e.embed([question], { query: true });
+          return q;
+        },
+        { owner, label: 'retrieval' },
+      );
+      m.bgeLoadAndEmbedMs = Math.round(performance.now() - tb);
+      const ts = performance.now();
+      const scored = all
+        .map((p, i) => ({ i, v: hasVec(p) ? vecCache.get(p.id).v : null }))
+        .filter((x) => x.v)
+        .map((x) => ({ i: x.i, s: AL.dot(qv, x.v) }))
+        .sort((a, b) => b.s - a.s);
+      meaning = scored.filter((x) => x.s > 0.55).slice(0, 30).map((x) => x.i);
+      m.semanticMs = Math.round(performance.now() - ts);
+      say(meaning.length ? 'ok' : 'skip', `Meaning match: ${meaning.length} close passages (best similarity ${scored[0]?.s.toFixed(2) ?? '–'}; ${scored.length} of ${all.length} passages have vectors)`);
+      const live = new Set(all.map((p) => p.id));
+      for (const id of [...vecCache.keys()])
+        if (!live.has(id)) {
+          vecCache.delete(id);
+          AS.del('vectors', id).catch(() => {});
         }
-      } finally {
-        clearBusy();
-      }
-      await log('ok', 'index', `Indexed ${missing.length} passages with BGE in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+    } catch (err) {
+      m.semantic = 'failed';
+      m.semanticError = err.code ?? err.name;
+      say('skip', `Meaning match skipped, using keywords only: ${explain(err)}`);
     }
-    const [q] = await embed([question], { query: true });
-    const scored = all.map((p, i) => ({ i, s: AL.dot(q, stored.get(p.id).v) })).sort((a, b) => b.s - a.s);
-    meaning = scored.filter((x) => x.s > 0.45).slice(0, 30).map((x) => x.i);
-    say(meaning.length ? 'ok' : 'skip', `Meaning match: ${meaning.length} close passages (best similarity ${scored[0]?.s.toFixed(2) ?? '–'})`);
-    const live = new Set(all.map((p) => p.id));
-    for (const id of stored.keys()) if (!live.has(id)) AS.del('vectors', id).catch(() => {});
-  } else say('skip', 'Meaning match: BGE is not downloaded, so keyword match only');
+  } else say('skip', ready.has('bge') ? `Meaning match is off (${mayRun('bge').why}), so keyword match only` : 'Meaning match: BGE is not downloaded, so keyword match only');
+  const tf = performance.now();
   const fused = AL.fuse({ words, meaning });
-  const picked = AL.pickContext(fused, all, budget, max);
-  return { all, picked };
+  m.fuseMs = Math.round(performance.now() - tf);
+  const tp = performance.now();
+  const picked = SEL.pickContext(fused, all, budget, max, { question });
+  m.selectMs = Math.round(performance.now() - tp);
+  Object.assign(m, { passages: all.length, considered: fused.length, selected: picked.length, excluded: Math.max(0, fused.length - picked.length), excerpted: picked.filter((p) => p.excerpted).length, evidenceChars: picked.reduce((n, p) => n + p.text.length, 0), budget, totalMs: Math.round(performance.now() - t0) });
+  event('ai.retrieval.completed', { level: 'ok', msg: `Retrieval: ${picked.length} of ${fused.length} candidate passages chosen in ${m.totalMs} ms (${m.semantic} meaning match)`, m });
+  return { all, picked, metrics: m, semantic: m.semantic };
 }
 
-export const getSummary = (url, pkg) => (persist ? AS.get('notes', `sum|${pkg}|${url}`).catch(() => null) : null);
-export const saveSummary = (url, pkg, rec) => AS.put('notes', `sum|${pkg}|${url}`, rec).catch(() => {});
+// ---------- summaries and questions ----------
+
+/** A summary made earlier for this model, this way of choosing text, and this version of the page. */
+export const getSummary = (url, pkg, markdown) => (persist ? AS.get('notes', SEL.summaryKey({ pkg, revision: P[pkg]?.revision, url, text: markdown })).catch(() => null) : null);
+export async function saveSummary(url, pkg, markdown, rec) {
+  await AS.delPrefix('notes', SEL.summaryPrefix(pkg, url)).catch(() => {});
+  await AS.put('notes', SEL.summaryKey({ pkg, revision: P[pkg]?.revision, url, text: markdown }), { ...rec, rev: P[pkg]?.revision, strategy: SEL.STRATEGY_VERSION }).catch(() => {});
+}
 
 export async function recentAsks() {
   if (!persist) return [];
@@ -859,12 +1499,90 @@ export async function saveAsk(entry) {
 }
 export const clearAsks = () => AS.del('notes', 'asks').catch(() => {});
 
-/** Everything useful for a bug report, as text. */
-export async function report() {
-  const [d, st, entries] = await Promise.all([device(true), states(), readLog(200)]);
-  const lines = [`Sparse on-device AI report, ${new Date().toISOString()}`, '', 'Device:', JSON.stringify(d, null, 1), '', 'Packages:'];
-  for (const r of Object.values(st)) lines.push(JSON.stringify(r));
-  lines.push('', `Engine: ${engineMode() ?? 'not started'}; in memory: ${[...loaded.keys()].join(', ') || 'nothing'}`, '', 'Log (newest first):');
-  for (const e of entries) lines.push(`${new Date(e.t).toISOString()} ${e.level.toUpperCase()} [${e.area}] ${e.msg}${e.detail ? `\n    ${String(e.detail).split('\n').slice(0, 4).join('\n    ')}` : ''}`);
-  return lines.join('\n');
+// ---------- status and reports ----------
+
+/** What the diagnostics screen shows at the top. */
+export const status = () => ({
+  op: sched.snapshot(),
+  worker: workerInfo(),
+  loaded: [...loaded.entries()].map(([id, i]) => ({ id, ...i })),
+  cls,
+  dev: safety.dev,
+  quarantine: quarantined(),
+  gpuLost,
+  versionMismatch,
+  lastInference,
+  interruption: lastInterruption(),
+  logger: logger.stats(),
+});
+
+export const history_ = () => history;
+
+/** One row per model for this device class: status, limits, whether it may run. */
+export function profileTable() {
+  return Object.keys(P)
+    .filter((id) => P[id].kind !== 'engine')
+    .map((id) => {
+      const p = PO.profileFor(id, cls);
+      const r = recs.get(id);
+      const may = r?.dtype ? PO.mayRun(id, r.device, r.dtype, policyState()) : null;
+      return { id, ...p, optIn: p.status === 'experimental' ? optedIn(id) : undefined, runnable: may ? may.ok : null, blockedBy: may && !may.ok ? may.code : null };
+    });
+}
+
+let debugCapsule = null;
+/** In memory only, never stored: the question and source titles of the last answer, for an opted-in detailed report. */
+export const noteDetail = (d) => {
+  debugCapsule = d;
+};
+
+export async function diagnostics({ detail = false } = {}) {
+  const [d, st, entries, jsStore] = await Promise.all([device(true), states(), readLog(300), navigator.storage?.estimate?.().catch(() => null) ?? null]);
+  const estimates = AL.CHAT_IDS.map((id) => {
+    const lim = PO.profileFor(id, cls);
+    if (!lim.maxInput) return `${P[id].short}: no limits on this device (${lim.status})`;
+    const est = PO.estimateAllocations(id, lim.maxInput);
+    return `${P[id].short}: ${est.positions === 1 ? 'scores for the last position only' : `scores for all ${est.positions} prompt positions`}: ≈${AL.size(est.logits + est.castCopy)} (${AL.size(est.logits)} scores${est.castCopy ? ` + ${AL.size(est.castCopy)} 16→32-bit copy` : ''}), key/value cache ≈${AL.size(est.kv)}, at the ${lim.maxInput}-token limit`;
+  });
+  const data = {
+    now: Date.now(),
+    formatVersion: 2,
+    build: AL.AI_BUILD,
+    runtimeVersions: 'Transformers.js 4.3.0 · ONNX Runtime Web 1.31.0-dev.20260914',
+    mode: conn?.mode ?? 'not started',
+    deviceClass: cls,
+    device: d,
+    memory: { jsHeap: globalThis.performance?.memory?.usedJSHeapSize ?? null, jsHeapLimit: globalThis.performance?.memory?.jsHeapSizeLimit ?? null, storageUsage: jsStore?.usage ?? null },
+    scheduler: sched.snapshot(),
+    worker: workerInfo(),
+    loaded: [...loaded.keys()],
+    models: Object.values(st).map((r) => ({ id: r.id, status: r.status, dtype: r.dtype, device: r.device, revision: P[r.id]?.revision, have: r.have, failures: r.failures, crashes: r.crashes })),
+    profiles: profileTable(),
+    quarantine: quarantined().map((q) => ({ key: q.key, category: q.category, confidence: q.confidence, at: q.at })),
+    history,
+    interruption: interruptionRec,
+    lastInference,
+    performance: performanceSummary(entries),
+    estimates,
+    logger: logger.stats(),
+    events: entries,
+    detail: detail && debugCapsule ? [`question: ${debugCapsule.question}`, ...(debugCapsule.sources ?? []).map((s, i) => `source ${i + 1}: ${s}`)] : detail ? ['no question has been asked in this session'] : null,
+  };
+  return data;
+}
+
+/** Everything useful for a bug report, as text (and JSON). Nothing is sent anywhere. */
+export async function report(opts = {}) {
+  const r = buildReport(await diagnostics(opts));
+  return r.text;
+}
+export async function reportJson(opts = {}) {
+  return JSON.stringify(buildReport(await diagnostics(opts)).json, null, 1);
+}
+
+/** Developer mode: clears the stored history of runs (not quarantine). */
+export function clearHistory() {
+  history = {};
+  jset(K.history, history);
+  emit('safety');
 }

@@ -34,12 +34,72 @@ export const PACKAGES = {
       },
     ],
   },
+  lfm350: {
+    id: 'lfm350',
+    kind: 'chat',
+    name: 'LFM2.5 350M Instruct',
+    short: 'LFM2.5 350M',
+    role: 'Lightweight AI (recommended on phones): short summaries and answers from your saved pages, with small, conservative limits. Needs WebGPU on phones.',
+    repo: 'LiquidAI/LFM2.5-350M-ONNX',
+    revision: 'd11593fd9eb408e322667926656598896c2d5ff9',
+    license: 'LFM Open License 1.0',
+    common: [
+      ['config.json', 1443],
+      ['generation_config.json', 136],
+      ['tokenizer.json', 3_297_793],
+      ['tokenizer_config.json', 3269],
+      ['chat_template.jinja', 2553],
+    ],
+    variants: {
+      q4f16: [
+        ['onnx/model_q4f16.onnx', 182_827],
+        ['onnx/model_q4f16.onnx_data', 254_965_760],
+      ],
+      q4: [
+        ['onnx/model_q4.onnx', 183_442],
+        ['onnx/model_q4.onnx_data', 293_629_952],
+      ],
+    },
+    // The 8-bit export (model_quantized) has a 4-bit embedding (GatherBlockQuantized) that the CPU
+    // backend cannot run: "Could not find an implementation". Tried and failed, so there is no CPU option.
+    cpu: null,
+    // Read from the exported graphs (see README, "What was measured"): this export takes a
+    // `num_logits_to_keep` input, which Transformers.js sets to 1, so only the last position's
+    // scores are computed, however long the prompt.
+    graph: { vocab: 65_536, lastTokenLogits: true, logitsBytes: 4, logitsCast: false, kvBytesPerToken: 6 * 2 * 8 * 64 * 4 },
+  },
+  lfm230: {
+    id: 'lfm230',
+    kind: 'chat',
+    name: 'LFM2.5 230M Instruct',
+    short: 'LFM2.5 230M',
+    role: 'Smallest AI: the lowest-memory fallback for short summaries and answers. Needs WebGPU.',
+    repo: 'LiquidAI/LFM2.5-230M-ONNX',
+    revision: 'c6f46e4e3f885ebcad164d14059a49f90e27eb4d',
+    license: 'LFM Open License 1.0',
+    common: [
+      ['config.json', 1668],
+      ['generation_config.json', 131],
+      ['tokenizer.json', 4_733_389],
+      ['tokenizer_config.json', 5347],
+      ['chat_template.jinja', 4621],
+    ],
+    variants: {
+      q4: [
+        ['onnx/model_q4.onnx', 154_010],
+        ['onnx/model_q4.onnx_data', 211_111_936],
+      ],
+    },
+    cpu: null, // the model card lists Q8 and Q4F32 for servers only
+    // This export has no `num_logits_to_keep`: scores for every prompt position (full sequence).
+    graph: { vocab: 65_536, lastTokenLogits: false, logitsBytes: 4, logitsCast: false, kvBytesPerToken: 6 * 2 * 8 * 64 * 4 },
+  },
   lfm12: {
     id: 'lfm12',
     kind: 'chat',
     name: 'LFM2.5 1.2B Instruct',
     short: 'LFM2.5 1.2B',
-    role: 'Primary AI: summarises pages and answers questions, from your saved pages or on its own.',
+    role: 'Experimental on phones: better answers than the smaller models, but it uses more memory and iOS has ended the app with it before. Opt in below.',
     repo: 'LiquidAI/LFM2.5-1.2B-Instruct-ONNX',
     revision: '10f72e70abf67ac0fd7ebf15bc5854726891d864',
     license: 'LFM Open License 1.0',
@@ -65,12 +125,10 @@ export const PACKAGES = {
       ],
     },
     cpu: 'q8', // the q4 exports use GatherBlockQuantized, which only the WebGPU backend implements
-    // Prompts stay short: the export computes scores for its whole 65,536-word vocabulary at every
-    // prompt position, so a 3,000-token prompt needs about 0.4–0.8 GB on top of the weights, which
-    // made iOS end the app. Long pages are summarised in parts of `partChars` instead.
-    maxInputChars: 12_000,
-    partChars: 2_400,
-    contextChars: 2_500,
+    // Prompts stay short: this export computes scores over its whole 65,536-word vocabulary at every
+    // prompt position (and holds a 16-bit copy that is cast to 32-bit), so a 3,000-token prompt needs
+    // over 1 GB on top of the weights. See SAFETY in ai-policy.js for the limits that follow.
+    graph: { vocab: 65_536, lastTokenLogits: false, logitsBytes: 4, logitsCast: true, kvBytesPerToken: 6 * 2 * 8 * 64 * 4 },
   },
   bge: {
     id: 'bge',
@@ -97,7 +155,7 @@ export const PACKAGES = {
     experimental: true,
     name: 'LFM2.5 2.6B (experimental)',
     short: 'LFM2.5 2.6B',
-    role: 'Higher quality for longer summaries, comparisons and synthesis. Too big for an iPhone: on a test iPhone, iOS ended the app while loading it. For computers and large tablets.',
+    role: 'Experimental, for computers only. Too big for a phone: on a test iPhone, iOS ended the app while loading it, so it is blocked there.',
     repo: 'LiquidAI/LFM2.5-2.6B-ONNX',
     revision: '66826372fd4fa166f53be0371c9315745c07cace',
     license: 'LFM Open License 1.0',
@@ -120,13 +178,11 @@ export const PACKAGES = {
       ],
     },
     cpu: null, // no export of this model runs on the CPU backend (its 8-bit one is 3.9 GB)
-    maxInputChars: 12_000,
-    partChars: 2_400,
-    contextChars: 2_500,
+    graph: { vocab: 128_000, lastTokenLogits: true, logitsBytes: 4, logitsCast: false, kvBytesPerToken: 8 * 2 * 8 * 64 * 4 },
   },
 };
 
-export const MODEL_IDS = ['lfm12', 'bge', 'lfm26'];
+export const MODEL_IDS = ['lfm350', 'lfm230', 'lfm12', 'bge', 'lfm26'];
 export const CHAT_IDS = MODEL_IDS.filter((id) => PACKAGES[id].kind === 'chat');
 
 /**
@@ -138,22 +194,23 @@ export const CHAT_IDS = MODEL_IDS.filter((id) => PACKAGES[id].kind === 'chat');
 export function pickVariant(pkg, gpu) {
   if (pkg.kind === 'engine') return { dtype: null, device: null };
   if (pkg.kind === 'embed') return { dtype: 'q8', device: 'wasm' };
-  if (gpu) return { dtype: gpu.f16 ? 'q4f16' : 'q4', device: 'webgpu' };
+  if (gpu) {
+    const dtype = [gpu.f16 ? 'q4f16' : null, 'q4'].find((d) => d && pkg.variants[d]) ?? null;
+    return { dtype, device: dtype ? 'webgpu' : null };
+  }
   return { dtype: pkg.cpu, device: pkg.cpu ? 'wasm' : null };
 }
 
-/** Prompt-size limits to choose from. On a test iPhone, 338-token prompts worked and ~650 ended the app. */
-export const PROMPT_LIMITS = [300, 450, 600, 900, 2000];
-
 /**
- * Characters of page or saved text that fit a prompt of `maxPrompt` tokens. English runs about
- * 3–4 characters a token, but names, numbers and markup run denser, so this assumes 2.8, less
- * 130 tokens of instructions. Summary parts are also trimmed to fit by the engine, which counts exactly.
+ * Characters of page or saved text that fit a prompt of `maxPrompt` tokens, after `overhead` tokens
+ * of instructions and chat template. English runs about 3–4 characters a token, but names, numbers
+ * and markup run denser, so this assumes 2.8. It only sizes the text: the engine counts the real
+ * tokens with the model's tokenizer and refuses (or trims) anything over the limit.
  */
-export const textBudget = (maxPrompt) => Math.max(300, Math.round((maxPrompt - 130) * 2.8));
+export const textBudget = (maxPrompt, overhead = 90) => Math.max(200, Math.round((maxPrompt - overhead) * 2.8));
 
-/** How many part-notes (about 60 tokens each) the final summary prompt can hold. */
-export const maxParts = (maxPrompt) => Math.max(2, Math.floor((maxPrompt - 110) / 60));
+/** Changes whenever the AI files change shape; the page and the worker compare it to catch a half-updated app. */
+export const AI_BUILD = '2026-10-15.1';
 
 /** How many external weight files a variant has (Transformers.js must be told for some exports). */
 export const dataChunks = (pkg, dtype) => (pkg.variants?.[dtype] ?? []).filter(([path]) => /\.onnx_data(_\d+)?$/.test(path)).length;
@@ -318,64 +375,16 @@ export function hash(s) {
   return (h >>> 0).toString(36);
 }
 
-const snippetText = (snippet) => (Array.isArray(snippet) ? snippet.map((s) => s.text).join('') : String(snippet ?? ''));
-
-/**
- * Everything on the device that questions can be answered from, as passages:
- * pages read in the reader (split into passages) and search results (title + snippet).
- * `results` and `pages` are [key, record] pairs from store.js.
- */
-export function collectPassages(results, pages, { perPage = 40 } = {}) {
-  const out = [];
-  for (const [, p] of pages) {
-    if (!p?.url || !p.markdown) continue;
-    const title = p.title || p.url;
-    const chunks = passages(markdownToText(p.markdown)).slice(0, perPage);
-    for (const [i, text] of chunks.entries())
-      out.push({ id: `p|${p.url}|${i}`, kind: 'page', url: p.url, title, text, at: p.at, saved: !!p.saved });
-  }
-  const seen = new Set();
-  const recs = results.map(([, r]) => r).filter((r) => Array.isArray(r?.results) && r.q).sort((a, b) => b.at - a.at);
-  for (const r of recs) {
-    if (r.instant?.text && !seen.has(`i|${r.q}`)) {
-      seen.add(`i|${r.q}`);
-      out.push({ id: `i|${r.q.toLowerCase()}`, kind: 'instant', url: r.instant.url ?? null, title: r.instant.heading || r.q, text: r.instant.text, q: r.q, at: r.at });
-    }
-    for (const x of r.results) {
-      if (!x?.url || seen.has(x.url)) continue;
-      seen.add(x.url);
-      const text = `${x.title}. ${snippetText(x.snippet)}`.trim();
-      if (text.length > 20) out.push({ id: `r|${x.url}`, kind: 'result', url: x.url, title: x.title || x.url, text, q: r.q, at: r.at });
-    }
-  }
-  return out;
-}
-
-/** Picks fused passages up to a character budget, at most `max`, at most 3 from one page. */
-export function pickContext(ranked, all, budget, max = 6) {
-  const picked = [];
-  const perUrl = new Map();
-  let used = 0;
-  for (const r of ranked) {
-    const p = all[r.i];
-    if ((perUrl.get(p.url) ?? 0) >= 3) continue;
-    if (used + p.text.length > budget && picked.length) continue;
-    picked.push({ ...p, from: r.from });
-    perUrl.set(p.url, (perUrl.get(p.url) ?? 0) + 1);
-    used += p.text.length;
-    if (picked.length >= max) break;
-  }
-  return picked;
-}
-
 // ---------- prompts ----------
 
-export function summaryMessages(title, text) {
+const SUM_RULES = 'Keep names, numbers and dates exactly. Use only the text. Do not add facts.';
+
+/** `excerpted`: the text is key sentences picked from across the page, not all of it. */
+export function summaryMessages(title, text, { excerpted = false } = {}) {
   return [
     {
       role: 'system',
-      content:
-        'You summarise web pages for someone reading on a phone. Write 3 to 5 short bullet points, each starting with "- ", covering the main points. Then one line starting with "In short:". Use only the page text. Do not add facts.',
+      content: `Summarise this web page${excerpted ? ' (key sentences picked from across it)' : ''} in 3 to 5 short bullets, each starting with "- ", then one line starting with "In short:". ${SUM_RULES}`,
     },
     { role: 'user', content: `Page title: ${title}\n\nPage text:\n${text}` },
   ];
@@ -384,10 +393,7 @@ export function summaryMessages(title, text) {
 /** Notes on one part of a long page, to be combined by combineMessages. */
 export function partMessages(title, text, i, n) {
   return [
-    {
-      role: 'system',
-      content: 'You take brief notes on part of a web page. Write 2 or 3 short bullet points, each starting with "- ", with the main facts in this part. Use only the text given.',
-    },
+    { role: 'system', content: `Take 2 or 3 short notes, each starting with "- ", on the main facts in this part of a web page. ${SUM_RULES}` },
     { role: 'user', content: `Page title: ${title}\nPart ${i} of ${n}:\n${text}` },
   ];
 }
@@ -397,24 +403,28 @@ export function combineMessages(title, notes) {
   return [
     {
       role: 'system',
-      content:
-        'You summarise web pages for someone reading on a phone, from notes on each part of the page. Write 3 to 5 short bullet points, each starting with "- ", covering the main points of the whole page. Then one line starting with "In short:". Use only the notes.',
+      content: `Summarise this web page from notes on each part, in 3 to 5 short bullets starting with "- ", then one line starting with "In short:". ${SUM_RULES}`,
     },
     { role: 'user', content: `Page title: ${title}\n\nNotes:\n${notes.map((x, i) => `Part ${i + 1}:\n${x.trim()}`).join('\n\n')}` },
   ];
 }
 
+const day = (t) => (t ? new Date(t).toISOString().slice(0, 10) : '');
+
+/** The label before each source: "[2] Title › Section (saved 2026-10-03)". */
+export const sourceLabel = (s, i) =>
+  `[${i + 1}] ${s.title}${s.heading ? ` › ${s.heading}` : ''}${s.kind === 'result' ? ` (search result for "${s.q}")` : s.at ? ` (saved ${day(s.at)})` : ''}`;
+
+/** The question comes first and the sources last, so a prompt that must be shortened loses only source text. */
 export function answerMessages(question, sources) {
-  const list = sources
-    .map((s, i) => `[${i + 1}] ${s.title}${s.kind === 'result' ? ` (search result for "${s.q}")` : ''}\n${s.text}`)
-    .join('\n\n');
+  const list = sources.map((s, i) => `${sourceLabel(s, i)}\n${s.text}`).join('\n\n');
   return [
     {
       role: 'system',
       content:
-        'Answer the question using only the numbered sources. Cite the sources you use in square brackets, like [2]. If the sources do not contain the answer, say that the saved pages do not answer it. Keep the answer short.',
+        'Answer using only the numbered sources. Cite the ones you use like [2]. If they do not contain the answer, say the saved pages do not answer it. Be brief.',
     },
-    { role: 'user', content: `Sources:\n${list}\n\nQuestion: ${question}` },
+    { role: 'user', content: `Question: ${question}\n\nSources:\n${list}` },
   ];
 }
 

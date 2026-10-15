@@ -6,8 +6,8 @@ import * as A from '../js/ai-lib.js';
 const P = A.PACKAGES;
 
 test('catalog: pinned files, variants and sizes', () => {
-  assert.deepEqual(A.MODEL_IDS, ['lfm12', 'bge', 'lfm26']);
-  assert.deepEqual(A.CHAT_IDS, ['lfm12', 'lfm26']);
+  assert.deepEqual(A.MODEL_IDS, ['lfm350', 'lfm230', 'lfm12', 'bge', 'lfm26']);
+  assert.deepEqual(A.CHAT_IDS, ['lfm350', 'lfm230', 'lfm12', 'lfm26']);
   for (const id of A.MODEL_IDS) {
     assert.match(P[id].revision, /^[0-9a-f]{40}$/, `${id} is pinned to a commit`);
     for (const dtype of Object.keys(P[id].variants)) {
@@ -22,6 +22,8 @@ test('catalog: pinned files, variants and sizes', () => {
   assert.equal(lfm.find((f) => f.path === 'config.json').resume, false);
   assert.equal(lfm.find((f) => f.path === 'onnx/model_q4f16.onnx_data').resume, true);
   assert.equal(Math.round(A.totalSize(lfm) / 1e6), 764);
+  assert.equal(Math.round(A.totalSize(A.filesFor(P.lfm350, 'q4f16')) / 1e6), 258);
+  assert.equal(Math.round(A.totalSize(A.filesFor(P.lfm230, 'q4')) / 1e6), 216);
   // the 2.6B q4f16 weights come in two parts, as its config says
   assert.deepEqual(
     A.filesFor(P.lfm26, 'q4f16')
@@ -39,6 +41,9 @@ test('pickVariant matches weights to the device', () => {
   assert.deepEqual(A.pickVariant(P.lfm12, { f16: false }), { dtype: 'q4', device: 'webgpu' });
   assert.deepEqual(A.pickVariant(P.lfm12, null), { dtype: 'q8', device: 'wasm' }); // q4 needs WebGPU
   assert.deepEqual(A.pickVariant(P.lfm26, null), { dtype: null, device: null }); // no CPU export
+  assert.deepEqual(A.pickVariant(P.lfm350, null), { dtype: null, device: null }); // its 8-bit export fails on the CPU backend
+  assert.deepEqual(A.pickVariant(P.lfm230, { f16: true }), { dtype: 'q4', device: 'webgpu' }); // no q4f16 export of the 230M
+  assert.deepEqual(A.pickVariant(P.lfm230, null), { dtype: null, device: null });
   assert.equal(A.dataChunks(P.lfm26, 'q4f16'), 2);
   assert.equal(A.dataChunks(P.lfm12, 'q8'), 1);
   assert.equal(A.dataChunks(P.bge, 'q8'), 0);
@@ -96,40 +101,22 @@ test('BM25 ranks the passage that matches the question', () => {
   assert.deepEqual(A.tokenize('The cats were running'), ['cat', 'running']);
 });
 
-test('fuse and pickContext', () => {
+test('fuse', () => {
   const fused = A.fuse({ words: [2, 0, 1], meaning: [0, 3] });
   assert.equal(fused[0].i, 0); // in both lists
   assert.deepEqual(fused[0].from, ['words', 'meaning']);
-  const all = [0, 1, 2, 3].map((i) => ({ url: i < 3 ? 'https://same.example' : 'https://other.example', text: 'x'.repeat(100), title: `t${i}` }));
-  const picked = A.pickContext(A.fuse({ words: [0, 1, 2, 3] }), all, 1000, 6);
-  assert.equal(picked.length, 4);
-  const many = Array.from({ length: 5 }, () => ({ url: 'https://same.example', text: 'y', title: 't' }));
-  assert.equal(A.pickContext(A.fuse({ words: [0, 1, 2, 3, 4] }), many, 1000).length, 3); // at most 3 from one page
-  assert.equal(A.pickContext(A.fuse({ words: [0, 1, 2] }), all, 150).length, 1); // character budget
   assert.equal(A.dot([0.6, 0.8], [0.6, 0.8]).toFixed(2), '1.00');
-});
-
-test('collectPassages reads saved pages, results and instant answers', () => {
-  const pages = [['https://a.example', { url: 'https://a.example', title: 'A page', markdown: 'Some long enough text about apples and pears for a passage.', at: 1, saved: true }]];
-  const results = [
-    ['mwmbl|1|apples', { q: 'apples', at: 2, results: [{ title: 'Apples', url: 'https://b.example', snippet: [{ text: 'All about ' }, { text: 'apples', bold: true }] }], instant: { heading: 'Apple', text: 'An apple is a fruit.', url: 'https://w.example' } }],
-    ['wx2|leeds|c', { now: { temp: 3 } }], // weather records are skipped
-  ];
-  const ps = A.collectPassages(results, pages);
-  assert.deepEqual(
-    ps.map((p) => p.kind),
-    ['page', 'instant', 'result'],
-  );
-  assert.equal(ps[2].text, 'Apples. All about apples');
-  assert.equal(ps[2].q, 'apples');
 });
 
 test('prompts, answers and citations', () => {
   const msgs = A.answerMessages('Why?', [{ title: 'T', text: 'Because.', kind: 'result', q: 'why' }]);
   assert.equal(msgs[0].role, 'system');
   assert.ok(msgs[1].content.includes('[1] T (search result for "why")\nBecause.'));
-  assert.ok(msgs[1].content.endsWith('Question: Why?'));
+  // the question comes first and the sources last: a prompt cut at the end loses only sources
+  assert.ok(msgs[1].content.startsWith('Question: Why?\n\nSources:\n'));
   assert.equal(A.summaryMessages('T', 'body')[1].content, 'Page title: T\n\nPage text:\nbody');
+  assert.ok(A.summaryMessages('T', 'body', { excerpted: true })[0].content.includes('picked from across'));
+  assert.equal(A.sourceLabel({ title: 'T', heading: 'Part', kind: 'page', at: Date.UTC(2026, 9, 3) }, 1), '[2] T › Part (saved 2026-10-03)');
   assert.deepEqual(A.splitAnswer('- one\n- two\nIn short: done'), [
     { type: 'list', items: ['one', 'two'] },
     { type: 'p', text: 'In short: done' },
@@ -137,6 +124,8 @@ test('prompts, answers and citations', () => {
   assert.deepEqual(A.citations('Yes [1], and [2, 3].'), [{ text: 'Yes ' }, { cite: 1 }, { text: ', and ' }, { cite: 2 }, { cite: 3 }, { text: '.' }]);
   assert.equal(A.describeRun({ tokens: 100, ms: 6000, ttft: 1000, promptTokens: 500 }), '100 tokens in 6.0 s (20.0/s), first after 1.0 s, prompt 500 tokens');
   assert.ok(A.crashText({ what: 'load', pkg: 'lfm26' }).includes('loading LFM2.5 2.6B'));
+  assert.equal(A.textBudget(300), 588);
+  assert.ok(A.textBudget(60) >= 200);
   assert.equal(A.hash('abc'), A.hash('abc'));
   assert.notEqual(A.hash('abc'), A.hash('abd'));
 });

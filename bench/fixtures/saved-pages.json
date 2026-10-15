@@ -1,0 +1,26 @@
+{
+ "https://example.org/sourdough": {
+  "title": "Sourdough basics",
+  "at": 1760000000000,
+  "saved": true,
+  "markdown": "# Sourdough basics\n\nA sourdough starter is a fermented mix of flour and water. Feed it equal weights of flour and water every day.\n\n## Baking\n\nBake at 230 C for 20 minutes with steam, then 15 minutes without. Let the loaf cool for an hour before slicing.\n\n## Troubleshooting\n\nA dense loaf usually means the starter was not active enough. Let the dough rise until it has grown by half.\n\n## Storage\n\nKeep the starter in the fridge between bakes and feed it weekly. A spare jar of starter can be dried into flakes for months of safekeeping.\n"
+ },
+ "https://example.org/sourdough-tips": {
+  "title": "Sourdough tips",
+  "at": 1750000000000,
+  "saved": true,
+  "markdown": "# Sourdough tips\n\nUse a Dutch oven to trap steam. Bake at 230 C for 20 minutes with steam, then 15 minutes without.\n\n## Hydration\n\nA 75% hydration dough is easier to shape for beginners than a wetter one.\n"
+ },
+ "https://example.org/rail": {
+  "title": "Harbour Line: a long road",
+  "at": 1759000000000,
+  "saved": true,
+  "markdown": "# Harbour Line: a long road\n\nThe proposal for the Harbour Line was first drawn up in 1998, when the regional council commissioned a study of congestion on the coast road. The study found that traffic on the road had doubled in a decade.\n\nSubscribe to our newsletter for more stories like this one.\n\nPlanning took far longer than expected. Three separate environmental reviews were needed, and the final route was not approved until 2014.\n\n## Construction and cost\n\nWork began in March 2017. The line runs for 41 kilometres and includes the 6.2 km Orlen Tunnel, the longest in the country.\n\nThe original budget was 1.8 billion euros. By 2023 the cost had risen to 3.4 billion euros after delays caused by unstable rock in the tunnel section.\n\nShare this article on social media. Related stories. Read more.\n\n## Delays and disputes\n\nThe contractor, Brandt Civil, blamed the government for late land purchases, while ministers blamed the contractor for poor management. An independent audit in 2022 found fault on both sides.\n\nThe audit recommended that 14 changes be made to future projects, including a single accountable manager.\n\n## What riders can expect\n\nTrains will run every 10 minutes at peak times and every 20 minutes otherwise. The journey from Harbourton to Eastgate will take 34 minutes, down from 71 minutes by road.\n\nA single fare will cost 6.50 euros, with a monthly pass at 120 euros.\n\n## Opening day\n\nThe line opens on 9 September 2025. Free travel will be offered for the first week, and the Transport Minister, Lena Voss, will ride the first train.\n\nEngineers warned that the signalling system will be tested for six months after opening and that short closures should be expected."
+ },
+ "https://example.org/cache": {
+  "title": "Configuring the cache",
+  "at": 1758000000000,
+  "saved": true,
+  "markdown": "# Configuring the cache\n\nThe cache module stores responses on disk and in memory. It is enabled by default in version 3.\n\n## Settings\n\nSet `cache.maxSize` to the maximum size in megabytes. The default is 256. Set `cache.ttl` to the number of seconds an entry stays fresh; the default is 3600.\n\n## Eviction\n\nWhen the cache is full, the least recently used entries are removed first. Pinned entries are never removed. Use `cache.pin(key)` to pin an entry.\n\n## Troubleshooting\n\nIf you see error E_CACHE_FULL, increase `cache.maxSize` or reduce `cache.ttl`. If you see error E_CACHE_LOCKED, another process holds the lock file at `/var/run/cache.lock`; delete it only if that process has exited.\n\n## Limits\n\nThe maximum key length is 512 bytes and the maximum value size is 16 MB. Keys longer than 512 bytes raise error E_KEY_TOO_LONG.\n"
+ }
+}

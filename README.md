@@ -32,47 +32,44 @@ DuckDuckGo's own results pages can't be read by a web page. The app opens them i
 
 ## On-device AI
 
-Open **Settings → On-device AI** (`#/ai`). Nothing downloads until you tap Download, and every model can be removed again. After the download, everything runs on the device with no connection, and nothing you read or ask is sent anywhere.
+Open **Settings → On-device AI** (`#/ai`). Nothing downloads until you tap Download, every model can be removed again, and **the browser works fully without any of it**. After the download, everything runs on the device with no connection, and nothing you read or ask is sent anywhere.
 
-| Model | Role | Download (WebGPU) |
+The full write-up (safety policy, what was measured, observability guide, benchmarks, tests, a manual iPhone test plan, known limits) is in **[docs/ai.md](docs/ai.md)**. In short:
+
+| Model | On a phone | Download |
 |---|---|---|
-| LFM2.5 1.2B Instruct | Primary: summaries and answers | 764 MB (q4f16), 854 MB (q4 without 16-bit floats) |
-| BGE small en v1.5 | Finds saved passages by meaning; runs on the CPU | 35 MB |
-| LFM2.5 2.6B (experimental) | Better summaries and synthesis; too big for an iPhone (iOS ended the app while loading it) | 1.53 GB |
-| AI engine | Transformers.js and ONNX Runtime, needed by all | 27 MB (about 6 MB on the wire) |
+| LFM2.5 350M Instruct | provisional, the default; WebGPU | 258 MB (q4f16) / 297 MB (q4) |
+| LFM2.5 230M Instruct | provisional, the lowest-memory fallback; WebGPU | 216 MB |
+| LFM2.5 1.2B Instruct | **experimental: off until you opt in** | 764 MB (q4f16), 854 MB (q4), 1.52 GB (CPU, computers) |
+| LFM2.5 2.6B | **blocked** (iOS ended the app while loading it); computers, opt in | 1.53 GB |
+| BGE small en v1.5 | finds saved passages by meaning; CPU | 35 MB |
+| AI engine (Transformers.js 4.3.0, ONNX Runtime Web) | needed by all | 27 MB (about 6 MB on the wire) |
 
-Without WebGPU, the 1.2B model downloads its 8-bit CPU version (1.5 GB, slow) and the 2.6B can't run. The `q4` exports only work on WebGPU.
+"Provisional" means conservative limits that have **not been proven on a real device**, not a claim of safety. Licences: LFM Open License 1.0 for the LFM models, MIT for BGE.
 
-What it does:
+**What it does**
+1. **Summarise** a reader page: sentences are picked from the whole page (not just its start), one pass when possible, a bounded number of notes plus a combine only when one pass would see too little. The card says how much of the page was read. Summaries are kept with the page, keyed by model, method and page text.
+2. **Ask from saved pages and searches** (`#/ask`): keyword (BM25, updated incrementally) plus meaning (BGE) matching over every saved page, a hard evidence budget, cited answers `[1]`. **If no model may run** (not downloaded, switched off, no WebGPU), it shows the closest passages with their sources instead.
+3. **Ask from the model's own knowledge**, labelled as possibly wrong.
 
-1. **Summarise:** a button on every reader page, or automatically when a page loads (setting). Long pages are read in parts sized to the prompt limit: short notes on each, then a summary of the notes. Summaries are kept with the page.
-2. **Ask, from saved pages and searches** (`#/ask`): passages from pages read in the reader and from search results are matched by keyword (BM25), and by meaning when BGE is downloaded. The two lists are combined, and the model answers from the best few, citing them as [1], [2], linking to the saved copies. Without a chat model, the matching passages are shown.
-3. **Ask, from the model's own knowledge:** no sources, labelled as possibly wrong (training data to mid-2024).
+**How it is kept from destabilising the app** (iOS can end a page that uses too much memory, with no error to catch)
+- Each model has per-device **token budgets** (prompt, answer, and combined), counted exactly with the model's tokenizer, enforced inside the engine, and refused rather than risked. Ordinary settings can lower them, never raise them.
+- **One operation at a time**: loads, embeddings, generations, unloads and resets queue in one scheduler, enforced again inside the worker. Stop is never queued. One model in memory at a time; BGE is released before a chat model loads.
+- **Checkpoints** are written before each risky stage. A leftover one at the next launch is *classified* (backgrounded, closed, GPU lost, unexplained, repeated) rather than assumed to be an out-of-memory crash; an unexplained foreground interruption **switches that model setup off** until you retest it in developer mode.
+- The AI stops if the app goes to the background; it never runs on the page itself on a phone; a half-updated app is detected.
 
-Downloads:
-- They resume where they stopped: they are saved in 8 MB pieces in IndexedDB, continue with HTTP Range requests, retry with backoff, and wait for the connection to come back.
-- They keep the screen on while running, and check free storage first.
-- Revisions are pinned, file sizes are checked, and the engine files are checked against SHA-256.
+**Diagnostics** (AI page): live status, last inference, performance medians, recent failures and recovery actions, safety profiles, the structured log, and **Copy report** / **Copy as JSON**. Reports hold ids, counts and timings, never page text or questions unless you tick the opt-in. See docs/ai.md for how to read one.
 
-Diagnostics on the AI page:
-- **Device check:** WebGPU, 16-bit floats, GPU limits, storage, and whether WebGPU works in a worker.
-- **Log:** every download, load and run, with timings, tokens per second, and the error behind any failure.
-- **Copy report:** puts all of this on the clipboard.
-- **Crashes:** iOS ends a page that uses too much memory without an error the page can see. So a marker is written before each load or run and cleared after; one left over on the next launch is logged as a crash against that model and shown on the home screen.
+**Downloads** resume where they stopped (8 MB pieces in IndexedDB, HTTP Range, retries, wait for the connection), keep the screen on, check free storage first, pin revisions, check sizes, and verify the engine's SHA-256.
 
-Files: `js/ai.js` (page side: downloads, worker, log, retrieval), `js/ai-engine.js` (runs the models, in `js/ai-worker.js` or on the page if WebGPU only works there), `js/ai-store.js` (IndexedDB `sparse-ai`), `js/ai-lib.js` (catalog, chunking, BM25, prompts; tested).
+**Memory facts, briefly** (details and caveats in docs/ai.md)
+- Read from the model files: the 350M and 2.6B exports score only the last prompt position; the 1.2B and 230M score every prompt position, which is why long prompts hurt the 1.2B (an estimated 125 MB at 300 tokens, 1.25 GB at 3,000, against 8 MB and 74 MB for the 350M).
+- Observed on a test iPhone with the 1.2B: 338-token prompts worked, about 650 ended the app, and the 2.6B ended the app while loading. Those runs predate this work; **none of the new models or limits has been run on an iPhone yet.**
+- Safari does not report memory, so figures are labelled estimates. `tools/add_logits_to_keep.py` reproducibly rewrites a full-sequence graph to the last-token form (verified in ONNX Runtime on the 230M, not shipped).
 
-**Memory on iPhone:**
-- These exports compute a score for every word in the 65,536-word vocabulary at every prompt position. A 3,000-token prompt therefore needs about 0.4–0.8 GB beyond the 764 MB of weights, and iOS ended the app.
-- On the test iPhone, 338-token prompts worked, and prompts of about 650 tokens ended the app, even after splitting summaries into parts.
-- So there is a **Longest prompt** setting on the AI page (default 300 tokens). Summary parts and the saved text used for answers are sized to fit it.
-- The engine refuses any prompt over the limit with a message, rather than letting iOS end the app.
-- At 300 tokens, a summary covers the first ~1,800 characters of a page, in 3 parts of ~600 characters each. Raise the limit to cover more.
-- After any prompt over 900 tokens, the model is unloaded to give the memory back. Reloading takes about 3 s.
+**Testing:** `npm test` (96 tests); `node bench/run.mjs` (source selection and retrieval benchmark on `bench/fixtures`). Settings for testers: developer testing mode (AI page → Safety) allows longer prompts, a software GPU and retesting a switched-off model; `localStorage['sparse-ai-class']` can be set to `"ios"` or `"mobile"` to apply stricter limits on a device (it can never loosen them).
 
-**Measured on an iPhone, WebGPU with 16-bit floats:**
-- The 1.2B model loads in about 2.8 s and writes 10–23 tokens a second.
-- BGE indexed 344 saved passages in 57 s. That happens once; the results are kept.
+Files: `js/ai.js` (page side: downloads, worker, safety state, checkpoints, retrieval), `js/ai-engine.js` + `js/ai-worker.js` (run the models), `js/ai-policy.js` (profiles, budgets, interruption diagnosis), `js/ai-ops.js` (scheduler), `js/ai-diag.js` (events, error codes, report), `js/ai-select.js` (summary evidence and retrieval selection), `js/ai-store.js` (IndexedDB `sparse-ai`), `js/ai-lib.js` (catalog, prompts, BM25).
 
 ## Activity and network details
 

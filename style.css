@@ -702,3 +702,6 @@ pre.report {
   padding: 8px;
   border-radius: 8px;
 }
+
+/* streamed replies are drawn as plain text while they arrive, and formatted once at the end */
+.answer .live { white-space: pre-wrap; margin: 0; }

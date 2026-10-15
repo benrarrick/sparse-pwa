@@ -12,6 +12,7 @@ import * as N from './net.js';
 import * as S from './store.js';
 import * as AI from './ai.js';
 import * as AL from './ai-lib.js';
+import * as SEL from './ai-select.js';
 
 const DEFAULTS = {
   engine: 'mwmbl',
@@ -28,9 +29,9 @@ const DEFAULTS = {
   jinaKey: '',
   showActivity: true,
   weatherDetail: 'basic',
-  aiModel: 'lfm12',
+  aiModel: 'lfm350',
   aiAutoSummary: false,
-  aiPromptLimit: 300, // renamed from aiMaxPrompt (450) so the safer default reaches saved settings
+  aiPromptLimit: null, // null = the model's own limit; a number can only lower it (ai-policy.js), or raise it in developer mode
 };
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -578,13 +579,13 @@ async function showHome(id) {
       h(
         'nav',
         { class: 'links' },
-        AI.anyChat() || AI.isReady('bge') ? h('a', { href: '#/ask' }, 'Ask') : null,
+        AL.MODEL_IDS.some((x) => AI.isReady(x) && x !== 'engine') ? h('a', { href: '#/ask' }, 'Ask') : null,
         h('a', { href: '#/net' }, 'Network'),
         h('a', { href: '#/settings' }, 'Settings'),
       ),
     ),
     searchForm(),
-    AI.crashOnLaunch() ? h('p', { class: 'small bad' }, AL.crashText(AI.crashOnLaunch()), ' ', h('a', { href: '#/ai' }, 'AI diagnostics')) : null,
+    AI.lastInterruption() ? h('p', { class: `small ${AI.lastInterruption().quarantine ? 'bad' : 'warn'}` }, AI.lastInterruption().message, ' ', h('a', { href: '#/ai' }, 'AI diagnostics')) : null,
     h(
       'p',
       { class: 'muted small' },
@@ -1172,43 +1173,88 @@ function answerNodes(text, sources) {
 const loadNote = (p) => (p.total ? `${Math.round((100 * p.loaded) / p.total)}% of ${AL.size(p.total)}` : AL.size(p.loaded));
 
 /**
- * Loads a chat model and streams its reply into `out`, narrating in `status` and the activity log.
- * Resolves with { text, stats }, or null if it failed (the reason is shown and logged).
+ * Runs a chat model and streams its reply into `out`, narrating in `status` and the activity log.
+ * Resolves with { text, stats }, or null if it failed (the reason is shown and logged). Text that
+ * arrived before a failure or a stop stays on screen, labelled as incomplete.
+ *
+ * While the model writes, the reply is drawn as plain text, at most every 100 ms; it is formatted
+ * (lists, citations) once, when it is finished. The time spent drawing is measured and logged.
  */
-async function runModel(pkg, messages, { out, status, act, id, maxTokens, label, sources, fit = false }) {
+async function runModel(pkg, messages, { out, status, act, id, maxTokens, label, sources, fit = false, alive = () => true, meta = {} }) {
   const short = AL.PACKAGES[pkg].short;
-  const stopBtn = h('button', { type: 'button', class: 'link', onclick: () => AI.stop() }, 'Stop');
-  try {
-    if (!AI.loadedModels().has(pkg)) {
-      act.step(`Loading ${short} from this device into memory (nothing is downloaded)…`);
-      fill(status, `Loading ${short} into memory…`);
-      await AI.ensureLoaded(pkg, { onProgress: (p) => id === renderId && fill(status, `Loading ${short} into memory: ${loadNote(p)}`) });
-      act.ok(`${short} is ready (${T(AI.loadedModels().get(pkg)?.ms)})`);
+  const live = () => id === renderId && alive();
+  const stopBtn = h('button', { type: 'button', class: 'link', onclick: () => AI.stop('user', String(id)) }, 'Stop');
+  let text = '';
+  let drawn = false;
+  let timer = null;
+  const node = document.createTextNode('');
+  const ui = { flushes: 0, ms: 0, final: 0 };
+  const flush = () => {
+    timer = null;
+    if (!live()) return;
+    const t0 = performance.now();
+    if (!drawn) {
+      fill(out, h('p', { class: 'live' }, node));
+      drawn = true;
     }
-    if (id !== renderId) return null;
-    fill(status, `${short} is writing… `, stopBtn);
-    let text = '';
+    node.data = text;
+    ui.ms += performance.now() - t0;
+    ui.flushes++;
+  };
+  const finalise = (note) => {
+    clearTimeout(timer);
+    timer = null;
+    if (!live() || !text) return;
+    const t0 = performance.now();
+    fill(out, answerNodes(text, sources), note ? h('p', { class: 'small warn' }, note) : null);
+    ui.final = performance.now() - t0;
+    AI.event('ai.ui.render', {
+      msg: `Reply drawn: ${ui.flushes} live updates took ${Math.round(ui.ms)} ms, final formatting ${Math.round(ui.final)} ms`,
+      m: { flushes: ui.flushes, liveMs: Math.round(ui.ms * 10) / 10, finalMs: Math.round(ui.final * 10) / 10, chars: text.length, label },
+    });
+  };
+  try {
+    if (AI.busy()) {
+      act.step('Waiting for another AI task to finish first');
+      fill(status, 'Waiting for another AI task to finish… ', stopBtn);
+    } else fill(status, AI.loadedModels().has(pkg) ? `${short} is reading the prompt… ` : `Loading ${short} into memory… `, stopBtn);
     const stats = await AI.generate(pkg, messages, {
       maxTokens,
       label,
       maxPrompt: settings.aiPromptLimit,
       fit,
+      owner: String(id),
+      meta,
+      onProgress: (p) => live() && fill(status, `Loading ${short} into memory: ${loadNote(p)} `, stopBtn),
       onToken: (t) => {
+        if (!text && live()) fill(status, `${short} is writing… `, stopBtn);
         text += t;
-        if (id === renderId) fill(out, answerNodes(text, sources));
+        if (!timer && live()) timer = setTimeout(flush, 100);
       },
     });
     if (!text.trim()) act.warn(`${short} returned no text`);
+    finalise(stats.stopped ? 'Stopped before it finished, so this is incomplete.' : null);
     act.ok(`${short}: ${AL.describeRun(stats)}`);
-    if (id === renderId) fill(status, `${short} on this device · 0 B downloaded · ${AL.describeRun(stats)}`);
+    if (live()) fill(status, `${short} on this device · 0 B downloaded · ${AL.describeRun(stats)}`);
     return { text, stats };
   } catch (e) {
-    act.warn(`AI failed: ${e.message}`);
-    if (id === renderId)
-      fill(status, h('span', { class: 'bad' }, `The AI failed: ${e.message}. `), h('a', { href: '#/ai' }, 'Details in AI diagnostics'));
+    const cancelled = e.code === 'CANCELLED';
+    finalise(text ? (cancelled ? 'Stopped before it finished, so this is incomplete.' : 'The AI failed before it finished, so this is incomplete.') : null);
+    if (cancelled) {
+      act.skip('Stopped');
+      if (live()) fill(status, 'Stopped.');
+    } else {
+      act.warn(`AI failed: ${AI.explain(e)}`);
+      if (live()) fill(status, h('span', { class: 'bad' }, `The AI failed: ${AI.explain(e)} `), h('a', { href: '#/ai' }, 'Details in AI diagnostics'));
+    }
     return null;
   }
 }
+
+const coverageText = (plan) =>
+  plan.strategy === 'single'
+    ? 'the whole page'
+    : `${plan.note}. This is not the whole page: about ${Math.max(1, Math.round(plan.coverage * 100))}% of its text was read`;
 
 /** The reader's summary card. `cachedOnly` shows a summary made earlier without making a new one. */
 async function summarise(rec, url, box, act, id, { auto = false, redo = false, cachedOnly = false } = {}) {
@@ -1218,52 +1264,55 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
   const status = h('p', { class: 'small muted' });
   const out = h('div', { class: 'answer' });
   const head = h('h2', null, 'Summary');
-  const old = redo ? null : await AI.getSummary(url, pkg);
+  const old = redo ? null : await AI.getSummary(url, pkg, rec.markdown);
   if (id !== renderId) return;
   if (old) {
     box.hidden = false;
     fill(box, head, out, status);
     fill(out, answerNodes(old.text));
-    fill(status, `Made ${L.relTime(old.at)} by ${spec.short} on this device${old.cut ? ` from the first ${old.chars.toLocaleString()} of ${old.of.toLocaleString()} characters` : ''} · `, h('button', { type: 'button', class: 'link', onclick: () => summarise(rec, url, box, act, id, { redo: true }) }, 'Redo'));
+    fill(
+      status,
+      `Made ${L.relTime(old.at)} by ${spec.short} on this device${old.note ? `, from ${old.strategy === 'single' ? 'the whole page' : old.note}` : ''} · `,
+      h('button', { type: 'button', class: 'link', onclick: () => summarise(rec, url, box, act, id, { redo: true }) }, 'Redo'),
+    );
     return act.skip(`Summary: made earlier by ${spec.short}, kept on this device`);
   }
   if (cachedOnly) return;
   box.hidden = false;
   fill(box, head, out, status);
-  const text = AL.markdownToText(rec.markdown);
-  const partChars = AL.textBudget(settings.aiPromptLimit);
-  // Long pages are read in parts sized to the prompt limit; only as many as the final prompt can combine.
-  const t = AL.trimText(text, Math.min(spec.maxInputChars, partChars * AL.maxParts(settings.aiPromptLimit)));
-  if (text.length < 200) {
+  if (AL.markdownToText(rec.markdown).length < 200) {
     fill(status, 'There is too little text on this page to summarise.');
     return act.skip('Summary: too little text on the page');
   }
+  // What fits one prompt comes from the model's own limit; the text is chosen from the WHOLE page
+  const lim = AI.limitsFor(pkg, settings.aiPromptLimit);
+  const title = rec.title.slice(0, 80);
+  const plan = SEL.planSummary(rec.markdown, { perCallChars: AL.textBudget(lim.maxInput, 110), maxParts: AI.lowMemory() ? 2 : 4 });
   act.step(
-    `${auto ? 'Summarising automatically (Settings)' : 'Summarising'} with ${spec.short} on this device: ${t.cut ? `the first ${t.text.length.toLocaleString()} of ${t.of.toLocaleString()} characters` : `${t.text.length.toLocaleString()} characters`}. Nothing is sent anywhere.`,
+    `${auto ? 'Summarising automatically (Settings)' : 'Summarising'} with ${spec.short} on this device: ${plan.strategy === 'single' ? 'the whole page' : plan.note} · ${plan.calls === 1 ? '1 pass' : `${plan.calls} passes`}. Nothing is sent anywhere.`,
   );
-  let messages = AL.summaryMessages(rec.title, t.text);
-  if (t.text.length > partChars) {
-    // Long pages: short notes on each part, then a summary of the notes, so no prompt is long
-    // enough to need more memory than iOS allows.
-    const parts = AL.passages(t.text, partChars);
-    act.step(`The page is long, so it is read in ${parts.length} parts: notes on each, then a summary of the notes`);
+  const summaryTokens = Math.min(lim.maxNew, 160);
+  const base = { out, status, act, id, fit: true, meta: { strategy: plan.strategy, coverage: Math.round(plan.coverage * 100) / 100, calls: plan.calls, sections: plan.sections, sectionsUsed: plan.sectionsUsed, pageChars: plan.of } };
+  let messages = AL.summaryMessages(title, plan.text, { excerpted: plan.strategy !== 'single' });
+  if (plan.strategy === 'hierarchical') {
+    act.step(`The page is long, so it is read in ${plan.parts.length} parts picked from across it: notes on each, then a summary of the notes`);
     const notes = [];
-    for (const [i, part] of parts.entries()) {
+    for (const [i, part] of plan.parts.entries()) {
       if (id !== renderId) return;
-      const scratch = h('div');
       const pStatus = h('span');
-      fill(out, h('p', { class: 'muted' }, `Reading part ${i + 1} of ${parts.length}… `, pStatus));
-      const n = await runModel(pkg, AL.partMessages(rec.title, part, i + 1, parts.length), { out: scratch, status: pStatus, act, id, maxTokens: 60, label: `summary part ${i + 1}/${parts.length}`, fit: true });
+      fill(out, h('p', { class: 'muted' }, `Reading part ${i + 1} of ${plan.parts.length}… `, pStatus));
+      const n = await runModel(pkg, AL.partMessages(title, part, i + 1, plan.parts.length), { ...base, out: h('div'), status: pStatus, maxTokens: Math.min(lim.maxNew, 50), label: `summary part ${i + 1}/${plan.parts.length}` });
       if (!n) return fill(status, pStatus.childNodes.length ? [...pStatus.childNodes] : 'The AI failed.');
       if (n.stats.stopped) return fill(status, 'Stopped.');
       notes.push(n.text);
     }
-    messages = AL.combineMessages(rec.title, notes);
+    messages = AL.combineMessages(title, notes);
     fill(out);
   }
-  const r = await runModel(pkg, messages, { out, status, act, id, maxTokens: 320, label: 'summary', fit: true });
+  const r = await runModel(pkg, messages, { ...base, maxTokens: summaryTokens, label: 'summary' });
+  if (r && id === renderId) status.append(` · from ${coverageText(plan)}`);
   if (r?.text.trim() && !r.stats.stopped) {
-    await AI.saveSummary(url, pkg, { text: r.text, at: Date.now(), stats: r.stats, cut: t.cut, chars: t.text.length, of: t.of });
+    await AI.saveSummary(url, pkg, rec.markdown, { text: r.text, at: Date.now(), stats: r.stats, strategy: plan.strategy, coverage: plan.coverage, note: plan.note, calls: plan.calls });
     act.ok('Summary kept on this device with the page');
   }
 }
@@ -1312,7 +1361,7 @@ async function showRead(id, raw, reload = false) {
     const blocks = L.trimNav(L.parseMarkdown(rec.markdown, rec.source || url));
     const box = h('div', { class: 'archive card', hidden: true });
     const summary = h('div', { class: 'ai-out card', hidden: true });
-    const sumBtn = AI.anyChat() ? h('button', { type: 'button', class: 'link', onclick: () => summarise(rec, url, summary, act, id, { redo: !summary.hidden }) }, 'Summarise') : null;
+    const sumBtn = AI.anyChat(settings.aiModel) ? h('button', { type: 'button', class: 'link', onclick: () => summarise(rec, url, summary, act, id, { redo: !summary.hidden }) }, 'Summarise') : null;
     const archived = h('button', { type: 'button', class: 'link' }, 'Archived copy');
     archived.addEventListener('click', () => {
       archived.disabled = true;
@@ -1342,7 +1391,7 @@ async function showRead(id, raw, reload = false) {
     );
     act.ok(`Showing ${plural(blocks.length, 'block')} of text (menus at the top removed)`);
     settle();
-    if (sumBtn) summarise(rec, url, summary, act, id, { auto: settings.aiAutoSummary && !fromDevice, cachedOnly: !(settings.aiAutoSummary && !fromDevice) });
+    if (sumBtn) summarise(rec, url, summary, act, id, { auto: settings.aiAutoSummary && !fromDevice && AI.autoAllowed(), cachedOnly: !(settings.aiAutoSummary && !fromDevice && AI.autoAllowed()) });
   };
 
   const showProblem = (message, { archive = false } = {}) => {
@@ -1622,7 +1671,7 @@ async function showNet(id) {
 
 const sourceLabel = (s) => (s.kind === 'page' ? `${L.hostOf(s.url)} · saved page` : s.kind === 'instant' ? `instant answer for “${s.q}”` : `search result for “${s.q}”`);
 
-function sourceList(sources) {
+function sourceList(sources, chars = 160) {
   return h(
     'ol',
     { class: 'sources small' },
@@ -1631,19 +1680,23 @@ function sourceList(sources) {
         'li',
         null,
         s.url ? h('a', { href: hashFor('/r', { u: s.url }) }, s.title) : s.title,
+        s.heading ? h('span', { class: 'muted' }, ` › ${s.heading}`) : null,
         h('span', { class: 'muted' }, ` · ${sourceLabel(s)}${s.from ? ` · matched by ${s.from.join(' and ')}` : ''}`),
-        s.text ? h('span', { class: 'block muted' }, `${s.text.slice(0, 160)}${s.text.length > 160 ? '…' : ''}`) : null,
+        s.text ? h('span', { class: 'block muted' }, `${s.text.slice(0, chars)}${s.text.length > chars ? '…' : ''}`) : null,
       ),
     ),
   );
 }
+
+let askSeq = 0;
 
 async function showAsk(id, q0) {
   document.title = 'Ask · Sparse';
   const asks = await AI.recentAsks();
   if (id !== renderId) return;
   const pkg = AI.chatModel(settings.aiModel);
-  const bge = AI.isReady('bge');
+  const blockers = AI.chatBlockers();
+  const bge = AI.isReady('bge') && AI.mayRun('bge').ok;
   const act = activity('Ask');
   const input = h('textarea', { name: 'q', rows: 3, placeholder: pkg ? 'Ask a question' : 'Words to find in saved pages', 'aria-label': 'Question', enterkeyhint: 'send' }, q0);
   const mode = h(
@@ -1652,7 +1705,7 @@ async function showAsk(id, q0) {
     h('option', { value: 'saved', selected: true }, 'My saved pages and searches'),
     h('option', { value: 'general', disabled: !pkg }, 'The model’s own knowledge (no sources)'),
   );
-  const chats = AL.CHAT_IDS.filter((x) => AI.isReady(x));
+  const chats = AL.CHAT_IDS.filter((x) => AI.isReady(x) && AI.mayRun(x).ok);
   const model =
     chats.length > 1
       ? h(
@@ -1665,11 +1718,16 @@ async function showAsk(id, q0) {
   const ask = async () => {
     const question = input.value.trim();
     if (!question) return;
+    // a newer question replaces one still working: stop it and drop its waiting tasks
+    const mine = ++askSeq;
+    const alive = () => id === renderId && mine === askSeq;
+    AI.stop('new question', String(id));
     input.blur();
     const use = model?.value ?? pkg;
     const status = h('p', { class: 'small muted' });
     const answer = h('div', { class: 'answer' });
     const srcBox = h('div');
+    const srcHead = h('h3', null, 'Sources on this device');
     fill(out, h('div', { class: 'ai-out card' }, h('h2', null, question), answer, status, srcBox));
     let sources = null;
     let messages;
@@ -1677,13 +1735,19 @@ async function showAsk(id, q0) {
       fill(status, 'Searching what is saved on this device…');
       let found;
       try {
-        found = await AI.retrieve(question, { budget: Math.round(AL.textBudget(settings.aiPromptLimit) * 0.7) - question.length, max: 4, say: (k, t) => act[k](t) });
+        // the evidence budget is hard (labels included) and comes from the model's own limit
+        const lim = use ? AI.limitsFor(use, settings.aiPromptLimit) : null;
+        const budget = lim ? AL.textBudget(lim.maxInput, 100 + Math.ceil(question.length / 2.5)) : 1500;
+        found = await AI.retrieve(question, { budget, max: use ? 4 : 6, say: (k, t) => act[k](t), owner: String(id) });
       } catch (e) {
-        act.warn(`Search of saved pages failed: ${e.message}`);
-        return fill(status, h('span', { class: 'bad' }, `Searching saved pages failed: ${e.message}. `), h('a', { href: '#/ai' }, 'AI diagnostics'));
+        act.warn(`Search of saved pages failed: ${AI.explain(e)}`);
+        return fill(status, h('span', { class: 'bad' }, `Searching saved pages failed: ${AI.explain(e)} `), h('a', { href: '#/ai' }, 'AI diagnostics'));
       }
-      if (id !== renderId) return;
+      if (!alive()) return;
       sources = found.picked;
+      const mt = found.metrics;
+      act.ok(`Search took ${mt.totalMs} ms: ${mt.passages ?? 0} passages${mt.semantic === 'on' ? `, ${mt.newVectors ?? 0} newly indexed` : ''}, ${sources.length} chosen`);
+      AI.noteDetail({ question, sources: sources.map((x) => x.title) });
       if (!sources.length) {
         act.skip('Nothing saved matches the question');
         fill(status, found.all.length ? 'Nothing saved on this device matches the question.' : 'Nothing is saved on this device yet: search, or open pages in the reader, and they become answerable here.');
@@ -1693,10 +1757,16 @@ async function showAsk(id, q0) {
         }
         return act.finish('Ask: nothing matched');
       }
-      fill(srcBox, h('h3', null, 'Sources on this device'), sourceList(sources));
-      act.ok(`Using ${plural(sources.length, 'passage')} (${sources.reduce((n, s) => n + s.text.length, 0).toLocaleString()} characters)`);
+      fill(srcBox, srcHead, sourceList(sources, use ? 160 : 700));
+      act.ok(`Using ${plural(sources.length, 'passage')} (${sources.reduce((n, x) => n + x.text.length, 0).toLocaleString()} characters)`);
       if (!use) {
-        fill(status, 'These are the closest passages. Download a chat model on the AI page to get a written answer.');
+        fill(
+          status,
+          blockers.length
+            ? `Written answers are off (${blockers.map((b) => `${AL.PACKAGES[b.id].short}: ${b.why}`).join('; ')}), so these are the closest passages instead. `
+            : 'These are the closest passages. Download a chat model on the AI page to get a written answer. ',
+          h('a', { href: '#/ai' }, 'AI settings'),
+        );
         return act.finish('Ask: passages found (no chat model)');
       }
       messages = AL.answerMessages(question, sources);
@@ -1704,20 +1774,26 @@ async function showAsk(id, q0) {
       act.step('Answering from the model’s own knowledge: no sources, so check anything important');
       messages = AL.generalMessages(question);
     }
-    const r = await runModel(use, messages, { out: answer, status, act, id, maxTokens: 400, label: mode.value === 'saved' ? 'answer from saved' : 'general answer', sources });
-    if (!r) return act.finish('Ask failed');
+    const r = await runModel(use, messages, { out: answer, status, act, id, maxTokens: 128, label: mode.value === 'saved' ? 'answer from saved' : 'general answer', sources, fit: mode.value === 'saved', alive, meta: { sources: sources?.length ?? 0 } });
+    if (!alive()) return;
+    if (!r) {
+      if (sources?.length) srcHead.textContent = 'Closest passages on this device (the AI could not write an answer)';
+      return act.finish('Ask failed');
+    }
     if (mode.value === 'general') status.append(' · from the model’s memory (trained to mid-2024); it can be wrong');
     await AI.saveAsk({ q: question, mode: mode.value, pkg: use, text: r.text, stats: r.stats, at: Date.now(), sources: sources?.map(({ title, url, kind, q }) => ({ title, url, kind, q })) });
     act.finish(`Answered on this device · ${AL.describeRun(r.stats)}`);
   };
   render(
     h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'Ask'), h('a', { href: '#/ai' }, 'AI settings')),
-    !pkg && !bge
+    !pkg
       ? h(
           'div',
           { class: 'card' },
-          h('p', null, 'Answers need a model on this device. Nothing is downloaded until you choose one: ', h('a', { href: '#/ai' }, 'set up on-device AI'), '.'),
-          h('p', { class: 'small muted' }, 'Until then, this finds matching passages in your saved pages and searches by keyword.'),
+          blockers.length
+            ? h('p', null, 'Written answers are switched off: ', blockers.map((b) => `${AL.PACKAGES[b.id].short} (${b.why})`).join('; '), '. ', h('a', { href: '#/ai' }, 'See AI settings'), '.')
+            : h('p', null, 'Written answers need a model on this device. Nothing is downloaded until you choose one: ', h('a', { href: '#/ai' }, 'set up on-device AI'), '.'),
+          h('p', { class: 'small muted' }, 'Until then, this finds the closest passages in your saved pages and searches, by keyword. Nothing else is affected.'),
         )
       : null,
     h(
@@ -1734,7 +1810,7 @@ async function showAsk(id, q0) {
       h(
         'p',
         { class: 'small muted' },
-        pkg ? `${AL.PACKAGES[pkg].short} answers on this device, offline. ` : '',
+        pkg ? `${AL.PACKAGES[pkg].short} answers on this device, offline, within a safe size limit. ` : '',
         bge ? 'Saved passages are matched by meaning (BGE) and by keyword.' : 'Saved passages are matched by keyword; BGE on the AI page adds matching by meaning.',
       ),
     ),
@@ -1770,7 +1846,11 @@ function pkgCard(id, rec, dev) {
   const spec = AL.PACKAGES[id];
   const variant = rec.dtype || spec.kind === 'engine' ? rec : AL.pickVariant(spec, AI.usableGpu(dev));
   const total = AL.totalSize(AL.filesFor(spec, variant.dtype));
-  const unsupported = spec.kind !== 'engine' && !variant.dtype;
+  const prof = spec.kind === 'engine' ? null : AI.profile(id);
+  const noVariant = spec.kind !== 'engine' && !variant.dtype;
+  // a model the safety profile does not allow on this kind of device is not offered for download
+  const blockedHere = !!prof && (prof.status === 'unsupported' || (!!variant.device && !prof.backends?.includes(variant.device)));
+  const unsupported = noVariant || blockedHere;
   const where = spec.kind === 'engine' || unsupported ? '' : `${variant.dtype} on ${variant.device === 'webgpu' ? 'WebGPU' : 'the CPU'}`;
   const prog = h('progress', { max: total, value: rec.have ?? 0, hidden: !['downloading', 'paused', 'queued'].includes(rec.status) });
   const line = h('p', { class: 'small', id: `ai-status-${id}` });
@@ -1786,23 +1866,55 @@ function pkgCard(id, rec, dev) {
   const button = (label, fn, cls = 'button small') => h('button', { type: 'button', class: cls, onclick: fn }, label);
   const testOut = h('div', { class: 'small' });
   const buttons = [];
+  const notes = [];
   if (spec.kind !== 'engine') {
     if ((rec.status === 'none' || rec.status === 'failed') && !unsupported) buttons.push(button(`Download ${AL.size(total - (rec.have ?? 0))}`, () => AI.download(id)));
     if (rec.status === 'paused') buttons.push(button('Resume', () => AI.download(id)));
     if (rec.status === 'queued' || rec.status === 'downloading') buttons.push(button('Pause', () => AI.pause(id), 'button secondary small'));
-    if (rec.status === 'ready') buttons.push(button('Test', () => testModel(id, testOut), 'button secondary small'));
+    if (rec.status === 'ready' && AI.mayRun(id).ok) buttons.push(button('Test', () => testModel(id, testOut), 'button secondary small'));
+    else if (rec.status === 'ready') notes.push(h('p', { class: 'small warn' }, `Not running: ${AI.mayRun(id).why}`));
     if (rec.status !== 'none') buttons.push(twoTap(rec.status === 'ready' ? `Remove (frees ${AL.size(total)})` : 'Cancel and delete', () => AI.remove(id)));
   }
-  const notes = [];
-  if (rec.crashes) notes.push(h('p', { class: 'small bad' }, `The app stopped ${plural(rec.crashes, 'time')} while using this model${rec.lastCrash ? `, last ${L.relTime(rec.lastCrash.found)} (while ${rec.lastCrash.what === 'load' ? 'loading' : rec.lastCrash.what === 'embed' ? 'indexing' : 'writing'})` : ''}: most likely it needed more memory than iOS allows the app.`));
+  if (rec.crashes) notes.push(h('p', { class: 'small bad' }, `The app was interrupted unexpectedly ${plural(rec.crashes, 'time')} while using this model${rec.lastCrash ? `, last ${L.relTime(rec.lastCrash.found)} (at "${rec.lastCrash.stage ?? '?'}")` : ''}. iOS does not say why; the diagnostics below show what was recorded.`));
   if (rec.lastLoad) notes.push(h('p', { class: 'small muted' }, `Last loaded in ${T(rec.lastLoad.ms)} (${rec.lastLoad.where}, ${rec.lastLoad.mode === 'page' ? 'on the page' : 'in a worker'}), ${L.relTime(rec.lastLoad.at)}`));
   if (rec.lastRun) notes.push(h('p', { class: 'small muted' }, `Last run (${rec.lastRun.label}): ${AL.describeRun(rec.lastRun)}, ${L.relTime(rec.lastRun.at)}`));
   if (rec.lastError) notes.push(h('p', { class: 'small bad' }, `Last error (${rec.lastError.phase}, ${L.relTime(rec.lastError.at)}): ${rec.lastError.message}`));
-  if (spec.experimental && rec.status !== 'ready')
-    notes.push(h('p', { class: 'small warn' }, 'Experimental: it needs about 2 GB of memory, which is probably more than iOS lets a web app use. If loading it ends the app, that shows up here on the next launch.'));
-  if (unsupported) notes.push(h('p', { class: 'small bad' }, `Needs WebGPU, which this browser doesn't offer${dev.gpu.fallback ? ' (only a software version)' : ''}, so it can't run here.`));
+  if (blockedHere) notes.push(h('p', { class: 'small bad' }, prof.why ?? `Not qualified to run on ${variant.device === 'webgpu' ? 'WebGPU' : 'the CPU'} on this kind of device (${AI.deviceClassName()}), so it is not offered for download. Saved pages can still be searched.`));
+  else if (noVariant) notes.push(h('p', { class: 'small bad' }, `Needs WebGPU, which this browser doesn't offer${dev.gpu.fallback ? ' (only a software version)' : ''}, so it can't run here.`));
   else if (spec.kind === 'chat' && rec.device !== 'webgpu' && !AI.usableGpu(dev))
     notes.push(h('p', { class: 'small warn' }, `No usable WebGPU here${dev.gpu.fallback ? ' (only a software version)' : ''}, so it runs on the CPU with larger 8-bit weights: expect it to be slow.`));
+  if (prof && spec.kind === 'chat' && !blockedHere) {
+    notes.push(
+      h(
+        'p',
+        { class: 'small muted' },
+        `${prof.status === 'experimental' ? 'Experimental' : 'Conservative limits, not yet proven on a real device'} on this device (${AI.deviceClassName()}): prompt up to ${prof.maxInput} tokens, answer up to ${prof.maxNew}, together up to ${prof.maxTotal}, at most ${Math.round(prof.maxMs / 1000)} s. `,
+        spec.graph.lastTokenLogits ? 'Scores only the last prompt position (read from the model file).' : 'Scores every prompt position, so long prompts cost extra memory (read from the model file).',
+      ),
+    );
+    if (prof.status === 'experimental') {
+      const c = h('input', {
+        type: 'checkbox',
+        checked: AI.optedIn(id),
+        onchange: () => {
+          AI.setOptIn(id, c.checked);
+          route();
+        },
+      });
+      notes.push(h('label', { class: 'field check' }, c, h('span', null, 'Allow this experimental model to run on this device'), h('small', { class: 'muted' }, 'It uses more memory. If iOS ends the app while it runs, it is switched off again.')));
+    }
+  }
+  for (const q of AI.quarantined().filter((x) => x.key.startsWith(`${id}@`)))
+    notes.push(
+      h(
+        'p',
+        { class: 'small bad' },
+        `Switched off ${L.relTime(q.at)}: the app was interrupted unexpectedly while it ran (${q.category.toLowerCase().replaceAll('_', ' ')}, ${q.confidence} confidence). `,
+        AI.getDev()
+          ? h('button', { type: 'button', class: 'link', onclick: () => (AI.retest(q.key), route()) }, 'Allow a retest')
+          : 'Turn on developer testing mode below to retest it.',
+      ),
+    );
   return h(
     'div',
     { class: `card pkg${spec.kind === 'engine' ? ' engine' : ''}` },
@@ -1833,6 +1945,7 @@ async function testModel(id, box) {
     const stats = await AI.generate(id, AL.generalMessages('In one sentence, what does a web browser do?'), {
       maxTokens: 48,
       label: 'test',
+      owner: 'ai-page',
       onToken: (t) => {
         text += t;
         say(`“${text}”`);
@@ -1840,24 +1953,30 @@ async function testModel(id, box) {
     });
     say(h('span', null, `“${text.trim()}”`), h('span', { class: 'block muted' }, `Works: ${AL.describeRun(stats)}. Loaded in ${T(AI.loadedModels().get(id)?.ms)}.`));
   } catch (e) {
-    say(h('span', { class: 'bad' }, `Test failed: ${e.message}`), h('span', { class: 'block muted' }, 'The diagnostics log below has the details.'));
+    say(h('span', { class: 'bad' }, `Test failed: ${AI.explain(e)}`), h('span', { class: 'block muted' }, 'The diagnostics log below has the details.'));
   }
 }
 
 function logItem(e) {
+  const meta = [e.ev && !e.ev.endsWith('.note') ? e.ev : null, e.op ? `op ${e.op}` : null, e.stage ? `stage ${e.stage}` : null, e.code ? e.code : null].filter(Boolean).join(' · ');
   return h(
     'li',
     { class: { error: 'bad', warn: 'warn', ok: 'ok' }[e.level] ?? '' },
     h('span', { class: 't' }, new Date(e.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })),
-    h('span', null, `[${e.area}] ${e.msg}`, e.detail ? h('span', { class: 'block muted' }, String(e.detail).split('\n').slice(0, 3).join(' · ')) : null),
+    h('span', null, `[${e.area}] ${e.msg}`, meta ? h('span', { class: 'block muted' }, meta) : null, e.detail ? h('span', { class: 'block muted' }, String(e.detail).split('\n').slice(0, 3).join(' · ')) : null),
   );
 }
 
+const kvRows = (rows) => rows.map(([k, v]) => h('tr', null, h('th', null, k), h('td', null, v == null ? '–' : v)));
+const secs = (ms) => (ms == null ? '–' : ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`);
+
 async function showAI(id) {
   document.title = 'On-device AI · Sparse';
-  const [st, dev, entries] = await Promise.all([AI.states(), AI.device(true), AI.readLog(150)]);
+  const [st, d] = await Promise.all([AI.states(), AI.diagnostics()]);
   if (id !== renderId) return;
-  const crash = AI.crashOnLaunch();
+  const dev = d.device;
+  const entries = d.events;
+  const interruption = AI.lastInterruption();
   const loaded = AI.loadedModels();
   const dl = AI.downloading();
   const shown = Object.fromEntries(Object.entries(st).map(([k, v]) => [k, v.status]));
@@ -1873,6 +1992,7 @@ async function showAI(id) {
   const g = dev.gpu;
   const yes = (v) => (v ? 'yes' : 'no');
   const rows = [
+    ['Kind of device', `${AI.deviceClassName()}${AI.lowMemory() ? ' (low-memory limits apply)' : ''}`],
     ['WebGPU on the page', g.gpu ? `yes · ${g.adapter}${g.fallback ? ' (software fallback)' : ''}` : `no${g.why ? ` (${g.why})` : ''}`],
     ['16-bit floats (shader-f16)', g.gpu ? yes(g.f16) : '–'],
     ['Largest GPU buffer', g.limits ? `${AL.size(g.limits.maxBufferSize)} (binding ${AL.size(g.limits.maxStorageBufferBindingSize)})` : '–'],
@@ -1882,31 +2002,101 @@ async function showAI(id) {
     ['Storage permanent', dev.persisted == null ? 'not reported' : yes(dev.persisted)],
     ['Installed to the home screen', yes(dev.standalone)],
     ['CPU cores', dev.cores ?? 'not reported'],
-    ['Memory', dev.memory ? `about ${dev.memory} GB` : 'not reported (Safari never says)'],
+    ['Memory', dev.memory ? `about ${dev.memory} GB (the browser’s rough figure)` : 'not reported (Safari never says)'],
+    ['App build', AL.AI_BUILD],
     ['Browser', dev.ua],
   ];
+
+  // current status: redrawn whenever an operation starts, moves on or ends
+  const statusBox = h('table', { class: 'kv' });
+  const drawStatus = () => {
+    const s = AI.status();
+    const a = s.op.active;
+    fill(
+      statusBox,
+      kvRows([
+        ['State', `${s.op.state}${s.op.failed ? ` (${s.op.failed.code})` : ''}`],
+        ['Doing now', a ? `${a.type}${a.label !== a.type ? ` (${a.label})` : ''}, stage “${a.stage}”` : 'nothing'],
+        ['Waiting', s.op.queue.length ? `${s.op.queue.length}: ${s.op.queue.map((q) => q.type).join(', ')}` : 'nothing'],
+        ['Engine', `${s.worker.mode ?? 'not started'} · ${s.worker.state} (started ${s.worker.starts}×, restarted ${s.worker.resets}×)`],
+        ['In memory', s.loaded.length ? s.loaded.map((m) => `${AL.PACKAGES[m.id].short}: ${m.dtype} on ${m.device === 'webgpu' ? 'WebGPU' : 'the CPU'}`).join(', ') : 'nothing'],
+        ['Health', s.gpuLost ? 'The GPU was lost: reset the engine below' : s.versionMismatch ? 'The app is only partly updated: close it completely and open it again (twice)' : 'OK'],
+        ['Switched off for safety', s.quarantine.length ? `${s.quarantine.length}: ${s.quarantine.map((q) => AL.PACKAGES[q.key.split('@')[0]]?.short ?? q.key).join(', ')}` : 'none'],
+      ]),
+    );
+  };
+  drawStatus();
+
+  const li = d.lastInference;
+  const lastBox = li
+    ? h('table', { class: 'kv' }, kvRows([
+        ['Result', `${li.status}${li.m?.stopReason ? ` (${li.m.stopReason})` : ''} · ${AL.PACKAGES[li.pkg]?.short ?? li.pkg} ${li.dtype ?? ''}/${li.backend ?? ''}, ${li.m?.label ?? ''}, ${L.relTime(li.t)}`],
+        ['Prompt → answer', `${li.m?.promptTokens ?? li.m?.inputTokens ?? '?'} → ${li.m?.tokens ?? '?'} tokens (asked for up to ${li.m?.requestedNew ?? '?'}, allowed ${li.m?.maxNew ?? '?'})`],
+        ['First token', secs(li.m?.ttft)],
+        ['Writing speed', li.m?.tps ? `${li.m.tps} tokens/s` : '–'],
+        ['Total', secs(li.m?.ms)],
+        ['Waited in queue', secs(li.m?.queueMs)],
+        ['Scores computed for', li.m?.lastTokenLogits == null ? '–' : li.m.lastTokenLogits ? 'the last prompt position only' : 'every prompt position'],
+      ]))
+    : h('p', { class: 'small muted' }, 'Nothing has run since the app opened.');
+
+  const p = d.performance;
+  const perfBox = h('table', { class: 'kv' }, kvRows([
+    ['Runs this session', p.runs],
+    ['Median time to first token', secs(p.medianTtftMs)],
+    ['Median writing speed', p.medianTokensPerSec ? `${p.medianTokensPerSec.toFixed(1)} tokens/s` : '–'],
+    ['Median run', secs(p.medianRunMs)],
+    ['Model loads · median', `${p.loads} · ${secs(p.medianLoadMs)}`],
+    ['Searches of saved pages · median', `${p.retrievals} · ${secs(p.medianRetrievalMs)}`],
+    ['Failures', p.failures ? `${p.failures} (${Object.entries(p.failuresByCode).map(([k, v]) => `${k} ${v}`).join(', ')})` : 'none'],
+  ]));
+
+  const failures = entries.filter((e) => e.level === 'error' && (e.code || e.ev?.includes('failed'))).slice(0, 8);
+  const recovery = entries.filter((e) => ['ai.worker.reset', 'ai.quarantine.added', 'ai.quarantine.released', 'ai.worker.unresponsive', 'ai.memory.idle_unload', 'ai.recovery.interrupted'].includes(e.ev)).slice(0, 6);
+  const detailBox = h('input', { type: 'checkbox' });
+  const copy = async (text, what) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      copyNote.textContent = ` Copied the ${what} (${AL.size(text.length)}).`;
+    } catch {
+      copyNote.textContent = ' Could not copy; shown below instead.';
+      logList.before(h('pre', { class: 'report' }, text));
+    }
+  };
+  const usable = AL.CHAT_IDS.filter((x) => AI.isReady(x) && AI.mayRun(x).ok);
+
   render(
-    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'On-device AI'), AI.anyChat() || AI.isReady('bge') ? h('a', { href: '#/ask' }, 'Ask') : null),
+    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'On-device AI'), AL.MODEL_IDS.some((x) => AI.isReady(x)) ? h('a', { href: '#/ask' }, 'Ask') : null),
     h(
       'section',
       null,
-      h('p', null, 'Optional AI that runs on this device: it summarises pages and answers questions from your saved pages and searches, or on its own, with no connection. Nothing downloads until you tap Download.'),
+      h('p', null, 'Optional AI that runs on this device: it summarises pages and answers questions from your saved pages and searches, or on its own, with no connection. Nothing downloads until you tap Download, and the browser works fully without it.'),
       h(
         'ul',
         { class: 'small' },
         h('li', null, 'Models come from Hugging Face and the engine from jsDelivr, once. After that, nothing you read or ask leaves the device.'),
         h('li', null, 'Use Wi-Fi and keep the app open: the screen stays on while it downloads. If the download is interrupted, it carries on from where it stopped.'),
-        h('li', null, 'Phones limit how much memory a web app may use. If a model is too big, iOS ends the app; the next launch notes it here.'),
+        h('li', null, 'Phones limit how much memory a web app may use, and iOS can end the app without saying why. So each model has hard size limits here, one task runs at a time, and a model that was interrupted unexpectedly is switched off until you retest it.'),
       ),
     ),
-    crash ? h('div', { class: 'card warn-card' }, h('p', null, h('strong', null, 'Last time: '), AL.crashText(crash))) : null,
+    interruption
+      ? h(
+          'div',
+          { class: 'card warn-card' },
+          h('p', null, h('strong', null, 'Last time: '), interruption.message),
+          h('p', { class: 'small muted' }, `Diagnosis: ${interruption.category.toLowerCase().replaceAll('_', ' ')} (${interruption.confidence} confidence). ${interruption.quarantine ? 'That model was switched off; saved pages and summaries are untouched. ' : ''}`, h('button', { type: 'button', class: 'link', onclick: () => (AI.ackInterruption(), route()) }, 'Dismiss')),
+          h('details', null, h('summary', { class: 'small' }, 'Why this diagnosis'), h('ul', { class: 'small' }, interruption.reasons.map((r) => h('li', null, r)))),
+        )
+      : null,
+    h('h2', null, 'Status now'),
+    statusBox,
     h('h2', null, 'Models'),
-    ['lfm12', 'bge', 'lfm26', 'engine'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
+    ['lfm350', 'lfm230', 'bge', 'lfm12', 'lfm26', 'engine'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
     h(
       'section',
       null,
       h('h2', null, 'Use'),
-      AL.CHAT_IDS.filter((x) => AI.isReady(x)).length > 1
+      usable.length > 1
         ? h(
             'label',
             { class: 'field' },
@@ -1914,42 +2104,57 @@ async function showAI(id) {
             (() => {
               const s = h(
                 'select',
-                { onchange: () => saveSetting('aiModel', s.value) },
-                AL.CHAT_IDS.map((x) => h('option', { value: x, selected: settings.aiModel === x }, AL.PACKAGES[x].short)),
+                { onchange: () => (saveSetting('aiModel', s.value), route()) },
+                usable.map((x) => h('option', { value: x, selected: AI.chatModel(settings.aiModel) === x }, AL.PACKAGES[x].short)),
               );
               return s;
             })(),
           )
         : null,
-      h(
-        'label',
-        { class: 'field' },
-        h('span', null, 'Longest prompt'),
-        (() => {
-          const s = h(
-            'select',
-            { onchange: () => saveSetting('aiPromptLimit', Number(s.value)) },
-            AL.PROMPT_LIMITS.map((n) => h('option', { value: String(n), selected: settings.aiPromptLimit === n }, `${n} tokens (about ${AL.textBudget(n).toLocaleString()} characters of text)`)),
-          );
-          return s;
-        })(),
-        h(
-          'small',
-          { class: 'muted' },
-          'Longer prompts need more memory: the model scores its whole vocabulary at every word of the prompt. On a test iPhone, 338 tokens worked and about 650 ended the app. Long pages are summarised in parts of this size, and answers use this much saved text. Raise it to find what this device can handle; a crash shows up in the log.',
-        ),
-      ),
+      (() => {
+        const use = AI.chatModel(settings.aiModel) ?? usable[0];
+        if (!use) return h('p', { class: 'small muted' }, 'Download a model above to choose how long prompts may be.');
+        const cap = AI.limitsFor(use, null).maxInput;
+        const current = settings.aiPromptLimit ? Math.min(settings.aiPromptLimit, AI.getDev() ? 2000 : cap) : cap;
+        const s = h(
+          'select',
+          { onchange: () => (saveSetting('aiPromptChosen', true), saveSetting('aiPromptLimit', Number(s.value))) },
+          AI.limitChoices(use).map((n) => h('option', { value: String(n), selected: current === n }, `${n} tokens (about ${AL.textBudget(n).toLocaleString()} characters of text)${n === cap ? ' · this model’s limit' : ''}`)),
+        );
+        return h(
+          'label',
+          { class: 'field' },
+          h('span', null, 'Longest prompt'),
+          s,
+          h('small', { class: 'muted' }, `Longer prompts need more memory. You can lower this, but not raise it above ${cap} tokens, the limit for ${AL.PACKAGES[use].short} on this device. Pages are summarised from sentences picked across the whole page; answers use this much saved text.`),
+        );
+      })(),
       h(
         'label',
         { class: 'field check' },
         (() => {
-          const c = h('input', { type: 'checkbox', checked: settings.aiAutoSummary, onchange: () => saveSetting('aiAutoSummary', c.checked) });
+          const c = h('input', { type: 'checkbox', checked: settings.aiAutoSummary && AI.autoAllowed(), disabled: !AI.autoAllowed(), onchange: () => saveSetting('aiAutoSummary', c.checked) });
           return c;
         })(),
         h('span', null, 'Summarise pages automatically when they load'),
-        h('small', { class: 'muted' }, 'Otherwise, tap Summarise on a page. Either way, summaries are kept with the page.'),
+        h('small', { class: 'muted' }, AI.autoAllowed() ? 'Otherwise, tap Summarise on a page. Either way, summaries are kept with the page.' : 'Off while a model is switched off for safety, or the engine needs attention.'),
       ),
       h('p', { class: 'small' }, h('a', { href: '#/ask' }, 'Ask a question'), ': from your saved pages and searches, or the model’s own knowledge.'),
+    ),
+    h('section', null, h('h2', null, 'Last inference'), lastBox),
+    h('section', null, h('h2', null, 'Performance'), perfBox),
+    h(
+      'section',
+      null,
+      h('h2', null, 'Recent failures'),
+      failures.length
+        ? h(
+            'ul',
+            { class: 'plain small' },
+            failures.map((e) => h('li', { class: 'bad' }, `${new Date(e.t).toLocaleString()} · ${AL.PACKAGES[e.pkg]?.short ?? e.pkg ?? '–'} · stage ${e.stage ?? '–'} · ${e.code ?? 'error'}`, h('span', { class: 'block muted' }, e.msg))),
+          )
+        : h('p', { class: 'small muted' }, 'None recorded.'),
+      recovery.length ? h('details', null, h('summary', { class: 'small' }, 'Recovery actions taken'), h('ul', { class: 'plain small' }, recovery.map((e) => h('li', null, `${new Date(e.t).toLocaleString()} · ${e.msg}`)))) : null,
     ),
     h(
       'section',
@@ -1963,37 +2168,48 @@ async function showAI(id) {
               h('li', null, `${AL.PACKAGES[k].short}: ${info.dtype} on ${info.device === 'webgpu' ? 'WebGPU' : 'the CPU'}, loaded in ${T(info.ms)} `, h('button', { type: 'button', class: 'link', onclick: async () => (await AI.unload(k), route()) }, 'Unload')),
             ),
           )
-        : h('p', { class: 'small muted' }, 'Nothing. Models load when first used, and unload after 10 minutes unused.'),
+        : h('p', { class: 'small muted' }, 'Nothing. One model is in memory at a time, loaded when first used and released after a short while unused (2 minutes on a phone).'),
+    ),
+    h(
+      'section',
+      null,
+      h('h2', null, 'Safety'),
+      h('table', { class: 'kv' }, AI.profileTable().map((r) => h('tr', null, h('th', null, AL.PACKAGES[r.id].short), h('td', null, r.status === 'unsupported' ? `Not supported here: ${r.why}` : `${r.status}${r.maxInput ? ` · prompt ≤ ${r.maxInput}, answer ≤ ${r.maxNew}, total ≤ ${r.maxTotal} tokens` : ` · batches of ${r.maxBatch}, ≤ ${r.maxPerRun} passages per question`}${r.blockedBy ? ` · blocked: ${r.blockedBy}` : ''}`)))),
+      h('p', { class: 'small muted' }, 'Expected memory use (estimates from the tensor shapes in the model files; Safari does not report real memory):'),
+      h('ul', { class: 'plain small' }, d.estimates.map((x) => h('li', null, x))),
+      (() => {
+        const c = h('input', {
+          type: 'checkbox',
+          checked: AI.getDev(),
+          onchange: () => {
+            AI.setDev(c.checked);
+            route();
+          },
+        });
+        return h('label', { class: 'field check' }, c, h('span', null, 'Developer testing mode'), h('small', { class: 'muted' }, 'For testing only: allows longer prompts and retesting a switched-off model. Larger prompts can make iOS end the app. Ordinary use never needs it.'));
+      })(),
+      AI.getDev() ? h('p', { class: 'small' }, twoTap('Clear run history', () => AI.clearHistory())) : null,
     ),
     h('section', null, h('h2', null, 'This device'), h('table', { class: 'kv' }, rows.map(([k, v]) => h('tr', null, h('th', null, k), h('td', null, String(v)))))),
     h(
       'section',
       null,
       h('h2', null, 'Diagnostics'),
-      h('p', { class: 'small muted' }, 'Every download, load and run, with how long it took and why anything failed. Kept on this device.'),
+      h('p', { class: 'small muted' }, 'Every download, load and run, step by step, with how long it took and where and why anything failed. Kept on this device, bounded, and never sent anywhere. By default it holds no page text, questions or answers.'),
       h(
         'p',
         { class: 'small' },
-        h(
-          'button',
-          {
-            type: 'button',
-            class: 'link',
-            onclick: async () => {
-              const text = await AI.report();
-              try {
-                await navigator.clipboard.writeText(text);
-                copyNote.textContent = ` Copied (${AL.size(text.length)}).`;
-              } catch {
-                copyNote.textContent = ' Could not copy; the report is shown below instead.';
-                logList.before(h('pre', { class: 'report' }, text));
-              }
-            },
-          },
-          'Copy report',
-        ),
-        copyNote,
+        h('button', { type: 'button', class: 'link', onclick: async () => copy(await AI.report({ detail: detailBox.checked }), 'report') }, 'Copy report'),
         ' · ',
+        h('button', { type: 'button', class: 'link', onclick: async () => copy(await AI.reportJson({ detail: detailBox.checked }), 'report as JSON') }, 'Copy as JSON'),
+        copyNote,
+      ),
+      h('label', { class: 'field check' }, detailBox, h('span', null, 'Include my last question and the titles of its sources'), h('small', { class: 'muted' }, 'Private: this puts text you wrote into the report. Leave it off unless you are sending the report to someone you trust.')),
+      h(
+        'p',
+        { class: 'small' },
+        h('button', { type: 'button', class: 'link', onclick: async () => (await AI.resetEngine(), route()) }, 'Reset AI engine'),
+        ' (stops anything running and restarts the engine; downloaded models are kept) · ',
         filterBtn,
         ' · ',
         twoTap('Clear log', () => AI.clearLog()),
@@ -2005,12 +2221,17 @@ async function showAI(id) {
       null,
       h('h2', null, 'Remove'),
       h('p', { class: 'small' }, twoTap('Remove all AI data from this device', () => AI.removeAll())),
-      h('p', { class: 'small muted' }, 'Deletes every model, the engine, the meaning index, summaries, questions and this log.'),
+      h('p', { class: 'small muted' }, 'Deletes every model, the engine, the meaning index, summaries, questions, this log and the safety history.'),
     ),
   );
   aiUnsub = AI.on((type, data) => {
     if (currentPath() !== '/ai') return;
     if (type === 'log') logList.prepend(logItem(data));
+    if (type === 'op' || type === 'loaded') drawStatus();
+    if (type === 'safety') {
+      clearTimeout(netPageTimer);
+      netPageTimer = setTimeout(route, 300);
+    }
     if (type === 'download' && !data.done) {
       const el = document.getElementById(`ai-status-${data.id}`);
       if (el)
@@ -2126,7 +2347,7 @@ async function showSettings(id) {
       h(
         'p',
         { class: 'small' },
-        AI.anyChat() || AI.isReady('bge')
+        AL.MODEL_IDS.some((x) => AI.isReady(x))
           ? `On this device: ${AL.MODEL_IDS.filter((x) => AI.isReady(x))
               .map((x) => AL.PACKAGES[x].short)
               .join(', ')}. `
@@ -2197,7 +2418,7 @@ function route() {
   const id = ++renderId;
   aiUnsub?.();
   aiUnsub = null;
-  if (AI.running()) AI.stop(); // a reply for a screen that's gone
+  AI.stop('left the screen', String(id - 1)); // a reply for a screen that's gone: stop it and drop its waiting tasks
   const p = new URLSearchParams(location.hash.split('?')[1] ?? '');
   switch (currentPath()) {
     case '/s':
@@ -2227,6 +2448,7 @@ async function start() {
   [settings, netLog, netTotals] = await Promise.all([
     S.kvGet('settings', {}).then((s) => {
       const merged = { ...DEFAULTS, ...s };
+      if (merged.aiPromptLimit === 300 && !merged.aiPromptChosen) merged.aiPromptLimit = null; // 300 was the old default, not a choice
       if (!L.FREE_ENGINE_IDS.includes(merged.engine)) merged.engine = DEFAULTS.engine; // the paid engine is never the default
       return merged;
     }),
