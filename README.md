@@ -25,6 +25,33 @@ DuckDuckGo's own results pages can't be read by a web page. The app opens them i
 - **Repeat searches:** a search repeated within 6 hours (configurable) loads from the device and uses no data.
 - **Settings:** engine, keys, fallback, region, safe search, instant answers, what tapping a result opens, DuckDuckGo Lite or HTML, weather units.
 
+## Activity and network details
+
+The app tells you what it is doing and what it costs:
+
+- **Activity log, on every screen.** A timestamped list of each step, for example:
+  - "Looking on this device for saved results…"
+  - "Skipped Mojeek: no API key in Settings"
+  - "Trying Marginalia…" then "Marginalia failed: timed out; trying Mwmbl"
+  - "↓ Mwmbl: HTTP 200 · 22 KB received · ≈3.7 KB on the wire · first byte 334 ms · total 339 ms · ≈11 KB/s"
+  - "Saved these results on this device (15 KB)"
+
+  Its heading sums up the whole screen. Results, reader pages and weather cards also say what they cost to download, or "0 B downloaded now" when they came from the device.
+- **Bottom bar, always shown.** What is happening right now, including live progress while a download runs, plus this session's totals. Tap it for the Network page.
+- **Network page.** Shows:
+  - the connection, where the browser shares it (Safari doesn't);
+  - totals for this session;
+  - totals per service since the last reset;
+  - how each of the app's own files loaded on this launch (0 B = offline cache);
+  - storage used;
+  - the last 150 requests with full timings. API keys are blanked out.
+
+How it is measured (`js/net.js`):
+
+- **Received** is the exact byte count after decompression.
+- **On the wire** is exact when the service sends `Content-Length`, as Jina, Open-Meteo places and Mojeek do. Otherwise it is estimated by gzip-compressing what arrived, and marked "≈", because browsers hide other sites' transfer sizes from web pages.
+- **Speed** is on-the-wire size divided by total time, so latency is included.
+
 ## Run it locally
 
 ```sh
@@ -72,7 +99,8 @@ History, cached results and saved pages stay on the device. The page's Content-S
 | File | |
 |---|---|
 | `index.html` | Shell, iOS meta tags, CSP |
-| `js/app.js` | Views (home, results, reader, settings), routing, offline queue |
+| `js/app.js` | Views (home, results, reader, network, settings), activity log, bottom bar, routing, offline queue |
+| `js/net.js` | Measured requests: timings, sizes, progress events, app-load figures |
 | `js/lib.js` | Pure logic: engine URLs and parsers, instant answers, weather, Jina and Markdown parsing. Tested in `test/` |
 | `js/store.js` | IndexedDB (kv, results, pages) and eviction |
 | `sw.js` | App-shell cache with a background refresh |

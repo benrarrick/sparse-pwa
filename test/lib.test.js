@@ -250,3 +250,35 @@ test('display helpers', () => {
   assert.equal(L.relTime(0, 30 * 1000), 'just now');
   assert.equal(L.relTime(0, 2 * 3600 * 1000), '2 h ago');
 });
+
+test('skippedEngines explains what is left out', () => {
+  assert.deepEqual(L.skippedEngines({ engine: 'mwmbl', mojeekKey: '', fallback: true }), [{ id: 'mojeek', reason: 'no API key in Settings' }]);
+  assert.deepEqual(
+    L.skippedEngines({ engine: 'mwmbl', mojeekKey: 'k', fallback: false }).map((x) => x.id),
+    ['mojeek', 'marginalia'],
+  );
+});
+
+test('network formatting', () => {
+  assert.equal(L.formatBytes(512), '512 B');
+  assert.equal(L.formatBytes(7680), '7.5 KB');
+  assert.equal(L.formatBytes(150 * 1024), '150 KB');
+  assert.equal(L.formatBytes(3 * 1048576), '3.0 MB');
+  assert.equal(L.formatMs(420), '420 ms');
+  assert.equal(L.formatMs(2100), '2.10 s');
+  assert.equal(L.formatSpeed(10240, 500), '20 KB/s');
+  assert.equal(L.formatSpeed(10, 0), '?');
+  const e = { status: 200, received: 7680, wire: 2400, wireKind: 'estimate', ttfb: 310, ms: 420 };
+  assert.equal(L.describeTransfer(e), 'HTTP 200 · 7.5 KB received · ≈2.3 KB on the wire · first byte 310 ms · total 420 ms · ≈5.6 KB/s');
+  assert.match(L.describeTransfer({ ...e, wireKind: 'exact' }), / 2\.3 KB on the wire/);
+  assert.equal(L.describeTransfer({ error: 'timed out', status: null, ms: 8000 }), 'timed out after 8.00 s');
+});
+
+test('serviceOf and redactUrl', () => {
+  assert.equal(L.serviceOf('https://r.jina.ai/https://x.example/'), 'Jina Reader');
+  assert.equal(L.serviceOf('https://www.mojeek.com/search?q=a'), 'Mojeek');
+  assert.equal(L.serviceOf('https://other.example/'), 'other.example');
+  assert.equal(L.redactUrl('https://www.mojeek.com/search?q=a+b&api_key=SECRET&fmt=json'), 'https://www.mojeek.com/search?q=a+b&api_key=•••&fmt=json');
+  assert.equal(L.redactUrl('https://api.marginalia.nu/mykey/search/a?count=10'), 'https://api.marginalia.nu/•••/search/a?count=10');
+  assert.equal(L.redactUrl('https://api.marginalia.nu/public/search/a'), 'https://api.marginalia.nu/public/search/a');
+});

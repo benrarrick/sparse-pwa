@@ -333,3 +333,160 @@ ul.plain li {
   width: 20px;
   height: 20px;
 }
+
+/* ---------- activity log, network bar, network page ---------- */
+:root {
+  --ok: #1d7a3a;
+  --warn: #9a5b00;
+  --bad: #b3261e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ok: #7fcf95;
+    --warn: #f0b860;
+    --bad: #ff8a80;
+  }
+}
+main {
+  padding-bottom: calc(64px + env(safe-area-inset-bottom));
+}
+.bar .links {
+  display: flex;
+  gap: 16px;
+}
+.activity {
+  margin: 0 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 0.8rem;
+}
+.activity summary {
+  padding: 8px 10px;
+  cursor: pointer;
+  color: var(--muted);
+}
+.log {
+  list-style: none;
+  margin: 0;
+  padding: 0 10px 8px;
+  font:
+    0.75rem/1.45 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+  overflow-wrap: anywhere;
+}
+.log li {
+  display: flex;
+  gap: 8px;
+  padding: 2px 0;
+}
+.log .t {
+  flex: none;
+  color: var(--muted);
+  min-width: 4.2em;
+}
+.log .ok {
+  color: var(--ok);
+}
+.log .warn {
+  color: var(--warn);
+}
+.log .bad {
+  color: var(--bad);
+}
+.log .skip {
+  color: var(--muted);
+}
+.status p {
+  margin: 0 0 2px;
+}
+.data p {
+  margin: 0 0 4px;
+  color: var(--muted);
+}
+.netbar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--card);
+  border-top: 1px solid var(--line);
+  padding: 6px 16px calc(6px + env(safe-area-inset-bottom));
+  font:
+    0.72rem/1.3 ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+.netbar a {
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  color: var(--fg) !important;
+  max-width: 42rem;
+  margin: 0 auto;
+}
+.netbar #now {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.netbar #tot {
+  flex: none;
+  color: var(--muted);
+}
+table.kv,
+table.grid {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  width: 100%;
+}
+table.kv th,
+table.kv td,
+table.grid th,
+table.grid td {
+  text-align: left;
+  padding: 4px 8px 4px 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+table.kv th {
+  font-weight: 600;
+  width: 45%;
+}
+table.grid td:not(:first-child),
+table.grid th:not(:first-child) {
+  text-align: right;
+  white-space: nowrap;
+}
+table.grid {
+  font-size: 0.78rem;
+}
+table.grid td:not(:first-child),
+table.grid th:not(:first-child) {
+  padding-left: 6px;
+}
+table.grid .total td {
+  font-weight: 600;
+}
+.requests {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.8rem;
+}
+.requests li {
+  border-bottom: 1px solid var(--line);
+  padding: 4px 0;
+}
+.requests li.bad summary {
+  color: var(--bad);
+}
+.requests p {
+  margin: 4px 0;
+}
+.requests .url {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

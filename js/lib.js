@@ -161,6 +161,80 @@ export function engineOrder(settings, chosen = settings.engine) {
   return [...first, ...ENGINE_IDS.filter((id) => id !== chosen && usable(id))];
 }
 
+/** Why each engine that won't be tried is left out, for the activity log. */
+export function skippedEngines(settings, chosen = settings.engine) {
+  const order = engineOrder(settings, chosen);
+  return ENGINE_IDS.filter((id) => !order.includes(id)).map((id) => ({
+    id,
+    reason: ENGINES[id].needsKey && !settings.mojeekKey ? 'no API key in Settings' : 'fallback to other engines is off',
+  }));
+}
+
+// ---------- network figures ----------
+
+export function formatBytes(n) {
+  if (n == null || Number.isNaN(n)) return '?';
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / 1048576).toFixed(1)} MB`;
+}
+
+export function formatMs(ms) {
+  if (ms == null) return '?';
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`;
+}
+
+/** Average speed over the whole request (latency included), e.g. "12 KB/s". */
+export function formatSpeed(bytes, ms) {
+  if (bytes == null || !ms) return '?';
+  return `${formatBytes((bytes * 1000) / ms)}/s`;
+}
+
+/** Wire size text: exact when the service sent Content-Length, "≈" when estimated. */
+export function formatWire(entry) {
+  if (entry.wire == null) return 'size on the wire unknown';
+  return entry.wireKind === 'exact' ? `${formatBytes(entry.wire)} on the wire` : `≈${formatBytes(entry.wire)} on the wire`;
+}
+
+/** One line describing a finished request: status, sizes, timings and speed. */
+export function describeTransfer(e) {
+  if (e.error && e.status == null) return `${e.error} after ${formatMs(e.ms)}`;
+  const parts = [`HTTP ${e.status}`, `${formatBytes(e.received)} received`, formatWire(e), `first byte ${formatMs(e.ttfb)}`, `total ${formatMs(e.ms)}`];
+  parts.push(`≈${formatSpeed(e.wire ?? e.received, e.ms)}`);
+  return parts.join(' · ');
+}
+
+const SERVICES = {
+  'api.mwmbl.org': 'Mwmbl',
+  'api.marginalia.nu': 'Marginalia',
+  'www.mojeek.com': 'Mojeek',
+  'api.duckduckgo.com': 'DuckDuckGo answers',
+  'r.jina.ai': 'Jina Reader',
+  'api.open-meteo.com': 'Open-Meteo forecast',
+  'geocoding-api.open-meteo.com': 'Open-Meteo places',
+};
+
+export function serviceOf(url) {
+  const host = hostOf(url);
+  return SERVICES[host] ?? SERVICES[`www.${host}`] ?? host;
+}
+
+/** Removes API keys from a URL before it is shown or logged. */
+export function redactUrl(raw) {
+  try {
+    const u = new URL(raw);
+    for (const k of ['api_key', 'key', 'token']) if (u.searchParams.has(k)) u.searchParams.set(k, '•••');
+    if (u.hostname === 'api.marginalia.nu') {
+      const parts = u.pathname.split('/');
+      if (parts[1] && parts[1] !== 'public') parts[1] = '•••';
+      u.pathname = parts.join('/');
+    }
+    return decodeURI(u.href);
+  } catch {
+    return String(raw);
+  }
+}
+
 // ---------- DuckDuckGo (opened, never read) ----------
 
 /** Regions offered in settings: DuckDuckGo `kl` value per country code. */
