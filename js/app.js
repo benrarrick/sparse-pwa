@@ -975,6 +975,22 @@ async function showRead(id, raw, reload = false) {
   }
 }
 
+/** Measures env(safe-area-inset-*) and the vh units with a hidden probe element. */
+function probe(style, read) {
+  const el = h('div');
+  el.style.cssText = `position:fixed;visibility:hidden;pointer-events:none;${style}`; // CSSOM, which the CSP allows (style attributes it doesn't)
+  document.body.append(el);
+  const out = read(getComputedStyle(el), el);
+  el.remove();
+  return out;
+}
+const safeAreaInsets = () =>
+  probe('padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)', (cs) =>
+    [cs.paddingTop, cs.paddingRight, cs.paddingBottom, cs.paddingLeft].map((v) => Math.round(parseFloat(v))).join(', '),
+  );
+const viewportUnits = () =>
+  [probe('height:100vh', (_, el) => el.offsetHeight), CSS.supports('height', '100dvh') ? probe('height:100dvh', (_, el) => el.offsetHeight) : '?'].join(' / ');
+
 async function showNet(id) {
   document.title = 'Network · Sparse';
   const [est, results, pages] = await Promise.all([navigator.storage?.estimate?.().catch(() => null) ?? null, S.entries('results'), S.entries('pages')]);
@@ -1068,6 +1084,22 @@ async function showNet(id) {
         await S.kvSet('nettotals', netTotals);
         await S.kvSet('netlog', netLog);
       }),
+    ),
+    h(
+      'section',
+      null,
+      h('h2', null, 'Screen'),
+      h(
+        'table',
+        { class: 'kv' },
+        row('Running as', navigator.standalone || matchMedia('(display-mode: standalone)').matches ? 'Home-screen app' : 'Browser tab'),
+        row('Window (layout)', `${innerWidth} × ${innerHeight}`),
+        row('Visible area', visualViewport ? `${Math.round(visualViewport.width)} × ${Math.round(visualViewport.height)}` : '?'),
+        row('Screen', `${screen.width} × ${screen.height}`),
+        row('Safe-area insets (top, right, bottom, left)', safeAreaInsets()),
+        row('Page height (100vh / 100dvh)', viewportUnits()),
+      ),
+      h('p', { class: 'muted small' }, 'If parts of the screen are cut off, these numbers show what iOS reports to the page.'),
     ),
     h(
       'section',

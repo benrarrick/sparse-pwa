@@ -23,15 +23,16 @@
     <script type="module" src="js/app.js"></script>
   </head>
   <body>
+    <!-- At the top: iOS home-screen apps can cut off whatever is pinned to the bottom edge. -->
+    <nav class="navbtns" aria-label="Navigation">
+      <button type="button" id="nav-back" aria-label="Back" disabled>‹ Back</button>
+      <button type="button" id="nav-fwd" aria-label="Forward" disabled>Forward ›</button>
+      <button type="button" id="nav-home" aria-label="Home">⌂ Home</button>
+    </nav>
     <p id="offline" class="offline" hidden>Offline: showing what is saved on this device</p>
     <main id="main"><p class="status">Loading…</p></main>
     <footer class="netbar">
       <a class="line" href="#/net" aria-label="Network details"><span id="now">Starting…</span><span id="tot"></span></a>
-      <nav class="navbtns" aria-label="Navigation">
-        <button type="button" id="nav-back" aria-label="Back" disabled>‹ Back</button>
-        <button type="button" id="nav-fwd" aria-label="Forward" disabled>Forward ›</button>
-        <button type="button" id="nav-home" aria-label="Home">⌂ Home</button>
-      </nav>
     </footer>
     <noscript>Sparse needs JavaScript.</noscript>
   </body>
