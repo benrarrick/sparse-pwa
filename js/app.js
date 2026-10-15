@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '2.5';
+const APP_VERSION = '2.6';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -451,6 +451,11 @@ async function drainQueue() {
 function submitQuery(raw) {
   const q = raw.trim();
   if (!q) return;
+  const url = L.asUrl(q);
+  if (url) {
+    location.hash = hashFor('/r', { u: url });
+    return;
+  }
   if (L.hasBang(q)) {
     addHistory(q);
     setNow(`Opening DuckDuckGo for “${q}” (it handles !bangs itself)`);
@@ -465,7 +470,7 @@ function searchForm(q = '') {
     type: 'search',
     name: 'q',
     value: q,
-    placeholder: 'Search',
+    placeholder: 'Search or paste a web address',
     autocomplete: 'off',
     autocapitalize: 'off',
     spellcheck: 'false',

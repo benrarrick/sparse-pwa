@@ -401,3 +401,16 @@ test('Internet Archive snapshots', () => {
   assert.equal(L.unarchiveLink('https://b.org/x', orig), 'https://b.org/x');
   assert.equal(L.serviceOf('https://archive.org/wayback/available?url=x'), 'Internet Archive');
 });
+
+test('asUrl turns pasted addresses into reader URLs and leaves searches alone', () => {
+  assert.equal(L.asUrl('https://a.example/x?y=1'), 'https://a.example/x?y=1');
+  assert.equal(L.asUrl('  http://a.example '), 'http://a.example/');
+  assert.equal(L.asUrl('example.com'), 'https://example.com/');
+  assert.equal(L.asUrl('www.foo.bar/baz'), 'https://www.foo.bar/baz');
+  assert.equal(L.asUrl('en.wikipedia.org/wiki/Lisbon'), 'https://en.wikipedia.org/wiki/Lisbon');
+  assert.equal(L.asUrl('paris weather'), null);
+  assert.equal(L.asUrl('node.js'), null);
+  assert.equal(L.asUrl('javascript:alert(1)'), null);
+  assert.equal(L.asUrl('ftp://a.example'), null);
+  assert.equal(L.asUrl('e.g.'), null);
+});

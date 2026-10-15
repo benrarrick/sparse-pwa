@@ -296,6 +296,21 @@ export const REGIONS = {
 const DDG_KL = { us: 'us-en', gb: 'uk-en', ca: 'ca-en', au: 'au-en', ie: 'ie-en', de: 'de-de', fr: 'fr-fr', nl: 'nl-nl', es: 'es-es', it: 'it-it' };
 
 /** True when the query has a DuckDuckGo !bang (e.g. `!w paris`, `maps !g`). */
+const COMMON_TLDS = /\.(?:com|org|net|edu|gov|io|co|uk|dev|app|info|wiki|news|me|us|ca|au|de|fr|eu)(?::\d+)?(?:[/?#]|$)/i;
+
+/** A pasted web address → an http(s) URL to open in the reader, or null if it is a search. */
+export function asUrl(q) {
+  const t = q.trim();
+  if (!t || /\s/.test(t)) return null;
+  if (/^https?:\/\//i.test(t)) return safeHttpUrl(t);
+  if (/^[a-z][a-z0-9+.-]*:/i.test(t) && !/^[^/:]+:\d+/.test(t)) return null;
+  if (/^(?:www\.|[a-z0-9-]+(?:\.[a-z0-9-]+)*\/)/i.test(t) || COMMON_TLDS.test(t.split('/')[0] + (t.includes('/') ? '/' : ''))) {
+    if (!/^[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d+)?(?:[/?#]|$)/i.test(t)) return null;
+    return safeHttpUrl(`https://${t}`);
+  }
+  return null;
+}
+
 export function hasBang(q) {
   return /(^|\s)![a-z0-9]/i.test(q);
 }
