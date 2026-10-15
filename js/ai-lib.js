@@ -145,8 +145,12 @@ export function pickVariant(pkg, gpu) {
 /** Prompt-size limits to choose from. On a test iPhone, 338-token prompts worked and ~650 ended the app. */
 export const PROMPT_LIMITS = [300, 450, 600, 900, 2000];
 
-/** Characters of page or saved text that fit a prompt of `maxPrompt` tokens (about 3.2 a token, less the instructions). */
-export const textBudget = (maxPrompt) => Math.max(400, Math.round((maxPrompt - 110) * 3.2));
+/**
+ * Characters of page or saved text that fit a prompt of `maxPrompt` tokens. English runs about
+ * 3–4 characters a token, but names, numbers and markup run denser, so this assumes 2.8, less
+ * 130 tokens of instructions. Summary parts are also trimmed to fit by the engine, which counts exactly.
+ */
+export const textBudget = (maxPrompt) => Math.max(300, Math.round((maxPrompt - 130) * 2.8));
 
 /** How many part-notes (about 60 tokens each) the final summary prompt can hold. */
 export const maxParts = (maxPrompt) => Math.max(2, Math.floor((maxPrompt - 110) / 60));

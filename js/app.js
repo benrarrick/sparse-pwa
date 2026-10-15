@@ -1175,7 +1175,7 @@ const loadNote = (p) => (p.total ? `${Math.round((100 * p.loaded) / p.total)}% o
  * Loads a chat model and streams its reply into `out`, narrating in `status` and the activity log.
  * Resolves with { text, stats }, or null if it failed (the reason is shown and logged).
  */
-async function runModel(pkg, messages, { out, status, act, id, maxTokens, label, sources }) {
+async function runModel(pkg, messages, { out, status, act, id, maxTokens, label, sources, fit = false }) {
   const short = AL.PACKAGES[pkg].short;
   const stopBtn = h('button', { type: 'button', class: 'link', onclick: () => AI.stop() }, 'Stop');
   try {
@@ -1192,6 +1192,7 @@ async function runModel(pkg, messages, { out, status, act, id, maxTokens, label,
       maxTokens,
       label,
       maxPrompt: settings.aiPromptLimit,
+      fit,
       onToken: (t) => {
         text += t;
         if (id === renderId) fill(out, answerNodes(text, sources));
@@ -1252,7 +1253,7 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
       const scratch = h('div');
       const pStatus = h('span');
       fill(out, h('p', { class: 'muted' }, `Reading part ${i + 1} of ${parts.length}… `, pStatus));
-      const n = await runModel(pkg, AL.partMessages(rec.title, part, i + 1, parts.length), { out: scratch, status: pStatus, act, id, maxTokens: 60, label: `summary part ${i + 1}/${parts.length}` });
+      const n = await runModel(pkg, AL.partMessages(rec.title, part, i + 1, parts.length), { out: scratch, status: pStatus, act, id, maxTokens: 60, label: `summary part ${i + 1}/${parts.length}`, fit: true });
       if (!n) return fill(status, pStatus.childNodes.length ? [...pStatus.childNodes] : 'The AI failed.');
       if (n.stats.stopped) return fill(status, 'Stopped.');
       notes.push(n.text);
@@ -1260,7 +1261,7 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
     messages = AL.combineMessages(rec.title, notes);
     fill(out);
   }
-  const r = await runModel(pkg, messages, { out, status, act, id, maxTokens: 320, label: 'summary' });
+  const r = await runModel(pkg, messages, { out, status, act, id, maxTokens: 320, label: 'summary', fit: true });
   if (r?.text.trim() && !r.stats.stopped) {
     await AI.saveSummary(url, pkg, { text: r.text, at: Date.now(), stats: r.stats, cut: t.cut, chars: t.text.length, of: t.of });
     act.ok('Summary kept on this device with the page');
@@ -1676,7 +1677,7 @@ async function showAsk(id, q0) {
       fill(status, 'Searching what is saved on this device…');
       let found;
       try {
-        found = await AI.retrieve(question, { budget: AL.textBudget(settings.aiPromptLimit) - question.length, max: 4, say: (k, t) => act[k](t) });
+        found = await AI.retrieve(question, { budget: Math.round(AL.textBudget(settings.aiPromptLimit) * 0.7) - question.length, max: 4, say: (k, t) => act[k](t) });
       } catch (e) {
         act.warn(`Search of saved pages failed: ${e.message}`);
         return fill(status, h('span', { class: 'bad' }, `Searching saved pages failed: ${e.message}. `), h('a', { href: '#/ai' }, 'AI diagnostics'));

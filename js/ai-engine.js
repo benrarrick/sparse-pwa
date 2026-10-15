@@ -135,17 +135,31 @@ export function createEngine(post) {
     post({ type: 'loaded', pkg, ...info });
   }
 
-  async function generate({ id, pkg, messages, maxTokens = 400, maxPrompt = null }) {
-    const m = models.get(pkg);
-    if (!m) throw new Error(`${PACKAGES[pkg]?.short ?? pkg} is not loaded`);
-    const tok = m.pipe.tokenizer;
-    let promptTokens = null;
+  function countTokens(tok, messages) {
     try {
       const ids = tok.apply_chat_template(messages, { add_generation_prompt: true, tokenize: true, return_tensor: false });
       const flat = ids?.input_ids ?? ids;
-      promptTokens = Array.isArray(flat) ? (Array.isArray(flat[0]) ? flat[0].length : flat.length) : (flat?.dims?.at(-1) ?? null);
+      return Array.isArray(flat) ? (Array.isArray(flat[0]) ? flat[0].length : flat.length) : (flat?.dims?.at(-1) ?? null);
     } catch (e) {
       log('warn', `Could not count the prompt's tokens: ${e?.message ?? e}`);
+      return null;
+    }
+  }
+
+  async function generate({ id, pkg, messages, maxTokens = 400, maxPrompt = null, fit = false }) {
+    const m = models.get(pkg);
+    if (!m) throw new Error(`${PACKAGES[pkg]?.short ?? pkg} is not loaded`);
+    const tok = m.pipe.tokenizer;
+    let promptTokens = countTokens(tok, messages);
+    // `fit`: the end of the last message may be cut to fit the limit (summary parts, where losing
+    // a few words at the end of a part is harmless). Counted exactly, with the model's tokenizer.
+    for (let i = 0; fit && maxPrompt && promptTokens > maxPrompt && i < 4; i++) {
+      const last = messages[messages.length - 1];
+      const keep = Math.floor(last.content.length * (maxPrompt / promptTokens) * 0.97);
+      const before = promptTokens;
+      messages = [...messages.slice(0, -1), { ...last, content: last.content.slice(0, keep) }];
+      promptTokens = countTokens(tok, messages);
+      log('info', `Trimmed the end of the text to fit the ${maxPrompt}-token limit (${before} → ${promptTokens} tokens)`);
     }
     // A prompt over the limit is refused here: on iOS, running it would end the whole app.
     if (maxPrompt && promptTokens > maxPrompt)
