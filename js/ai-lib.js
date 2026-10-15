@@ -142,6 +142,15 @@ export function pickVariant(pkg, gpu) {
   return { dtype: pkg.cpu, device: pkg.cpu ? 'wasm' : null };
 }
 
+/** Prompt-size limits to choose from. On a test iPhone, 338-token prompts worked and ~650 ended the app. */
+export const PROMPT_LIMITS = [300, 450, 600, 900, 2000];
+
+/** Characters of page or saved text that fit a prompt of `maxPrompt` tokens (about 3.2 a token, less the instructions). */
+export const textBudget = (maxPrompt) => Math.max(400, Math.round((maxPrompt - 110) * 3.2));
+
+/** How many part-notes (about 60 tokens each) the final summary prompt can hold. */
+export const maxParts = (maxPrompt) => Math.max(2, Math.floor((maxPrompt - 110) / 60));
+
 /** How many external weight files a variant has (Transformers.js must be told for some exports). */
 export const dataChunks = (pkg, dtype) => (pkg.variants?.[dtype] ?? []).filter(([path]) => /\.onnx_data(_\d+)?$/.test(path)).length;
 

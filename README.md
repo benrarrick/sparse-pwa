@@ -45,7 +45,7 @@ Without WebGPU, the 1.2B model downloads its 8-bit CPU version (1.5 GB, slow) an
 
 What it does:
 
-1. **Summarise:** a button on every reader page, or automatically when a page loads (setting). It summarises up to the first 12,000 characters. Pages longer than 2,400 characters are read in parts: short notes on each, then a summary of the notes. Summaries are kept with the page.
+1. **Summarise:** a button on every reader page, or automatically when a page loads (setting). Long pages are read in parts sized to the prompt limit: short notes on each, then a summary of the notes. Summaries are kept with the page.
 2. **Ask, from saved pages and searches** (`#/ask`): passages from pages read in the reader and from search results are matched by keyword (BM25), and by meaning when BGE is downloaded. The two lists are combined, and the model answers from the best few, citing them as [1], [2], linking to the saved copies. Without a chat model, the matching passages are shown.
 3. **Ask, from the model's own knowledge:** no sources, labelled as possibly wrong (training data to mid-2024).
 
@@ -64,7 +64,10 @@ Files: `js/ai.js` (page side: downloads, worker, log, retrieval), `js/ai-engine.
 
 **Memory on iPhone:**
 - These exports compute a score for every word in the 65,536-word vocabulary at every prompt position. A 3,000-token prompt therefore needs about 0.4–0.8 GB beyond the 764 MB of weights, and iOS ended the app.
-- So prompts are kept to about 600–700 tokens: summaries are made in parts, and answers use about 2,500 characters of saved text.
+- On the test iPhone, 338-token prompts worked, and prompts of about 650 tokens ended the app, even after splitting summaries into parts.
+- So there is a **Longest prompt** setting on the AI page (default 450 tokens). Summary parts and the saved text used for answers are sized to fit it.
+- The engine refuses any prompt over the limit with a message, rather than letting iOS end the app.
+- At 450 tokens, a summary covers the first ~5,400 characters of a page, in 5 parts of ~1,100 characters each.
 - After any prompt over 900 tokens, the model is unloaded to give the memory back. Reloading takes about 3 s.
 
 **Measured on an iPhone, WebGPU with 16-bit floats:**

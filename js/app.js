@@ -30,6 +30,7 @@ const DEFAULTS = {
   weatherDetail: 'basic',
   aiModel: 'lfm12',
   aiAutoSummary: false,
+  aiMaxPrompt: 450,
 };
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -1190,6 +1191,7 @@ async function runModel(pkg, messages, { out, status, act, id, maxTokens, label,
     const stats = await AI.generate(pkg, messages, {
       maxTokens,
       label,
+      maxPrompt: settings.aiMaxPrompt,
       onToken: (t) => {
         text += t;
         if (id === renderId) fill(out, answerNodes(text, sources));
@@ -1228,7 +1230,9 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
   box.hidden = false;
   fill(box, head, out, status);
   const text = AL.markdownToText(rec.markdown);
-  const t = AL.trimText(text, spec.maxInputChars);
+  const partChars = AL.textBudget(settings.aiMaxPrompt);
+  // Long pages are read in parts sized to the prompt limit; only as many as the final prompt can combine.
+  const t = AL.trimText(text, Math.min(spec.maxInputChars, partChars * AL.maxParts(settings.aiMaxPrompt)));
   if (text.length < 200) {
     fill(status, 'There is too little text on this page to summarise.');
     return act.skip('Summary: too little text on the page');
@@ -1237,10 +1241,10 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
     `${auto ? 'Summarising automatically (Settings)' : 'Summarising'} with ${spec.short} on this device: ${t.cut ? `the first ${t.text.length.toLocaleString()} of ${t.of.toLocaleString()} characters` : `${t.text.length.toLocaleString()} characters`}. Nothing is sent anywhere.`,
   );
   let messages = AL.summaryMessages(rec.title, t.text);
-  if (t.text.length > spec.partChars) {
+  if (t.text.length > partChars) {
     // Long pages: short notes on each part, then a summary of the notes, so no prompt is long
     // enough to need more memory than iOS allows.
-    const parts = AL.passages(t.text, spec.partChars);
+    const parts = AL.passages(t.text, partChars);
     act.step(`The page is long, so it is read in ${parts.length} parts: notes on each, then a summary of the notes`);
     const notes = [];
     for (const [i, part] of parts.entries()) {
@@ -1248,7 +1252,7 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
       const scratch = h('div');
       const pStatus = h('span');
       fill(out, h('p', { class: 'muted' }, `Reading part ${i + 1} of ${parts.length}… `, pStatus));
-      const n = await runModel(pkg, AL.partMessages(rec.title, part, i + 1, parts.length), { out: scratch, status: pStatus, act, id, maxTokens: 120, label: `summary part ${i + 1}/${parts.length}` });
+      const n = await runModel(pkg, AL.partMessages(rec.title, part, i + 1, parts.length), { out: scratch, status: pStatus, act, id, maxTokens: 60, label: `summary part ${i + 1}/${parts.length}` });
       if (!n) return fill(status, pStatus.childNodes.length ? [...pStatus.childNodes] : 'The AI failed.');
       if (n.stats.stopped) return fill(status, 'Stopped.');
       notes.push(n.text);
@@ -1672,7 +1676,7 @@ async function showAsk(id, q0) {
       fill(status, 'Searching what is saved on this device…');
       let found;
       try {
-        found = await AI.retrieve(question, { budget: use ? AL.PACKAGES[use].contextChars : 6000, say: (k, t) => act[k](t) });
+        found = await AI.retrieve(question, { budget: AL.textBudget(settings.aiMaxPrompt) - question.length, max: 4, say: (k, t) => act[k](t) });
       } catch (e) {
         act.warn(`Search of saved pages failed: ${e.message}`);
         return fill(status, h('span', { class: 'bad' }, `Searching saved pages failed: ${e.message}. `), h('a', { href: '#/ai' }, 'AI diagnostics'));
@@ -1916,6 +1920,24 @@ async function showAI(id) {
             })(),
           )
         : null,
+      h(
+        'label',
+        { class: 'field' },
+        h('span', null, 'Longest prompt'),
+        (() => {
+          const s = h(
+            'select',
+            { onchange: () => saveSetting('aiMaxPrompt', Number(s.value)) },
+            AL.PROMPT_LIMITS.map((n) => h('option', { value: String(n), selected: settings.aiMaxPrompt === n }, `${n} tokens (about ${AL.textBudget(n).toLocaleString()} characters of text)`)),
+          );
+          return s;
+        })(),
+        h(
+          'small',
+          { class: 'muted' },
+          'Longer prompts need more memory: the model scores its whole vocabulary at every word of the prompt. On a test iPhone, 338 tokens worked and about 650 ended the app. Long pages are summarised in parts of this size, and answers use this much saved text. Raise it to find what this device can handle; a crash shows up in the log.',
+        ),
+      ),
       h(
         'label',
         { class: 'field check' },

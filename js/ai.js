@@ -334,7 +334,7 @@ export async function unload(id) {
 }
 
 /** Writes a reply. Calls onToken with each new piece of text; resolves with the run's figures. */
-export async function generate(id, messages, { maxTokens = 400, onToken, label = 'run' } = {}) {
+export async function generate(id, messages, { maxTokens = 400, onToken, label = 'run', maxPrompt = null } = {}) {
   await ensureLoaded(id);
   const key = `g${++seq}`;
   current = key;
@@ -350,7 +350,7 @@ export async function generate(id, messages, { maxTokens = 400, onToken, label =
   try {
     const { stats } = await request(
       key,
-      { type: 'generate', id: key, pkg: id, messages, maxTokens },
+      { type: 'generate', id: key, pkg: id, messages, maxTokens, maxPrompt },
       {
         token: (t) => {
           last = Date.now();

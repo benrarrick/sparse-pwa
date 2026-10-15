@@ -135,7 +135,7 @@ export function createEngine(post) {
     post({ type: 'loaded', pkg, ...info });
   }
 
-  async function generate({ id, pkg, messages, maxTokens = 400 }) {
+  async function generate({ id, pkg, messages, maxTokens = 400, maxPrompt = null }) {
     const m = models.get(pkg);
     if (!m) throw new Error(`${PACKAGES[pkg]?.short ?? pkg} is not loaded`);
     const tok = m.pipe.tokenizer;
@@ -147,6 +147,9 @@ export function createEngine(post) {
     } catch (e) {
       log('warn', `Could not count the prompt's tokens: ${e?.message ?? e}`);
     }
+    // A prompt over the limit is refused here: on iOS, running it would end the whole app.
+    if (maxPrompt && promptTokens > maxPrompt)
+      throw new Error(`The prompt is ${promptTokens} tokens, over the ${maxPrompt}-token limit set on the AI page, so it was not run`);
     const stopper = new T.InterruptableStoppingCriteria();
     stoppers.set(id, stopper);
     let tokens = 0;
