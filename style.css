@@ -1,0 +1,335 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --line: #e3e3e3;
+  --card: #f5f5f3;
+  --link: #1a4fd6;
+  --visited: #6b3fb3;
+  --url: #1d7a3a;
+  --accent: #1a1a1a;
+  --accent-fg: #ffffff;
+  --warn-bg: #fff4d6;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111111;
+    --fg: #e8e8e8;
+    --muted: #9a9a9a;
+    --line: #2c2c2c;
+    --card: #1c1c1c;
+    --link: #8ab4ff;
+    --visited: #c3a6ff;
+    --url: #7fcf95;
+    --accent: #e8e8e8;
+    --accent-fg: #111111;
+    --warn-bg: #3a3014;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+html {
+  -webkit-text-size-adjust: 100%;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font:
+    17px/1.5 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    system-ui,
+    sans-serif;
+}
+main {
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 0 16px calc(32px + env(safe-area-inset-bottom));
+}
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+a:visited {
+  color: var(--visited);
+}
+h1 {
+  font-size: 1.5rem;
+  line-height: 1.25;
+  margin: 0.5rem 0;
+}
+h2 {
+  font-size: 1.05rem;
+  margin: 1.5rem 0 0.5rem;
+}
+code,
+pre {
+  font:
+    0.9em ui-monospace,
+    SFMono-Regular,
+    Menlo,
+    monospace;
+}
+.small {
+  font-size: 0.85rem;
+}
+.muted {
+  color: var(--muted);
+}
+.block {
+  display: block;
+}
+[hidden] {
+  display: none !important;
+}
+
+.offline {
+  margin: 0;
+  padding: 6px 16px;
+  background: var(--warn-bg);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+}
+.bar .brand {
+  font-weight: 700;
+  color: var(--fg);
+  flex: none;
+}
+.bar > :last-child {
+  margin-left: auto;
+}
+.bar .search {
+  flex: 1;
+  margin: 0;
+}
+
+.search {
+  display: flex;
+  gap: 8px;
+  margin: 8px 0;
+}
+.search input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 16px; /* 16px stops iOS zooming in on focus */
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--card);
+  color: var(--fg);
+  -webkit-appearance: none;
+  appearance: none;
+}
+.search button,
+.button {
+  font: inherit;
+  font-size: 16px;
+  padding: 9px 14px;
+  border: 0;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--accent-fg) !important;
+  display: inline-block;
+}
+.bar .search button {
+  display: none; /* the keyboard's Search key submits */
+}
+button.link {
+  font: inherit;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--link);
+  cursor: pointer;
+}
+
+.status {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 4px 0 12px;
+}
+
+.results {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.results li {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+.results .hit {
+  display: block;
+}
+.results .title {
+  display: block;
+  font-size: 1.05rem;
+  line-height: 1.3;
+}
+.results .url {
+  display: block;
+  color: var(--url);
+  font-size: 0.8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.results p {
+  margin: 4px 0 2px;
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+.results .ext {
+  color: var(--muted);
+}
+
+.more {
+  margin: 16px 0;
+}
+
+.card {
+  background: var(--card);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin: 0 0 12px;
+}
+.card h2 {
+  margin: 0 0 4px;
+}
+.card p {
+  margin: 0 0 6px;
+  font-size: 0.95rem;
+}
+.weather .big {
+  font-size: 1.6rem;
+  margin: 0;
+}
+.weather .big span {
+  font-size: 1rem;
+}
+.days {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.days td {
+  padding: 3px 6px 3px 0;
+}
+
+ul.plain {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 8px;
+}
+ul.plain li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.reader {
+  overflow-wrap: anywhere;
+}
+.reader p,
+.reader li {
+  line-height: 1.6;
+}
+.reader .actions {
+  margin: 0 0 16px;
+}
+.reader ul,
+.reader ol {
+  padding-left: 1.4em;
+}
+.reader li.d1 {
+  margin-left: 1em;
+}
+.reader li.d2 {
+  margin-left: 2em;
+}
+.reader li.d3 {
+  margin-left: 3em;
+}
+.reader blockquote {
+  margin: 1em 0;
+  padding-left: 12px;
+  border-left: 3px solid var(--line);
+  color: var(--muted);
+}
+.reader pre {
+  background: var(--card);
+  padding: 10px;
+  border-radius: 8px;
+  overflow-x: auto;
+  white-space: pre;
+}
+.reader .table {
+  overflow-x: auto;
+}
+.reader table {
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+.reader td {
+  border: 1px solid var(--line);
+  padding: 4px 6px;
+  vertical-align: top;
+}
+.reader hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.field {
+  display: block;
+  margin: 0 0 14px;
+}
+.field > span {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.field input[type='text'],
+.field select {
+  width: 100%;
+  font: inherit;
+  font-size: 16px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--fg);
+}
+.field small {
+  display: block;
+  margin-top: 4px;
+}
+.field.check {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  align-items: center;
+}
+.field.check > span {
+  margin: 0;
+  font-weight: 400;
+}
+.field.check small {
+  grid-column: 2;
+}
+.field.check input {
+  width: 20px;
+  height: 20px;
+}

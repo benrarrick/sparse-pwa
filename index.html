@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self' https://api.marginalia.nu https://api.mwmbl.org https://www.mojeek.com https://api.duckduckgo.com https://r.jina.ai https://api.open-meteo.com https://geocoding-api.open-meteo.com; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <title>Sparse</title>
+    <meta name="description" content="A light search app that works on slow connections and offline." />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Sparse" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#111111" media="(prefers-color-scheme: dark)" />
+    <link rel="stylesheet" href="style.css" />
+    <script type="module" src="js/app.js"></script>
+  </head>
+  <body>
+    <p id="offline" class="offline" hidden>Offline: showing what is saved on this device</p>
+    <main id="main"><p class="status">Loading…</p></main>
+    <noscript>Sparse needs JavaScript.</noscript>
+  </body>
+</html>
