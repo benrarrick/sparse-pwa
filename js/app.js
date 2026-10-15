@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '2.4';
+const APP_VERSION = '2.5';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -559,6 +559,28 @@ function appLoadText() {
 
 // ---------- views ----------
 
+/** A weather button for the home page. Nothing is downloaded until it is tapped. */
+function homeWeather(id) {
+  const unit = L.resolveUnit(settings.units, navigator.language);
+  const box = h('div', { class: 'home-weather' });
+  const btn = h('button', { type: 'button', class: 'button secondary small' }, 'Weather here');
+  const note = h('span', { class: 'muted small' }, 'uses your location · about 0.5 KB');
+  S.get('results', `wx2||${unit}`).then((rec) => {
+    if (rec && Date.now() - rec.at <= WEATHER_FRESH) note.textContent = `saved ${L.relTime(rec.at)}, 0 B`;
+  });
+  const prompt = h('p', { class: 'wx-actions' }, btn, ' ', note);
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const act = activity('Weather');
+    box.prepend(act.el);
+    prompt.remove();
+    await showWeather(box, '', id, act);
+    act.finish('Weather');
+  });
+  box.append(prompt);
+  return box;
+}
+
 async function showHome(id) {
   document.title = 'Sparse';
   const [history, queue, ready, pages] = await Promise.all([S.kvGet('history', []), S.kvGet('queue', []), S.kvGet('ready', []), S.entries('pages')]);
@@ -598,6 +620,7 @@ async function showHome(id) {
       h('code', null, '!bang'),
       ' to search on DuckDuckGo',
     ),
+    homeWeather(id),
     h('p', { class: 'muted small', id: 'version' }, `Sparse v${APP_VERSION}`),
     h(
       'section',
