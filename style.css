@@ -199,6 +199,10 @@ button.link {
   font-size: 0.92rem;
   overflow-wrap: anywhere;
 }
+.results .meta {
+  margin: 2px 0 0;
+  color: var(--muted);
+}
 .results .ext {
   color: var(--muted);
 }

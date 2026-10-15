@@ -68,6 +68,21 @@ export function relTime(at, now = Date.now()) {
   return `${Math.round(s / 86400)} d ago`;
 }
 
+/**
+ * A date from an API field: Unix seconds or milliseconds, or a date string. Returns epoch ms, or
+ * null for missing, zero or implausible values (before 1991 or more than a day in the future).
+ */
+export function parseApiDate(v, now = Date.now()) {
+  if (v == null || v === '' || v === 0 || v === '0') return null;
+  let ms;
+  if (typeof v === 'number' || /^\d+$/.test(String(v).trim())) {
+    const n = Number(v);
+    ms = n < 1e11 ? n * 1000 : n;
+  } else ms = Date.parse(String(v));
+  if (!Number.isFinite(ms) || ms < Date.UTC(1991, 0, 1) || ms > now + 86400000) return null;
+  return ms;
+}
+
 // ---------- search engines ----------
 
 export class EngineError extends Error {}
@@ -100,7 +115,7 @@ export const ENGINES = {
     needsKey: true,
     paid: true, // only used when asked for explicitly (the "Try Mojeek" button), never by default or as a fallback
     url({ q, page = 1, mojeekKey, safe, region }) {
-      const p = new URLSearchParams({ q, fmt: 'json', api_key: mojeekKey ?? '', t: '10', s: String((page - 1) * 10 + 1) });
+      const p = new URLSearchParams({ q, fmt: 'json', api_key: mojeekKey ?? '', t: '10', s: String((page - 1) * 10 + 1), date: '1' });
       if (safe) p.set('safe', '1');
       if (region) {
         p.set('rb', region.toUpperCase());
@@ -111,7 +126,14 @@ export const ENGINES = {
     parse(json) {
       const r = json?.response;
       if (!r || r.status !== 'OK') throw new EngineError(r?.status || 'unexpected response');
-      const results = tidy((r.results ?? []).map((x) => ({ url: x.url, title: clean(x.title), snippet: plain(x.desc) })));
+      const results = tidy(
+        (r.results ?? []).map((x) => {
+          const published = parseApiDate(x.pdate);
+          const modified = parseApiDate(x.timestamp) ?? parseApiDate(x.date);
+          const date = published ? { at: published, kind: 'published' } : modified ? { at: modified, kind: 'updated' } : null;
+          return { url: x.url, title: clean(x.title), snippet: plain(x.desc), ...(date && { date }) };
+        }),
+      );
       const start = Number(r.head?.start ?? 1);
       const total = Number(r.head?.results ?? 0);
       return { results, more: results.length > 0 && start + results.length - 1 < total };

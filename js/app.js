@@ -722,11 +722,17 @@ async function showSearch(id, q, page, engineParam, force = false) {
             h('span', { class: 'title' }, r.title),
             h('span', { class: 'url' }, L.displayUrl(r.url)),
           ),
+          h(
+            'p',
+            { class: 'meta small', 'data-url': r.url, hidden: !r.date },
+            r.date ? `${r.date.kind === 'published' ? 'Published' : 'Updated'} ${formatDate(r.date.at)} (from ${name})` : null,
+          ),
           r.snippet.length ? h('p', null, snippetNodes(r.snippet)) : null,
           settings.openIn === 'reader' ? external(r.url, 'Open site ↗', 'ext small') : null,
         ),
       ),
     );
+    addSavedDates(list, id);
     const others = L.FREE_ENGINE_IDS.filter((e) => e !== rec.engine);
     if (rec.engine !== 'mojeek' && L.canTryMojeek(settings)) status.append(tryMojeek());
     fill(
@@ -887,6 +893,20 @@ async function showWeather(container, place, id, act) {
     ),
     h('p', { class: 'muted small' }, `Wind ${f.now.wind} ${f.wind} · Open-Meteo, updated ${L.relTime(rec.at)} · ${amount(rec.net)}`),
   );
+}
+
+/**
+ * Free engines send no dates, but pages already opened in the reader have one from Jina, stored
+ * on this device. Fills those in without downloading anything.
+ */
+async function addSavedDates(list, id) {
+  for (const el of list.querySelectorAll('p.meta[hidden]')) {
+    const page = await S.get('pages', el.dataset.url);
+    if (id !== renderId) return;
+    if (!page?.published || Number.isNaN(new Date(page.published).getTime())) continue;
+    el.textContent = `Published ${formatDate(page.published)} (from your saved copy)`;
+    el.hidden = false;
+  }
 }
 
 function formatDate(raw) {

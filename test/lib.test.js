@@ -44,6 +44,26 @@ test('Mojeek: URL and parsing', () => {
   assert.throws(() => L.ENGINES.mojeek.parse({ response: { status: 'Access Denied: invalid key/password', results: [] } }), /invalid key/);
 });
 
+test('Mojeek dates', () => {
+  assert.equal(new URL(L.ENGINES.mojeek.url({ q: 'a', mojeekKey: 'K' })).searchParams.get('date'), '1');
+  const json = (fields) => ({ response: { status: 'OK', head: {}, results: [{ url: 'https://a.example/', title: 't', desc: 'd', ...fields }] } });
+  assert.deepEqual(L.ENGINES.mojeek.parse(json({ timestamp: 1700000000 })).results[0].date, { at: 1700000000000, kind: 'updated' });
+  assert.deepEqual(L.ENGINES.mojeek.parse(json({ timestamp: 1700000000, pdate: 1600000000 })).results[0].date, { at: 1600000000000, kind: 'published' });
+  assert.equal(L.ENGINES.mojeek.parse(json({ timestamp: 0 })).results[0].date, undefined);
+});
+
+test('parseApiDate', () => {
+  const now = Date.UTC(2026, 9, 15);
+  assert.equal(L.parseApiDate(1700000000, now), 1700000000000);
+  assert.equal(L.parseApiDate('1700000000', now), 1700000000000);
+  assert.equal(L.parseApiDate(1700000000000, now), 1700000000000);
+  assert.equal(L.parseApiDate('2024-03-03', now), Date.UTC(2024, 2, 3));
+  assert.equal(L.parseApiDate('Sun, 03 Mar 2024 10:00:00 GMT', now), Date.UTC(2024, 2, 3, 10));
+  assert.equal(L.parseApiDate(0, now), null);
+  assert.equal(L.parseApiDate('garbage', now), null);
+  assert.equal(L.parseApiDate(Date.UTC(2030, 0, 1) / 1000, now), null);
+});
+
 test('Marginalia: URL and parsing', () => {
   assert.equal(L.ENGINES.marginalia.url({ q: 'a/b c', page: 3, marginaliaKey: '' }), 'https://api.marginalia.nu/public/search/a%2Fb%20c?count=10&page=3');
   const out = L.ENGINES.marginalia.parse({
