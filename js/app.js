@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '2.0';
+const APP_VERSION = '2.1';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -2096,7 +2096,7 @@ async function showAI(id) {
     h('h2', null, 'Status now'),
     statusBox,
     h('h2', null, 'Models'),
-    ['lfm350', 'lfm230', 'bge', 'lfm12', 'lfm26', 'engine'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
+    ['lfm350', 'lfm230', 'bge', 'lfm12', 'llama32', 'lfm26', 'engine', 'webllm'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
     h(
       'section',
       null,

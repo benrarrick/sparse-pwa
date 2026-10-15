@@ -63,6 +63,13 @@ export const SAFETY = {
     mobile: { status: 'experimental', backends: ['webgpu'], ...lim(300, 128, 380, 120_000, { retainMs: 60_000 }) },
     desktop: { status: 'experimental', backends: ['webgpu', 'wasm'], ...lim(900, 300, 1100, 240_000, { retainMs: 600_000 }) },
   },
+  // WebLLM, never tried on a phone: experimental (opt-in) with small limits. The context window WebLLM reserves is
+  // 1024 tokens on phones (ai-lib.js), above maxTotal, so a run cannot outgrow it.
+  llama32: {
+    ios: { status: 'experimental', backends: ['webgpu'], ...lim(400, 128, 500, 150_000, { retainMs: 60_000 }) },
+    mobile: { status: 'experimental', backends: ['webgpu'], ...lim(400, 128, 500, 150_000, { retainMs: 60_000 }) },
+    desktop: { status: 'experimental', backends: ['webgpu'], ...lim(900, 300, 1100, 240_000, { retainMs: 600_000 }) },
+  },
   lfm26: {
     ios: { status: 'unsupported', why: 'iOS ended the app while this model was loading on a test iPhone' },
     mobile: { status: 'unsupported', why: 'too large for a phone' },

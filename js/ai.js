@@ -635,7 +635,7 @@ function touch() {
 
 function preflight(id, kind) {
   const spec = P[id];
-  if (!ready.has(id) || recs.get('engine')?.status !== 'ready') throw new AiError('MODEL_NOT_INSTALLED', `${spec.short} is not downloaded. Download it on the AI page.`, { pkg: id });
+  if (!ready.has(id) || recs.get(spec.needs ?? 'engine')?.status !== 'ready') throw new AiError('MODEL_NOT_INSTALLED', `${spec.short} is not downloaded. Download it on the AI page.`, { pkg: id });
   const rec = recs.get(id);
   if (rec.device === 'wasm' && rec.dtype !== spec.cpu) throw new AiError('MODEL_INCOMPATIBLE', `The downloaded ${rec.dtype} weights can't run on the CPU. Remove ${spec.short} and download it again.`, { pkg: id });
   const r = mayRun(id);
@@ -949,7 +949,7 @@ export const queued = () => [...queue];
 /** Downloads a package (and the engine first, if it isn't on the device yet). */
 export async function download(id) {
   persist = true;
-  const ids = id === 'engine' ? ['engine'] : ['engine', id];
+  const ids = AL.ENGINE_IDS.includes(id) ? [id] : [P[id].needs ?? 'engine', id];
   for (const x of ids) {
     const r = await state(x);
     if (r.status === 'ready' || queue.includes(x) || job?.id === x) continue;
@@ -996,7 +996,12 @@ async function run(j) {
     const d = await device();
     const v = AL.pickVariant(spec, usableGpu(d));
     if (!v.dtype) {
-      Object.assign(rec, { status: 'failed', error: `${spec.short} needs WebGPU, which this browser doesn't offer${d.gpu.why ? ` (${d.gpu.why})` : d.gpu.fallback ? ' (only a software version)' : ''}.` });
+      Object.assign(rec, {
+        status: 'failed',
+        error: spec.runtime === 'webllm' && d.gpu.gpu && !d.gpu.fallback
+          ? `${spec.short} needs WebGPU with 16-bit floats (shader-f16), which this browser's GPU doesn't offer.`
+          : `${spec.short} needs WebGPU, which this browser doesn't offer${d.gpu.why ? ` (${d.gpu.why})` : d.gpu.fallback ? ' (only a software version)' : ''}.`,
+      });
       await save(rec);
       await log('error', 'download', rec.error, { pkg: id });
       return;
@@ -1053,7 +1058,8 @@ async function run(j) {
   };
 
   try {
-    for (const f of files) {
+    if (spec.runtime === 'webllm') await fetchWebllm(j, id, spec, rec);
+    for (const f of spec.runtime === 'webllm' ? [] : files) {
       let fr = recs[f.path];
       if (fr.done && fr.size === f.size) continue;
       if (fr.size !== f.size || (fr.have && !f.resume)) {
@@ -1115,7 +1121,47 @@ async function run(j) {
     await log(r.status === 'failed' ? 'error' : 'info', 'download', `${spec.short}: ${r.status === 'failed' ? `download failed: ${e.message}` : `${r.reason} at ${AL.size(saved)} of ${AL.size(rec.total)}`}`, { pkg: id });
     emit('download', { id, done: true, status: r.status, why: r.reason ?? r.error });
     // A model without its engine can't run: stop the queue behind a failed engine.
-    if (id === 'engine' && r.status !== 'ready') for (const x of queue.splice(0)) await save(Object.assign(await state(x), { status: 'paused', reason: 'The engine download did not finish' }));
+    if (AL.ENGINE_IDS.includes(id) && r.status !== 'ready') for (const x of queue.splice(0)) await save(Object.assign(await state(x), { status: 'paused', reason: 'The engine download did not finish' }));
+  }
+}
+
+/**
+ * A WebLLM model downloads through WebLLM itself, which keeps the files in its own IndexedDB store: the engine loads
+ * the model once with `fetchOnly` and releases it. That is a real GPU load, so it runs as a queued, checkpointed
+ * operation like any other load (an iOS kill during it is diagnosed, and quarantines the model). Pieces already
+ * stored are not fetched again, so a retry continues roughly where the last attempt stopped.
+ */
+async function fetchWebllm(j, id, spec, rec) {
+  const t0 = Date.now();
+  const onAbort = () => restart('Paused', 'CANCELLED'); // restarting the engine is what stops WebLLM's transfer
+  j.ctrl.signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    await sched.run({ type: 'load', pkg: id, label: 'download' }, async (ctx) => {
+      begin(ctx, 'load', id);
+      try {
+        await connect();
+        await ensureResponsive();
+        for (const other of [...loaded.keys()]) await ctx.child({ type: 'unload', pkg: other, label: 'make room' }, (c) => unloadStep(c, other, 'making room for another model'));
+        cpStage('load.start', { pkg: id, dtype: rec.dtype, device: rec.device, mode: conn.mode, download: true });
+        await request(
+          { type: 'load', id: ctx.id, pkg: id, dtype: rec.dtype, device: rec.device, fetchOnly: true, cls },
+          {
+            progress: (m) => {
+              const have = Math.min(m.loaded, m.total);
+              const secs = Math.max(1, (Date.now() - t0) / 1000);
+              const rate = have / secs;
+              j.progress = { have, total: m.total, rate, file: 'model files', eta: rate > 0 ? (m.total - have) / rate : null };
+              rec.have = have;
+              emit('download', { id, ...j.progress });
+            },
+          },
+        );
+      } finally {
+        cpClear(ctx.id);
+      }
+    });
+  } finally {
+    j.ctrl.signal.removeEventListener('abort', onAbort);
   }
 }
 
@@ -1220,6 +1266,10 @@ export async function remove(id) {
   if (loaded.has(id)) await unload(id).catch(() => {});
   const r = await state(id);
   await AS.removePackage(id);
+  if (P[id].runtime === 'webllm') {
+    restart('Removing a model', 'CANCELLED'); // the engine holds WebLLM's database open; it must let go first
+    await deleteWebllmStore();
+  }
   ready.delete(id);
   recs.delete(id);
   if (id === 'bge') {
@@ -1229,10 +1279,29 @@ export async function remove(id) {
   if (P[id].kind === 'chat') await AS.delPrefix('notes', `sum|${id}|`);
   await log('ok', 'storage', `Removed ${P[id].name}${r.have ? `: freed about ${AL.size(r.have)}` : ''}`, { pkg: id });
   emit('pkg', { id, status: 'none' });
-  if (id !== 'engine' && !(await Promise.all(AL.MODEL_IDS.map(state))).some((x) => x.status !== 'none')) {
-    restart('No models left', 'CANCELLED');
-    await remove('engine');
+  if (!AL.ENGINE_IDS.includes(id)) {
+    // an engine nobody needs any more goes too
+    for (const eng of AL.ENGINE_IDS) {
+      const users = AL.MODEL_IDS.filter((x) => (P[x].needs ?? 'engine') === eng);
+      if ((await state(eng)).status !== 'none' && !(await Promise.all(users.map(state))).some((x) => x.status !== 'none')) {
+        restart('No models left', 'CANCELLED');
+        await remove(eng);
+      }
+    }
   }
+}
+
+const WEBLLM_DBS = ['webllm/model', 'webllm/config', 'webllm/wasm']; // WebLLM's own IndexedDB stores (its cache scopes)
+async function deleteWebllmStore() {
+  await Promise.all(
+    WEBLLM_DBS.map(
+      (name) =>
+        new Promise((resolve) => {
+          const req = indexedDB.deleteDatabase(name);
+          req.onsuccess = req.onerror = req.onblocked = () => resolve();
+        }),
+    ),
+  );
 }
 
 /** Deletes every AI file, vector, summary and log entry, the safety history, and the database itself. */
@@ -1246,6 +1315,7 @@ export async function removeAll() {
   sched.cancel(() => true, 'All AI data removed');
   restart('All AI data removed', 'CANCELLED');
   await AS.destroy();
+  await deleteWebllmStore();
   try {
     await caches.delete('transformers-cache');
   } catch {

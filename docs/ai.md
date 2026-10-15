@@ -13,6 +13,7 @@ This describes how the optional on-device AI is kept from destabilising the app,
 | LFM2.5 **350M** Instruct | provisional (default) | provisional | 258 MB (q4f16) or 297 MB (q4) | WebGPU | 220 / 80 / 280, 90 s |
 | LFM2.5 **230M** Instruct | provisional (fallback) | provisional | 216 MB (q4) | WebGPU | 200 / 80 / 260, 90 s |
 | LFM2.5 **1.2B** Instruct | **experimental: off until you opt in** | experimental (opt in) | 764 MB (q4f16), 854 MB (q4), 1.52 GB (8-bit, CPU) | WebGPU, or CPU on a computer | 300 / 128 / 380, 120 s |
+| Llama **3.2 1B** Instruct (WebLLM) | **experimental: off until you opt in** | experimental (opt in) | 711 MB (q4f16_1, WebLLM's own store) + 6 MB engine | WebGPU with 16-bit floats | 400 / 128 / 500, 150 s |
 | LFM2.5 **2.6B** | **blocked** (iOS ended the app while loading it) | experimental (opt in) | 1.53 GB | WebGPU | 600 / 200 / 700 (computer only) |
 | BGE small en v1.5 | provisional | provisional | 35 MB, CPU | none | batches of 4, ≤ 1,200 characters each, ≤ 64 passages per question |
 
@@ -22,6 +23,17 @@ This describes how the optional on-device AI is kept from destabilising the app,
 - Previously downloaded models and all saved data are kept. A 1.2B downloaded earlier stays on the device; it just needs the opt-in before it runs.
 - **Licence:** the LFM2.5 models are under the *LFM Open License 1.0* (Liquid AI; the model cards link the terms, which include conditions for commercial use). BGE small is MIT. Transformers.js and ONNX Runtime are Apache-2.0 / MIT. Models are downloaded by you, from Hugging Face, to your own device; this repository does not redistribute them.
 - **No silent CPU fallback on a phone.** The 350M and 230M exports have no CPU-compatible version (the 350M's 8-bit export failed with "Could not find an implementation for GatherBlockQuantized" when tried), so without WebGPU they are simply not offered, and written answers are off. Saved pages can still be searched.
+
+### Llama 3.2 1B through WebLLM (added in v2.1)
+
+The one model here that does not run on Transformers.js. It came out best in the lab comparison (5 of 8 test questions on a computer, the next best 3) and it is the smallest to load, because WebLLM sends the weights to the GPU a shard at a time instead of holding the whole file in memory twice.
+
+- **Engine:** WebLLM 0.2.86, kept in the repository (`vendor/web-llm-0.2.86.js`, SHA-256 in `js/ai-lib.js`) and downloaded once with the model like the other engine files. It then runs from the device, offline.
+- **Model files:** WebLLM downloads and keeps them itself (its own IndexedDB store). The app's downloader does not manage them, so there is no byte-level resume: shards already stored are skipped when you retry. The weights are *not* pinned to a revision (WebLLM always asks for the latest); the recorded identity is the library version.
+- **The download is a real GPU load**, run as a queued, checkpointed operation that releases the model straight away. If iOS ends the app during it, that is diagnosed and quarantines the model like any other load.
+- **Budgets:** counted with WebLLM's own tokenizer (an over-high estimate if it cannot be reached), refused or trimmed against the same limits, and the library's own count is logged next to it. The memory WebLLM reserves for the conversation is 1,024 tokens on phones (2,048 on computers), above the profile's combined limit.
+- **Needs shader-f16** (WebGPU 16-bit floats). Without it the card says so and nothing is offered: there is no CPU or 32-bit fallback.
+- **Tested** end to end in a desktop browser: download, checksum, load, answer, and a second run with the network blocked. **Not tested on an iPhone**, which is why it is experimental.
 
 *Safety profiles are in `js/ai-policy.js` (`SAFETY`). A configuration with no entry is unsupported.*
 
@@ -223,6 +235,7 @@ After any problem, **Copy report** and read it as above (or paste it to a develo
 
 ## Known limitations
 
+- Llama 3.2 1B: the weights are not pinned; WebLLM stores them in IndexedDB, and large shards there are untested on iOS. Pausing a download restarts the engine. See the section above.
 - iOS may end the app at any time, for reasons it does not disclose; no code here can prevent that. All limits are conservative guesses, not qualified limits. The first real-device runs decide whether 220 tokens is safe, too cautious, or still too much.
 - A swipe-away during generation is indistinguishable from an OS termination, so it can cause a (reversible) quarantine.
 - Prefill is a single runtime call: it can be neither interrupted nor observed in between, so a stuck prefill is only ended by restarting the engine after the time limit.

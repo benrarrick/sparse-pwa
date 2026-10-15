@@ -8,7 +8,7 @@
 // two models load, two generations run, or a model be released while it is working.
 //
 // Every request has an `id` that its replies carry.
-// Messages in:  probe · ping · load {id, pkg, dtype, device, chunks, cls} · generate {id, pkg, messages,
+// Messages in:  probe · ping · load {id, pkg, dtype, device, chunks, cls, fetchOnly} · generate {id, pkg, messages,
 //               maxTokens, limits, fit, dev, vis} · embed {id, pkg, texts, query} · stop {id}
 //               · unload {id, pkg}
 // Messages out: ready · pong · log {level, msg} · progress {id, pkg, file, loaded, total}
@@ -62,6 +62,8 @@ export function trimTail(text, keep) {
 export function createEngine(post, deps = {}) {
   let T = null;
   let runtime = null;
+  let W = null; // WebLLM, for the models that run on it
+  let wRuntime = null;
   let cls = 'ios'; // the strictest class until the page says otherwise
   let gpuLost = false;
   let gpuErrors = 0;
@@ -172,7 +174,8 @@ export function createEngine(post, deps = {}) {
     stage(id, 'dispose.start', { pkg, why, mem: mem() });
     models.delete(pkg);
     try {
-      await m.pipe.dispose?.();
+      if (m.engine) await m.engine.unload();
+      else await m.pipe.dispose?.();
     } catch (e) {
       post({ type: 'log', level: 'error', msg: `Releasing ${PACKAGES[pkg]?.short ?? pkg} failed: ${e?.message ?? e}` });
       throw new AiError('MODEL_DISPOSE_FAILED', `Releasing ${PACKAGES[pkg]?.short ?? pkg} from memory failed: ${e?.message ?? e}`);
@@ -181,7 +184,7 @@ export function createEngine(post, deps = {}) {
     post({ type: 'unloaded', id, pkg, ms: Math.round(clock() - t0), why });
   }
 
-  async function load({ id, pkg, dtype, device, chunks, cls: c }) {
+  async function load({ id, pkg, dtype, device, chunks, cls: c, fetchOnly = false }) {
     if (c) cls = c;
     const spec = PACKAGES[pkg];
     if (!spec) throw new AiError('MODEL_INCOMPATIBLE', `Unknown model ${pkg}`);
@@ -192,6 +195,7 @@ export function createEngine(post, deps = {}) {
     if (!p.backends?.includes(device)) throw new AiError('MODEL_INCOMPATIBLE', `${spec.short} is not allowed to run on ${device} on this device`);
     // one model in memory at a time: release the others first, completely, before loading this one
     for (const other of [...models.keys()]) await disposeModel(id, other, 'switching to another model');
+    if (spec.runtime === 'webllm') return loadWebllm({ id, pkg, spec, device, fetchOnly });
     stage(id, 'load.start', { pkg, dtype, device, mem: mem() });
     await loadRuntime();
     const t0 = clock();
@@ -219,6 +223,75 @@ export function createEngine(post, deps = {}) {
     if (device === 'webgpu') watchGpu();
     stage(id, 'load.ready', { pkg, ms: info.ms, mem: mem() });
     post({ type: 'loaded', id, pkg, ...info });
+  }
+
+  function loadWebllmRuntime() {
+    return (wRuntime ??= (async () => {
+      if (deps.loadW) return (W = await deps.loadW());
+      const js = await AS.fileBlob('webllm', 'web-llm.js');
+      if (!js) throw new AiError('MODEL_NOT_INSTALLED', 'The WebLLM engine is not on this device. Download the model again: the engine comes with it.');
+      // imported from a blob: URL made from the stored file, so it works offline
+      W = await import(URL.createObjectURL(new Blob([js], { type: 'text/javascript' })));
+      log('ok', `WebLLM engine started (${js.size ? Math.round(js.size / 1e6) : '?'} MB)`);
+      return W;
+    })().catch((e) => {
+      wRuntime = null;
+      throw e;
+    }));
+  }
+
+  /**
+   * A WebLLM model. WebLLM fetches and keeps the model files itself (its own IndexedDB store), so a first
+   * load is also the download. `fetchOnly` loads, reports, and releases at once: that is the "download".
+   */
+  async function loadWebllm({ id, pkg, spec, device, fetchOnly }) {
+    stage(id, 'load.start', { pkg, dtype: spec.dtype, device, mem: mem() });
+    const WL = await loadWebllmRuntime();
+    const record = WL.prebuiltAppConfig.model_list.find((r) => r.model_id === spec.modelId);
+    if (!record) throw new AiError('MODEL_INCOMPATIBLE', `This version of WebLLM has no build of ${spec.short} (${spec.modelId})`);
+    const t0 = clock();
+    let last = 0;
+    const engine = new WL.MLCEngine({
+      appConfig: { model_list: [record], cacheBackend: 'indexeddb' },
+      initProgressCallback: (p) => {
+        if (clock() - last < 300 && p.progress < 1) return;
+        last = clock();
+        post({ type: 'progress', id, pkg, file: spec.modelId, loaded: Math.round(p.progress * spec.size), total: spec.size });
+      },
+    });
+    log('info', `Loading ${spec.short} through WebLLM (${spec.dtype} on ${device})…`);
+    stage(id, 'load.initialising', { pkg });
+    try {
+      // the conversation memory WebLLM reserves is sized to this device class, above the profile's combined limit
+      await engine.reload(spec.modelId, { context_window_size: spec.contextWindow?.[cls] ?? spec.contextWindow?.desktop ?? 1024, temperature: 0 });
+    } catch (e) {
+      await engine.unload().catch(() => {});
+      throw Object.assign(e instanceof Error ? e : new Error(String(e)), { code: classifyError(e, { stage: 'load.start' }) });
+    }
+    const info = { device, dtype: spec.dtype, ms: Math.round(clock() - t0), lastTokenLogits: true, inputs: null, runtime: 'webllm' };
+    if (fetchOnly) {
+      await engine.unload();
+      stage(id, 'load.ready', { pkg, ms: info.ms, fetched: true, mem: mem() });
+      return post({ type: 'loaded', id, pkg, fetched: true, ...info });
+    }
+    models.set(pkg, { engine, pipe: null, info, modelId: spec.modelId });
+    stage(id, 'load.ready', { pkg, ms: info.ms, mem: mem() });
+    post({ type: 'loaded', id, pkg, ...info });
+  }
+
+  /** Tokens in a chat prompt for a WebLLM model: its own tokenizer when reachable, else a deliberately high estimate. */
+  function countWebllm(m, messages) {
+    const perMessage = 6; // role header and end-of-turn tokens of the chat template
+    const enc = m.engine.loadedModelIdToPipeline?.get?.(m.modelId)?.tokenizer?.encode;
+    try {
+      if (enc) {
+        const tk = m.engine.loadedModelIdToPipeline.get(m.modelId).tokenizer;
+        return messages.reduce((n, x) => n + tk.encode(String(x.content)).length + perMessage, 8);
+      }
+    } catch (e) {
+      log('warn', `Could not count the prompt's tokens with the WebLLM tokenizer: ${e?.message ?? e}`);
+    }
+    return messages.reduce((n, x) => n + Math.ceil(String(x.content).length / 2.6) + perMessage, 8);
   }
 
   function countTokens(tok, messages) {
@@ -252,11 +325,12 @@ export function createEngine(post, deps = {}) {
     if (vis === 'hidden') throw new AiError('NOT_FOREGROUND');
     if (m.info.device === 'webgpu' && gpuLost) throw new AiError('GPU_DEVICE_LOST');
     const limits = limitsFor(pkg, asked, dev);
-    const tok = m.pipe.tokenizer;
+    const tok = m.pipe?.tokenizer;
+    const count = (msgs) => (m.engine ? countWebllm(m, msgs) : countTokens(tok, msgs));
     ctx?.stage('tokenize');
     stage(id, 'tokenize', { mem: mem() });
     const tt0 = clock();
-    let inputTokens = countTokens(tok, messages);
+    let inputTokens = count(messages);
     // `fit`: the end of the last message may be cut to fit the limit (source text, summary parts),
     // counted exactly with the model's tokenizer. Without it, a prompt over the limit is refused.
     let trimmed = 0;
@@ -265,7 +339,7 @@ export function createEngine(post, deps = {}) {
       const keep = Math.floor(last.content.length * (limits.maxInput / inputTokens) * (i < 3 ? 0.95 : 0.85));
       const before = inputTokens;
       messages = [...messages.slice(0, -1), { ...last, content: trimTail(last.content, keep) }];
-      inputTokens = countTokens(tok, messages);
+      inputTokens = count(messages);
       trimmed++;
       log('info', `Trimmed the end of the text to fit the ${limits.maxInput}-token limit (${before} → ${inputTokens} tokens)`, { before, after: inputTokens });
     }
@@ -274,35 +348,68 @@ export function createEngine(post, deps = {}) {
     if (!check.ok) throw new AiError(check.code, check.message);
     const est = estimateAllocations(pkg, inputTokens);
     stage(id, 'prompt.tokenized', { inputTokens, maxNew: check.maxNew, total: check.total, limits, tokenizeMs, trimmed, est, mem: mem() });
-    const stopper = new T.InterruptableStoppingCriteria();
+    const stopper = m.engine
+      ? {
+          interrupted: false,
+          interrupt() {
+            this.interrupted = true;
+            m.engine.interruptGenerate();
+          },
+        }
+      : new T.InterruptableStoppingCriteria();
     stoppers.set(id, stopper);
     ctx?.signal?.addEventListener('abort', () => stopper.interrupt(), { once: true });
     let tokens = 0;
     let first = null;
     let lastStage = 0;
+    let finish = null;
+    let usage = null;
     const t0 = clock();
-    const streamer = new T.TextStreamer(tok, {
-      skip_prompt: true,
-      skip_special_tokens: true,
-      callback_function: (text) => post({ type: 'token', id, text }),
-      token_callback_function: () => {
-        tokens++;
-        if (first == null) {
-          first = clock();
-          stage(id, 'first_token', { ms: Math.round(first - t0) });
-        } else if (clock() - lastStage > 700) {
-          lastStage = clock();
-          stage(id, 'decode', { tokens });
-        }
-      },
-    });
+    const onToken = () => {
+      tokens++;
+      if (first == null) {
+        first = clock();
+        stage(id, 'first_token', { ms: Math.round(first - t0) });
+      } else if (clock() - lastStage > 700) {
+        lastStage = clock();
+        stage(id, 'decode', { tokens });
+      }
+    };
     ctx?.stage('prefill');
     // Prompt processing is inside this one call and runs until the first token: its start is
     // recorded here, its end is the first_token stage. The runtime reports nothing in between.
     stage(id, 'prefill', { inputTokens, mem: mem() });
     let error = null;
     try {
-      await m.pipe(messages, { max_new_tokens: check.maxNew, do_sample: false, repetition_penalty: 1.05, streamer, stopping_criteria: stopper });
+      if (m.engine) {
+        const chunks = await m.engine.chat.completions.create({
+          messages,
+          temperature: 0,
+          max_tokens: check.maxNew,
+          repetition_penalty: 1.05,
+          stream: true,
+          stream_options: { include_usage: true },
+        });
+        for await (const c of chunks) {
+          const d = c.choices?.[0]?.delta?.content;
+          if (d) {
+            post({ type: 'token', id, text: d });
+            onToken();
+          }
+          if (c.choices?.[0]?.finish_reason) finish = c.choices[0].finish_reason;
+          if (c.usage) usage = c.usage;
+        }
+        if (usage?.completion_tokens) tokens = usage.completion_tokens;
+        if (usage?.prompt_tokens > limits.maxInput) log('warn', `WebLLM counted ${usage.prompt_tokens} prompt tokens, over the ${limits.maxInput}-token limit (the estimate was ${inputTokens})`, { counted: usage.prompt_tokens, estimate: inputTokens });
+      } else {
+        const streamer = new T.TextStreamer(tok, {
+          skip_prompt: true,
+          skip_special_tokens: true,
+          callback_function: (text) => post({ type: 'token', id, text }),
+          token_callback_function: onToken,
+        });
+        await m.pipe(messages, { max_new_tokens: check.maxNew, do_sample: false, repetition_penalty: 1.05, streamer, stopping_criteria: stopper });
+      }
     } catch (e) {
       error = e;
     } finally {
@@ -311,7 +418,7 @@ export function createEngine(post, deps = {}) {
     const ms = Math.round(clock() - t0);
     const timedOut = ctx?.signal?.reason?.code === 'INFERENCE_TIMEOUT';
     const stopped = !!stopper.interrupted;
-    const stopReason = error ? 'error' : timedOut ? 'timeout' : stopped ? 'stopped' : tokens >= check.maxNew ? 'length' : 'eos';
+    const stopReason = error ? 'error' : timedOut ? 'timeout' : stopped || finish === 'abort' ? 'stopped' : tokens >= check.maxNew || finish === 'length' ? 'length' : 'eos';
     if (error) {
       // partial text already streamed stays with the page; the error says where it stopped
       throw Object.assign(error instanceof Error ? error : new Error(String(error)), { code: gpuLost ? 'GPU_DEVICE_LOST' : classifyError(error, { stage: first == null ? 'prefill' : 'decode' }), tokens });
@@ -322,7 +429,8 @@ export function createEngine(post, deps = {}) {
       tokens,
       ms,
       ttft: first == null ? null : Math.round(first - t0),
-      promptTokens: inputTokens,
+      promptTokens: usage?.prompt_tokens ?? inputTokens,
+      promptCounted: usage?.prompt_tokens ?? null,
       stopped,
       stopReason,
       requestedNew: maxTokens,

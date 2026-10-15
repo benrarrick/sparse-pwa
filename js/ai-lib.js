@@ -4,6 +4,7 @@
 const HF = 'https://huggingface.co';
 const ORT_VERSION = '1.31.0-dev.20260914-8d85527a0';
 const TJS_VERSION = '4.3.0';
+export const WEBLLM_VERSION = '0.2.86';
 
 /**
  * Everything the AI can download. Each package is a set of files fetched once and kept in
@@ -31,6 +32,23 @@ export const PACKAGES = {
         url: `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort-wasm-simd-threaded.asyncify.wasm`,
         size: 26_861_777,
         sha256: '49871f5a4409519797e127440868a6d1923339d9185907f301a5b2a1d90af082',
+      },
+    ],
+  },
+  webllm: {
+    id: 'webllm',
+    kind: 'engine',
+    name: 'WebLLM engine',
+    short: 'WebLLM engine',
+    role: `WebLLM ${WEBLLM_VERSION} (MLC), which runs the Llama model on WebGPU. Downloaded with that model; kept in this app's own files.`,
+    source: 'this app',
+    wire: 2_200_000,
+    files: [
+      {
+        path: 'web-llm.js',
+        url: new URL(`../vendor/web-llm-${WEBLLM_VERSION}.js`, import.meta.url).href,
+        size: 6_178_213,
+        sha256: '6abd753a15136ea1498868208b7e3530ea3e086252fd8f89f40ab33a1ed834aa',
       },
     ],
   },
@@ -149,6 +167,27 @@ export const PACKAGES = {
     variants: { q8: [['onnx/model_quantized.onnx', 34_014_426]] },
     cpu: 'q8',
   },
+  // Runs on WebLLM, not Transformers.js. WebLLM downloads and keeps the model files itself (its own IndexedDB
+  // store, ~700 MB), so there are no per-file entries here; `size` is the download. The weights are not pinned
+  // to a revision (WebLLM always asks for the latest), so `revision` names the library version instead.
+  llama32: {
+    id: 'llama32',
+    kind: 'chat',
+    runtime: 'webllm',
+    needs: 'webllm',
+    name: 'Llama 3.2 1B Instruct',
+    short: 'Llama 3.2 1B',
+    role: 'Experimental on phones: the strongest answers of the small models tried (5 of 8 test questions on a computer), through WebLLM. Needs WebGPU with 16-bit floats. Not yet tried on an iPhone: opt in below.',
+    modelId: 'Llama-3.2-1B-Instruct-q4f16_1-MLC',
+    dtype: 'q4f16_1',
+    size: 704_522_448 + 6_099_798, // weights + the compiled GPU library, from Hugging Face and GitHub
+    revision: `webllm-${WEBLLM_VERSION}`,
+    license: 'Llama 3.2 Community License',
+    source: 'Hugging Face and GitHub, through WebLLM',
+    contextWindow: { ios: 1024, mobile: 1024, desktop: 2048 }, // tokens of conversation WebLLM reserves memory for
+    // 16 layers × 8 key/value heads × 64 values × 2 (keys and values) × 2 bytes (16-bit) per token
+    graph: { vocab: 128_256, lastTokenLogits: true, logitsBytes: 4, logitsCast: false, kvBytesPerToken: 16 * 8 * 64 * 2 * 2 },
+  },
   lfm26: {
     id: 'lfm26',
     kind: 'chat',
@@ -182,7 +221,9 @@ export const PACKAGES = {
   },
 };
 
-export const MODEL_IDS = ['lfm350', 'lfm230', 'lfm12', 'bge', 'lfm26'];
+export const MODEL_IDS = ['lfm350', 'lfm230', 'lfm12', 'llama32', 'bge', 'lfm26'];
+/** Packages that hold only an engine (code), not a model. */
+export const ENGINE_IDS = ['engine', 'webllm'];
 export const CHAT_IDS = MODEL_IDS.filter((id) => PACKAGES[id].kind === 'chat');
 
 /**
@@ -193,6 +234,8 @@ export const CHAT_IDS = MODEL_IDS.filter((id) => PACKAGES[id].kind === 'chat');
  */
 export function pickVariant(pkg, gpu) {
   if (pkg.kind === 'engine') return { dtype: null, device: null };
+  // WebLLM's build is 16-bit only: without shader-f16 there is nothing to run
+  if (pkg.runtime === 'webllm') return gpu?.f16 ? { dtype: pkg.dtype, device: 'webgpu' } : { dtype: null, device: null };
   if (pkg.kind === 'embed') return { dtype: 'q8', device: 'wasm' };
   if (gpu) {
     const dtype = [gpu.f16 ? 'q4f16' : null, 'q4'].find((d) => d && pkg.variants[d]) ?? null;
@@ -210,7 +253,7 @@ export function pickVariant(pkg, gpu) {
 export const textBudget = (maxPrompt, overhead = 90) => Math.max(200, Math.round((maxPrompt - overhead) * 2.8));
 
 /** Changes whenever the AI files change shape; the page and the worker compare it to catch a half-updated app. */
-export const AI_BUILD = '2026-10-15.1';
+export const AI_BUILD = '2026-10-15.2';
 
 /** How many external weight files a variant has (Transformers.js must be told for some exports). */
 export const dataChunks = (pkg, dtype) => (pkg.variants?.[dtype] ?? []).filter(([path]) => /\.onnx_data(_\d+)?$/.test(path)).length;
@@ -218,6 +261,8 @@ export const dataChunks = (pkg, dtype) => (pkg.variants?.[dtype] ?? []).filter((
 /** The files to download for a package and variant: [{ path, size, url, resume, sha256? }]. */
 export function filesFor(pkg, dtype) {
   if (pkg.kind === 'engine') return pkg.files.map((f) => ({ ...f, resume: false }));
+  // WebLLM keeps its own files: one stand-in entry so sizes and progress add up
+  if (pkg.runtime === 'webllm') return [{ path: pkg.modelId, size: pkg.size, url: null, resume: false }];
   const list = [...pkg.common, ...(pkg.variants[dtype] ?? [])];
   return list.map(([path, size]) => ({ path, size, url: fileUrl(pkg, path), resume: size > 8 * 1024 * 1024 }));
 }

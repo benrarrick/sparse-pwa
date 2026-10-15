@@ -41,11 +41,12 @@ The full write-up (safety policy, what was measured, observability guide, benchm
 | LFM2.5 350M Instruct | provisional, the default; WebGPU | 258 MB (q4f16) / 297 MB (q4) |
 | LFM2.5 230M Instruct | provisional, the lowest-memory fallback; WebGPU | 216 MB |
 | LFM2.5 1.2B Instruct | **experimental: off until you opt in** | 764 MB (q4f16), 854 MB (q4), 1.52 GB (CPU, computers) |
+| Llama 3.2 1B Instruct (through WebLLM) | **experimental: off until you opt in**; WebGPU with 16-bit floats | 711 MB (kept by WebLLM) + 6 MB engine |
 | LFM2.5 2.6B | **blocked** (iOS ended the app while loading it); computers, opt in | 1.53 GB |
 | BGE small en v1.5 | finds saved passages by meaning; CPU | 35 MB |
 | AI engine (Transformers.js 4.3.0, ONNX Runtime Web) | needed by all | 27 MB (about 6 MB on the wire) |
 
-"Provisional" means conservative limits that have **not been proven on a real device**, not a claim of safety. Licences: LFM Open License 1.0 for the LFM models, MIT for BGE.
+"Provisional" means conservative limits that have **not been proven on a real device**, not a claim of safety. Licences: LFM Open License 1.0 for the LFM models, Llama 3.2 Community License for Llama, MIT for BGE.
 
 **What it does**
 1. **Summarise** a reader page: sentences are picked from the whole page (not just its start), one pass when possible, a bounded number of notes plus a combine only when one pass would see too little. The card says how much of the page was read. Summaries are kept with the page, keyed by model, method and page text.

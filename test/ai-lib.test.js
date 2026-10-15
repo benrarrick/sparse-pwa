@@ -6,9 +6,9 @@ import * as A from '../js/ai-lib.js';
 const P = A.PACKAGES;
 
 test('catalog: pinned files, variants and sizes', () => {
-  assert.deepEqual(A.MODEL_IDS, ['lfm350', 'lfm230', 'lfm12', 'bge', 'lfm26']);
-  assert.deepEqual(A.CHAT_IDS, ['lfm350', 'lfm230', 'lfm12', 'lfm26']);
-  for (const id of A.MODEL_IDS) {
+  assert.deepEqual(A.MODEL_IDS, ['lfm350', 'lfm230', 'lfm12', 'llama32', 'bge', 'lfm26']);
+  assert.deepEqual(A.CHAT_IDS, ['lfm350', 'lfm230', 'lfm12', 'llama32', 'lfm26']);
+  for (const id of A.MODEL_IDS.filter((x) => !P[x].runtime)) {
     assert.match(P[id].revision, /^[0-9a-f]{40}$/, `${id} is pinned to a commit`);
     for (const dtype of Object.keys(P[id].variants)) {
       const files = A.filesFor(P[id], dtype);
@@ -128,4 +128,22 @@ test('prompts, answers and citations', () => {
   assert.ok(A.textBudget(60) >= 200);
   assert.equal(A.hash('abc'), A.hash('abc'));
   assert.notEqual(A.hash('abc'), A.hash('abd'));
+});
+
+test('catalog: a WebLLM model is a stand-in download, needs 16-bit GPUs, and its engine is checksummed', () => {
+  const m = P.llama32;
+  assert.equal(m.runtime, 'webllm');
+  assert.equal(m.needs, 'webllm');
+  assert.deepEqual(A.pickVariant(m, { f16: true }), { dtype: 'q4f16_1', device: 'webgpu' });
+  assert.deepEqual(A.pickVariant(m, { f16: false }), { dtype: null, device: null }, 'no 16-bit floats: nothing to run');
+  assert.deepEqual(A.pickVariant(m, null), { dtype: null, device: null }, 'and no CPU build');
+  const files = A.filesFor(m, 'q4f16_1');
+  assert.equal(files.length, 1);
+  assert.equal(A.totalSize(files), m.size);
+  assert.ok(m.size > 700e6 && m.size < 720e6);
+  const e = P.webllm;
+  assert.equal(e.kind, 'engine');
+  assert.match(e.files[0].sha256, /^[0-9a-f]{64}$/);
+  assert.ok(A.ENGINE_IDS.includes('webllm') && A.ENGINE_IDS.includes('engine'));
+  assert.ok(m.contextWindow.ios >= 1024 && m.contextWindow.ios > 500, 'the reserved window is above the phone combined limit');
 });
