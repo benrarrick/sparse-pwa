@@ -9,7 +9,7 @@
 //
 // Every request has an `id` that its replies carry.
 // Messages in:  probe · ping · load {id, pkg, dtype, device, chunks, cls, fetchOnly} · generate {id, pkg, messages,
-//               maxTokens, limits, fit, dev, vis} · embed {id, pkg, texts, query} · stop {id}
+//               maxTokens, limits, fit, vis} · embed {id, pkg, texts, query} · stop {id}
 //               · unload {id, pkg}
 // Messages out: ready · pong · log {level, msg} · progress {id, pkg, file, loaded, total}
 //               · stage {id, stage, ms, ...} · loaded {id, pkg, ...} · token {id, text} · done {id, stats}
@@ -190,7 +190,7 @@ export function createEngine(post, deps = {}) {
     if (!spec) throw new AiError('MODEL_INCOMPATIBLE', `Unknown model ${pkg}`);
     if (models.has(pkg)) return post({ type: 'loaded', id, pkg, already: true, ...models.get(pkg).info });
     if (device === 'webgpu' && gpuLost) throw new AiError('GPU_DEVICE_LOST', 'The GPU was lost earlier. The engine must be restarted before loading a model onto it.');
-    const p = profileFor(pkg, cls);
+    const p = profileFor(pkg);
     if (p.status === 'unsupported') throw new AiError('MODEL_INCOMPATIBLE', p.why ?? `${spec.short} is not supported on this device`);
     if (!p.backends?.includes(device)) throw new AiError('MODEL_INCOMPATIBLE', `${spec.short} is not allowed to run on ${device} on this device`);
     // one model in memory at a time: release the others first, completely, before loading this one
@@ -262,8 +262,8 @@ export function createEngine(post, deps = {}) {
     log('info', `Loading ${spec.short} through WebLLM (${spec.dtype} on ${device})…`);
     stage(id, 'load.initialising', { pkg });
     try {
-      // the conversation memory WebLLM reserves is sized to this device class, above the profile's combined limit
-      await engine.reload(spec.modelId, { context_window_size: spec.contextWindow?.[cls] ?? spec.contextWindow?.desktop ?? 1024, temperature: 0 });
+      // the conversation memory WebLLM reserves: above the model's combined token limit
+      await engine.reload(spec.modelId, { context_window_size: spec.contextWindow ?? 1536, temperature: 0 });
     } catch (e) {
       await engine.unload().catch(() => {});
       throw Object.assign(e instanceof Error ? e : new Error(String(e)), { code: classifyError(e, { stage: 'load.start' }) });
@@ -306,11 +306,10 @@ export function createEngine(post, deps = {}) {
     }
   }
 
-  /** Limits for this run: what the page asked for, never above the profile (unless developer mode). */
-  function limitsFor(pkg, requested, dev) {
-    const p = profileFor(pkg, cls);
+  /** Limits for this run: what the page asked for, never above the model's own. */
+  function limitsFor(pkg, requested) {
+    const p = profileFor(pkg);
     const hard = { maxInput: p.maxInput, maxNew: p.maxNew, maxTotal: p.maxTotal, maxMs: p.maxMs };
-    if (dev && p.status !== 'unsupported') return { ...hard, ...requested };
     return {
       maxInput: Math.min(requested?.maxInput ?? hard.maxInput, hard.maxInput),
       maxNew: Math.min(requested?.maxNew ?? hard.maxNew, hard.maxNew),
@@ -319,12 +318,12 @@ export function createEngine(post, deps = {}) {
     };
   }
 
-  async function generate({ id, pkg, messages, maxTokens = 128, limits: asked = null, fit = false, dev = false, vis = 'visible' }, ctx) {
+  async function generate({ id, pkg, messages, maxTokens = 128, limits: asked = null, fit = false, vis = 'visible' }, ctx) {
     const m = models.get(pkg);
     if (!m) throw new AiError('MODEL_LOAD_FAILED', `${PACKAGES[pkg]?.short ?? pkg} is not loaded`);
     if (vis === 'hidden') throw new AiError('NOT_FOREGROUND');
     if (m.info.device === 'webgpu' && gpuLost) throw new AiError('GPU_DEVICE_LOST');
-    const limits = limitsFor(pkg, asked, dev);
+    const limits = limitsFor(pkg, asked);
     const tok = m.pipe?.tokenizer;
     const count = (msgs) => (m.engine ? countWebllm(m, msgs) : countTokens(tok, msgs));
     ctx?.stage('tokenize');
@@ -449,7 +448,7 @@ export function createEngine(post, deps = {}) {
   async function embed({ id, pkg, texts, query }, ctx) {
     const m = models.get(pkg);
     if (!m) throw new AiError('MODEL_LOAD_FAILED', `${PACKAGES[pkg]?.short ?? pkg} is not loaded`);
-    const p = profileFor(pkg, cls);
+    const p = profileFor(pkg);
     const prefix = query ? 'Represent this sentence for searching relevant passages: ' : '';
     const t0 = clock();
     const vecs = [];
@@ -506,7 +505,7 @@ export function createEngine(post, deps = {}) {
           case 'unload': {
             const spec = { id: msg.id, type: msg.type, pkg: msg.pkg, label: msg.label };
             if (sched.depth > 0 || sched.busy) log('warn', `Overlapping request (${msg.type}) queued behind ${sched.snapshot().active?.type ?? 'another task'}: the page should not send these`, { type: msg.type });
-            return await sched.run({ ...spec, timeoutMs: msg.type === 'generate' ? limitsFor(msg.pkg, msg.limits, msg.dev).maxMs : msg.type === 'embed' ? (profileFor(msg.pkg, cls).maxMs ?? 0) : 0 }, async (ctx) => {
+            return await sched.run({ ...spec, timeoutMs: msg.type === 'generate' ? limitsFor(msg.pkg, msg.limits).maxMs : msg.type === 'embed' ? (profileFor(msg.pkg).maxMs ?? 0) : 0 }, async (ctx) => {
               if (msg.type === 'load') return load(msg);
               if (msg.type === 'generate') return generate(msg, ctx);
               if (msg.type === 'embed') return embed(msg, ctx);

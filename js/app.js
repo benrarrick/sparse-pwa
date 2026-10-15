@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '2.1';
+const APP_VERSION = '2.2';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -34,7 +34,6 @@ const DEFAULTS = {
   weatherDetail: 'basic',
   aiModel: 'lfm350',
   aiAutoSummary: false,
-  aiPromptLimit: null, // null = the model's own limit; a number can only lower it (ai-policy.js), or raise it in developer mode
 };
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -588,7 +587,7 @@ async function showHome(id) {
       ),
     ),
     searchForm(),
-    AI.lastInterruption() ? h('p', { class: `small ${AI.lastInterruption().quarantine ? 'bad' : 'warn'}` }, AI.lastInterruption().message, ' ', h('a', { href: '#/ai' }, 'AI diagnostics')) : null,
+    AI.lastInterruption() ? h('p', { class: 'small warn' }, AI.lastInterruption().message, ' ', h('a', { href: '#/ai' }, 'AI diagnostics')) : null,
     h(
       'p',
       { class: 'muted small' },
@@ -1225,7 +1224,6 @@ async function runModel(pkg, messages, { out, status, act, id, maxTokens, label,
     const stats = await AI.generate(pkg, messages, {
       maxTokens,
       label,
-      maxPrompt: settings.aiPromptLimit,
       fit,
       owner: String(id),
       meta,
@@ -1289,7 +1287,7 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
     return act.skip('Summary: too little text on the page');
   }
   // What fits one prompt comes from the model's own limit; the text is chosen from the WHOLE page
-  const lim = AI.limitsFor(pkg, settings.aiPromptLimit);
+  const lim = AI.limitsFor(pkg);
   const title = rec.title.slice(0, 80);
   const plan = SEL.planSummary(rec.markdown, { perCallChars: AL.textBudget(lim.maxInput, 110), maxParts: AI.lowMemory() ? 2 : 4 });
   act.step(
@@ -1740,7 +1738,7 @@ async function showAsk(id, q0) {
       let found;
       try {
         // the evidence budget is hard (labels included) and comes from the model's own limit
-        const lim = use ? AI.limitsFor(use, settings.aiPromptLimit) : null;
+        const lim = use ? AI.limitsFor(use) : null;
         const budget = lim ? AL.textBudget(lim.maxInput, 100 + Math.ceil(question.length / 2.5)) : 1500;
         found = await AI.retrieve(question, { budget, max: use ? 4 : 6, say: (k, t) => act[k](t), owner: String(id) });
       } catch (e) {
@@ -1848,82 +1846,40 @@ let aiUnsub = null;
 
 function pkgCard(id, rec, dev) {
   const spec = AL.PACKAGES[id];
-  const variant = rec.dtype || spec.kind === 'engine' ? rec : AL.pickVariant(spec, AI.usableGpu(dev));
+  const variant = rec.dtype ? rec : AL.pickVariant(spec, AI.usableGpu(dev));
   const total = AL.totalSize(AL.filesFor(spec, variant.dtype));
-  const prof = spec.kind === 'engine' ? null : AI.profile(id);
-  const noVariant = spec.kind !== 'engine' && !variant.dtype;
-  // a model the safety profile does not allow on this kind of device is not offered for download
-  const blockedHere = !!prof && (prof.status === 'unsupported' || (!!variant.device && !prof.backends?.includes(variant.device)));
-  const unsupported = noVariant || blockedHere;
-  const where = spec.kind === 'engine' || unsupported ? '' : `${variant.dtype} on ${variant.device === 'webgpu' ? 'WebGPU' : 'the CPU'}`;
+  const unsupported = !variant.dtype;
+  const where = unsupported ? '' : `${variant.dtype} on ${variant.device === 'webgpu' ? 'WebGPU' : 'the CPU'}`;
   const prog = h('progress', { max: total, value: rec.have ?? 0, hidden: !['downloading', 'paused', 'queued'].includes(rec.status) });
   const line = h('p', { class: 'small', id: `ai-status-${id}` });
   const statusText = {
-    none: unsupported ? 'Not available on this device' : `Not on this device · ${AL.size(total)}${where ? ` (${where})` : ''}`,
+    none: unsupported ? 'Not available on this device' : `Not on this device · ${AL.size(total)}`,
     queued: 'Waiting to download…',
     downloading: `Downloading · ${AL.size(rec.have ?? 0)} of ${AL.size(total)}`,
     paused: `Paused at ${AL.size(rec.have ?? 0)} of ${AL.size(total)}${rec.reason ? `: ${rec.reason}` : ''}`,
     failed: `Download failed: ${rec.error}`,
-    ready: `On this device · ${AL.size(total)}${where ? ` · ${where}` : ''}${rec.readyAt ? ` · downloaded ${L.relTime(rec.readyAt)}` : ''}`,
+    ready: `On this device · ${AL.size(total)}${where ? ` · ${where}` : ''}`,
   }[rec.status];
   fill(line, rec.status === 'failed' ? h('span', { class: 'bad' }, statusText) : statusText);
   const button = (label, fn, cls = 'button small') => h('button', { type: 'button', class: cls, onclick: fn }, label);
   const testOut = h('div', { class: 'small' });
   const buttons = [];
   const notes = [];
-  if (spec.kind !== 'engine') {
-    if ((rec.status === 'none' || rec.status === 'failed') && !unsupported) buttons.push(button(`Download ${AL.size(total - (rec.have ?? 0))}`, () => AI.download(id)));
-    if (rec.status === 'paused') buttons.push(button('Resume', () => AI.download(id)));
-    if (rec.status === 'queued' || rec.status === 'downloading') buttons.push(button('Pause', () => AI.pause(id), 'button secondary small'));
-    if (rec.status === 'ready' && AI.mayRun(id).ok) buttons.push(button('Test', () => testModel(id, testOut), 'button secondary small'));
-    else if (rec.status === 'ready') notes.push(h('p', { class: 'small warn' }, `Not running: ${AI.mayRun(id).why}`));
-    if (rec.status !== 'none') buttons.push(twoTap(rec.status === 'ready' ? `Remove (frees ${AL.size(total)})` : 'Cancel and delete', () => AI.remove(id)));
-  }
-  if (rec.crashes) notes.push(h('p', { class: 'small bad' }, `The app was interrupted unexpectedly ${plural(rec.crashes, 'time')} while using this model${rec.lastCrash ? `, last ${L.relTime(rec.lastCrash.found)} (at "${rec.lastCrash.stage ?? '?'}")` : ''}. iOS does not say why; the diagnostics below show what was recorded.`));
-  if (rec.lastLoad) notes.push(h('p', { class: 'small muted' }, `Last loaded in ${T(rec.lastLoad.ms)} (${rec.lastLoad.where}, ${rec.lastLoad.mode === 'page' ? 'on the page' : 'in a worker'}), ${L.relTime(rec.lastLoad.at)}`));
-  if (rec.lastRun) notes.push(h('p', { class: 'small muted' }, `Last run (${rec.lastRun.label}): ${AL.describeRun(rec.lastRun)}, ${L.relTime(rec.lastRun.at)}`));
+  if ((rec.status === 'none' || rec.status === 'failed') && !unsupported) buttons.push(button(`Download ${AL.size(total - (rec.have ?? 0))}`, () => AI.download(id)));
+  if (rec.status === 'paused') buttons.push(button('Resume', () => AI.download(id)));
+  if (rec.status === 'queued' || rec.status === 'downloading') buttons.push(button('Pause', () => AI.pause(id), 'button secondary small'));
+  if (rec.status === 'ready' && AI.mayRun(id).ok) buttons.push(button('Test', () => testModel(id, testOut), 'button secondary small'));
+  else if (rec.status === 'ready') notes.push(h('p', { class: 'small warn' }, `Not running: ${AI.mayRun(id).why}`));
+  if (rec.status !== 'none') buttons.push(twoTap(rec.status === 'ready' ? `Remove (frees ${AL.size(total)})` : 'Cancel and delete', () => AI.remove(id)));
+  if (unsupported && rec.status === 'none')
+    notes.push(h('p', { class: 'small bad' }, spec.runtime === 'webllm' ? 'Needs WebGPU with 16-bit floats, which this browser’s GPU doesn’t offer.' : `Needs WebGPU, which this browser doesn't offer${dev.gpu.fallback ? ' (only a software version)' : ''}.`));
+  if (rec.crashes) notes.push(h('p', { class: 'small warn' }, `The app was ended unexpectedly ${plural(rec.crashes, 'time')} while using this${rec.lastCrash ? `, last ${L.relTime(rec.lastCrash.found)} (at “${rec.lastCrash.stage ?? '?'}”)` : ''}. iOS does not say why; the log below shows what was recorded.`));
   if (rec.lastError) notes.push(h('p', { class: 'small bad' }, `Last error (${rec.lastError.phase}, ${L.relTime(rec.lastError.at)}): ${rec.lastError.message}`));
-  if (blockedHere) notes.push(h('p', { class: 'small bad' }, prof.why ?? `Not qualified to run on ${variant.device === 'webgpu' ? 'WebGPU' : 'the CPU'} on this kind of device (${AI.deviceClassName()}), so it is not offered for download. Saved pages can still be searched.`));
-  else if (noVariant) notes.push(h('p', { class: 'small bad' }, `Needs WebGPU, which this browser doesn't offer${dev.gpu.fallback ? ' (only a software version)' : ''}, so it can't run here.`));
-  else if (spec.kind === 'chat' && rec.device !== 'webgpu' && !AI.usableGpu(dev))
-    notes.push(h('p', { class: 'small warn' }, `No usable WebGPU here${dev.gpu.fallback ? ' (only a software version)' : ''}, so it runs on the CPU with larger 8-bit weights: expect it to be slow.`));
-  if (prof && spec.kind === 'chat' && !blockedHere) {
-    notes.push(
-      h(
-        'p',
-        { class: 'small muted' },
-        `${prof.status === 'experimental' ? 'Experimental' : 'Conservative limits, not yet proven on a real device'} on this device (${AI.deviceClassName()}): prompt up to ${prof.maxInput} tokens, answer up to ${prof.maxNew}, together up to ${prof.maxTotal}, at most ${Math.round(prof.maxMs / 1000)} s. `,
-        spec.graph.lastTokenLogits ? 'Scores only the last prompt position (read from the model file).' : 'Scores every prompt position, so long prompts cost extra memory (read from the model file).',
-      ),
-    );
-    if (prof.status === 'experimental') {
-      const c = h('input', {
-        type: 'checkbox',
-        checked: AI.optedIn(id),
-        onchange: () => {
-          AI.setOptIn(id, c.checked);
-          route();
-        },
-      });
-      notes.push(h('label', { class: 'field check' }, c, h('span', null, 'Allow this experimental model to run on this device'), h('small', { class: 'muted' }, 'It uses more memory. If iOS ends the app while it runs, it is switched off again.')));
-    }
-  }
-  for (const q of AI.quarantined().filter((x) => x.key.startsWith(`${id}@`)))
-    notes.push(
-      h(
-        'p',
-        { class: 'small bad' },
-        `Switched off ${L.relTime(q.at)}: the app was interrupted unexpectedly while it ran (${q.category.toLowerCase().replaceAll('_', ' ')}, ${q.confidence} confidence). `,
-        AI.getDev()
-          ? h('button', { type: 'button', class: 'link', onclick: () => (AI.retest(q.key), route()) }, 'Allow a retest')
-          : 'Turn on developer testing mode below to retest it.',
-      ),
-    );
   return h(
     'div',
-    { class: `card pkg${spec.kind === 'engine' ? ' engine' : ''}` },
+    { class: 'card pkg' },
     h('h3', null, spec.name),
-    h('p', { class: 'small muted' }, spec.role, spec.license ? ` License: ${spec.license}.` : ''),
+    h('p', { class: 'small muted' }, spec.role),
     line,
     prog,
     buttons.length ? h('p', { class: 'pkg-actions' }, buttons.flatMap((b, i) => (i ? [' ', b] : [b]))) : null,
@@ -1971,8 +1927,6 @@ function logItem(e) {
   );
 }
 
-const kvRows = (rows) => rows.map(([k, v]) => h('tr', null, h('th', null, k), h('td', null, v == null ? '–' : v)));
-const secs = (ms) => (ms == null ? '–' : ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`);
 
 async function showAI(id) {
   document.title = 'On-device AI · Sparse';
@@ -1981,10 +1935,10 @@ async function showAI(id) {
   const dev = d.device;
   const entries = d.events;
   const interruption = AI.lastInterruption();
-  const loaded = AI.loadedModels();
   const dl = AI.downloading();
   const shown = Object.fromEntries(Object.entries(st).map(([k, v]) => [k, v.status]));
   const logList = h('ol', { class: 'log ai-log' }, entries.map(logItem));
+  const copyNote = h('span', { class: 'small muted' });
   let errorsOnly = false;
   const filterBtn = h('button', { type: 'button', class: 'link' }, 'Errors and warnings only');
   filterBtn.addEventListener('click', async () => {
@@ -1992,72 +1946,6 @@ async function showAI(id) {
     filterBtn.textContent = errorsOnly ? 'Show everything' : 'Errors and warnings only';
     fill(logList, (await AI.readLog(300)).filter((e) => !errorsOnly || e.level === 'error' || e.level === 'warn').map(logItem));
   });
-  const copyNote = h('span', { class: 'small muted' });
-  const g = dev.gpu;
-  const yes = (v) => (v ? 'yes' : 'no');
-  const rows = [
-    ['Kind of device', `${AI.deviceClassName()}${AI.lowMemory() ? ' (low-memory limits apply)' : ''}`],
-    ['WebGPU on the page', g.gpu ? `yes · ${g.adapter}${g.fallback ? ' (software fallback)' : ''}` : `no${g.why ? ` (${g.why})` : ''}`],
-    ['16-bit floats (shader-f16)', g.gpu ? yes(g.f16) : '–'],
-    ['Largest GPU buffer', g.limits ? `${AL.size(g.limits.maxBufferSize)} (binding ${AL.size(g.limits.maxStorageBufferBindingSize)})` : '–'],
-    ['WebGPU in a worker', dev.worker ? (dev.worker.gpu ? 'yes' : `no${dev.worker.why ? ` (${dev.worker.why})` : ''}`) : 'checked when a model first loads'],
-    ['Engine running', AI.engineMode() ? (AI.engineMode() === 'worker' ? 'in a worker' : 'on the page') : 'not started'],
-    ['Storage', dev.storage ? `${AL.size(dev.storage.usage)} used of about ${AL.size(dev.storage.quota)} this app may use` : 'not reported'],
-    ['Storage permanent', dev.persisted == null ? 'not reported' : yes(dev.persisted)],
-    ['Installed to the home screen', yes(dev.standalone)],
-    ['CPU cores', dev.cores ?? 'not reported'],
-    ['Memory', dev.memory ? `about ${dev.memory} GB (the browser’s rough figure)` : 'not reported (Safari never says)'],
-    ['App build', AL.AI_BUILD],
-    ['Browser', dev.ua],
-  ];
-
-  // current status: redrawn whenever an operation starts, moves on or ends
-  const statusBox = h('table', { class: 'kv' });
-  const drawStatus = () => {
-    const s = AI.status();
-    const a = s.op.active;
-    fill(
-      statusBox,
-      kvRows([
-        ['State', `${s.op.state}${s.op.failed ? ` (${s.op.failed.code})` : ''}`],
-        ['Doing now', a ? `${a.type}${a.label !== a.type ? ` (${a.label})` : ''}, stage “${a.stage}”` : 'nothing'],
-        ['Waiting', s.op.queue.length ? `${s.op.queue.length}: ${s.op.queue.map((q) => q.type).join(', ')}` : 'nothing'],
-        ['Engine', `${s.worker.mode ?? 'not started'} · ${s.worker.state} (started ${s.worker.starts}×, restarted ${s.worker.resets}×)`],
-        ['In memory', s.loaded.length ? s.loaded.map((m) => `${AL.PACKAGES[m.id].short}: ${m.dtype} on ${m.device === 'webgpu' ? 'WebGPU' : 'the CPU'}`).join(', ') : 'nothing'],
-        ['Health', s.gpuLost ? 'The GPU was lost: reset the engine below' : s.versionMismatch ? 'The app is only partly updated: close it completely and open it again (twice)' : 'OK'],
-        ['Switched off for safety', s.quarantine.length ? `${s.quarantine.length}: ${s.quarantine.map((q) => AL.PACKAGES[q.key.split('@')[0]]?.short ?? q.key).join(', ')}` : 'none'],
-      ]),
-    );
-  };
-  drawStatus();
-
-  const li = d.lastInference;
-  const lastBox = li
-    ? h('table', { class: 'kv' }, kvRows([
-        ['Result', `${li.status}${li.m?.stopReason ? ` (${li.m.stopReason})` : ''} · ${AL.PACKAGES[li.pkg]?.short ?? li.pkg} ${li.dtype ?? ''}/${li.backend ?? ''}, ${li.m?.label ?? ''}, ${L.relTime(li.t)}`],
-        ['Prompt → answer', `${li.m?.promptTokens ?? li.m?.inputTokens ?? '?'} → ${li.m?.tokens ?? '?'} tokens (asked for up to ${li.m?.requestedNew ?? '?'}, allowed ${li.m?.maxNew ?? '?'})`],
-        ['First token', secs(li.m?.ttft)],
-        ['Writing speed', li.m?.tps ? `${li.m.tps} tokens/s` : '–'],
-        ['Total', secs(li.m?.ms)],
-        ['Waited in queue', secs(li.m?.queueMs)],
-        ['Scores computed for', li.m?.lastTokenLogits == null ? '–' : li.m.lastTokenLogits ? 'the last prompt position only' : 'every prompt position'],
-      ]))
-    : h('p', { class: 'small muted' }, 'Nothing has run since the app opened.');
-
-  const p = d.performance;
-  const perfBox = h('table', { class: 'kv' }, kvRows([
-    ['Runs this session', p.runs],
-    ['Median time to first token', secs(p.medianTtftMs)],
-    ['Median writing speed', p.medianTokensPerSec ? `${p.medianTokensPerSec.toFixed(1)} tokens/s` : '–'],
-    ['Median run', secs(p.medianRunMs)],
-    ['Model loads · median', `${p.loads} · ${secs(p.medianLoadMs)}`],
-    ['Searches of saved pages · median', `${p.retrievals} · ${secs(p.medianRetrievalMs)}`],
-    ['Failures', p.failures ? `${p.failures} (${Object.entries(p.failuresByCode).map(([k, v]) => `${k} ${v}`).join(', ')})` : 'none'],
-  ]));
-
-  const failures = entries.filter((e) => e.level === 'error' && (e.code || e.ev?.includes('failed'))).slice(0, 8);
-  const recovery = entries.filter((e) => ['ai.worker.reset', 'ai.quarantine.added', 'ai.quarantine.released', 'ai.worker.unresponsive', 'ai.memory.idle_unload', 'ai.recovery.interrupted'].includes(e.ev)).slice(0, 6);
-  const detailBox = h('input', { type: 'checkbox' });
   const copy = async (text, what) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -2068,35 +1956,39 @@ async function showAI(id) {
     }
   };
   const usable = AL.CHAT_IDS.filter((x) => AI.isReady(x) && AI.mayRun(x).ok);
+  const gpuText = dev.gpu.gpu ? `WebGPU${dev.gpu.f16 ? ' with 16-bit floats' : ' without 16-bit floats'}${dev.gpu.fallback ? ' (software only)' : ''}` : 'no WebGPU';
+
+  // one line of live status, redrawn when an operation starts, moves on or ends
+  const live = h('p', { class: 'small' });
+  const drawStatus = () => {
+    const s = AI.status();
+    const a = s.op.active;
+    fill(
+      live,
+      a ? `Working: ${a.type}${a.label !== a.type ? ` (${a.label})` : ''}, ${a.stage}` : 'Idle',
+      ' · in memory: ',
+      s.loaded.length ? s.loaded.map((m) => AL.PACKAGES[m.id].short).join(', ') : 'nothing',
+      s.loaded.length ? [' ', h('button', { type: 'button', class: 'link', onclick: async () => (await Promise.all(s.loaded.map((m) => AI.unload(m.id))), route()) }, 'Unload')] : null,
+      s.gpuLost ? h('span', { class: 'bad' }, ' · The GPU was lost: use Reset AI engine below') : null,
+      s.versionMismatch ? h('span', { class: 'bad' }, ' · The app is only partly updated: close it completely and open it again (twice)') : null,
+    );
+  };
+  drawStatus();
 
   render(
-    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'On-device AI'), AL.MODEL_IDS.some((x) => AI.isReady(x)) ? h('a', { href: '#/ask' }, 'Ask') : null),
-    h(
-      'section',
-      null,
-      h('p', null, 'Optional AI that runs on this device: it summarises pages and answers questions from your saved pages and searches, or on its own, with no connection. Nothing downloads until you tap Download, and the browser works fully without it.'),
-      h(
-        'ul',
-        { class: 'small' },
-        h('li', null, 'Models come from Hugging Face and the engine from jsDelivr, once. After that, nothing you read or ask leaves the device.'),
-        h('li', null, 'Use Wi-Fi and keep the app open: the screen stays on while it downloads. If the download is interrupted, it carries on from where it stopped.'),
-        h('li', null, 'Phones limit how much memory a web app may use, and iOS can end the app without saying why. So each model has hard size limits here, one task runs at a time, and a model that was interrupted unexpectedly is switched off until you retest it.'),
-      ),
-    ),
+    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'On-device AI'), usable.length ? h('a', { href: '#/ask' }, 'Ask') : null),
+    h('p', null, 'Optional AI that runs on this device, with no connection once downloaded. Nothing downloads until you tap Download. Use Wi-Fi and keep the app open.'),
     interruption
       ? h(
           'div',
           { class: 'card warn-card' },
-          h('p', null, h('strong', null, 'Last time: '), interruption.message),
-          h('p', { class: 'small muted' }, `Diagnosis: ${interruption.category.toLowerCase().replaceAll('_', ' ')} (${interruption.confidence} confidence). ${interruption.quarantine ? 'That model was switched off; saved pages and summaries are untouched. ' : ''}`, h('button', { type: 'button', class: 'link', onclick: () => (AI.ackInterruption(), route()) }, 'Dismiss')),
+          h('p', null, h('strong', null, 'Last time: '), interruption.message, ' ', h('button', { type: 'button', class: 'link', onclick: () => (AI.ackInterruption(), route()) }, 'Dismiss')),
           h('details', null, h('summary', { class: 'small' }, 'Why this diagnosis'), h('ul', { class: 'small' }, interruption.reasons.map((r) => h('li', null, r)))),
         )
       : null,
-    h('p', { class: 'small' }, h('a', { href: '#/ai-lab' }, 'AI lab'), ' (experimental model tests, separate from the above)'),
-    h('h2', null, 'Status now'),
-    statusBox,
     h('h2', null, 'Models'),
-    ['lfm350', 'lfm230', 'bge', 'lfm12', 'llama32', 'lfm26', 'engine', 'webllm'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
+    ['lfm350', 'lfm230', 'llama32', 'bge'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
+    h('p', { class: 'small muted' }, 'Each model also downloads a small engine to run it. Only one model is in memory at a time.'),
     h(
       'section',
       null,
@@ -2107,33 +1999,15 @@ async function showAI(id) {
             { class: 'field' },
             h('span', null, 'Model for summaries and answers'),
             (() => {
-              const s = h(
+              const sel = h(
                 'select',
-                { onchange: () => (saveSetting('aiModel', s.value), route()) },
+                { onchange: () => (saveSetting('aiModel', sel.value), route()) },
                 usable.map((x) => h('option', { value: x, selected: AI.chatModel(settings.aiModel) === x }, AL.PACKAGES[x].short)),
               );
-              return s;
+              return sel;
             })(),
           )
         : null,
-      (() => {
-        const use = AI.chatModel(settings.aiModel) ?? usable[0];
-        if (!use) return h('p', { class: 'small muted' }, 'Download a model above to choose how long prompts may be.');
-        const cap = AI.limitsFor(use, null).maxInput;
-        const current = settings.aiPromptLimit ? Math.min(settings.aiPromptLimit, AI.getDev() ? 2000 : cap) : cap;
-        const s = h(
-          'select',
-          { onchange: () => (saveSetting('aiPromptChosen', true), saveSetting('aiPromptLimit', Number(s.value))) },
-          AI.limitChoices(use).map((n) => h('option', { value: String(n), selected: current === n }, `${n} tokens (about ${AL.textBudget(n).toLocaleString()} characters of text)${n === cap ? ' · this model’s limit' : ''}`)),
-        );
-        return h(
-          'label',
-          { class: 'field' },
-          h('span', null, 'Longest prompt'),
-          s,
-          h('small', { class: 'muted' }, `Longer prompts need more memory. You can lower this, but not raise it above ${cap} tokens, the limit for ${AL.PACKAGES[use].short} on this device. Pages are summarised from sentences picked across the whole page; answers use this much saved text.`),
-        );
-      })(),
       h(
         'label',
         { class: 'field check' },
@@ -2142,97 +2016,49 @@ async function showAI(id) {
           return c;
         })(),
         h('span', null, 'Summarise pages automatically when they load'),
-        h('small', { class: 'muted' }, AI.autoAllowed() ? 'Otherwise, tap Summarise on a page. Either way, summaries are kept with the page.' : 'Off while a model is switched off for safety, or the engine needs attention.'),
+        h('small', { class: 'muted' }, 'Otherwise, tap Summarise on a page. Summaries are kept with the page.'),
       ),
-      h('p', { class: 'small' }, h('a', { href: '#/ask' }, 'Ask a question'), ': from your saved pages and searches, or the model’s own knowledge.'),
-    ),
-    h('section', null, h('h2', null, 'Last inference'), lastBox),
-    h('section', null, h('h2', null, 'Performance'), perfBox),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Recent failures'),
-      failures.length
-        ? h(
-            'ul',
-            { class: 'plain small' },
-            failures.map((e) => h('li', { class: 'bad' }, `${new Date(e.t).toLocaleString()} · ${AL.PACKAGES[e.pkg]?.short ?? e.pkg ?? '–'} · stage ${e.stage ?? '–'} · ${e.code ?? 'error'}`, h('span', { class: 'block muted' }, e.msg))),
-          )
-        : h('p', { class: 'small muted' }, 'None recorded.'),
-      recovery.length ? h('details', null, h('summary', { class: 'small' }, 'Recovery actions taken'), h('ul', { class: 'plain small' }, recovery.map((e) => h('li', null, `${new Date(e.t).toLocaleString()} · ${e.msg}`)))) : null,
+      usable.length ? h('p', { class: 'small' }, h('a', { href: '#/ask' }, 'Ask a question'), ': from your saved pages and searches, or the model’s own knowledge.') : null,
     ),
     h(
       'section',
       null,
-      h('h2', null, 'In memory now'),
-      loaded.size
-        ? h(
-            'ul',
-            { class: 'plain small' },
-            [...loaded].map(([k, info]) =>
-              h('li', null, `${AL.PACKAGES[k].short}: ${info.dtype} on ${info.device === 'webgpu' ? 'WebGPU' : 'the CPU'}, loaded in ${T(info.ms)} `, h('button', { type: 'button', class: 'link', onclick: async () => (await AI.unload(k), route()) }, 'Unload')),
-            ),
-          )
-        : h('p', { class: 'small muted' }, 'Nothing. One model is in memory at a time, loaded when first used and released after a short while unused (2 minutes on a phone).'),
+      h('h2', null, 'Status'),
+      live,
+      h('p', { class: 'small muted' }, `${gpuText}${dev.storage ? ` · ${AL.size(dev.storage.usage)} of about ${AL.size(dev.storage.quota)} storage used by this app` : ''}`),
     ),
     h(
       'section',
       null,
-      h('h2', null, 'Safety'),
-      h('table', { class: 'kv' }, AI.profileTable().map((r) => h('tr', null, h('th', null, AL.PACKAGES[r.id].short), h('td', null, r.status === 'unsupported' ? `Not supported here: ${r.why}` : `${r.status}${r.maxInput ? ` · prompt ≤ ${r.maxInput}, answer ≤ ${r.maxNew}, total ≤ ${r.maxTotal} tokens` : ` · batches of ${r.maxBatch}, ≤ ${r.maxPerRun} passages per question`}${r.blockedBy ? ` · blocked: ${r.blockedBy}` : ''}`)))),
-      h('p', { class: 'small muted' }, 'Expected memory use (estimates from the tensor shapes in the model files; Safari does not report real memory):'),
-      h('ul', { class: 'plain small' }, d.estimates.map((x) => h('li', null, x))),
-      (() => {
-        const c = h('input', {
-          type: 'checkbox',
-          checked: AI.getDev(),
-          onchange: () => {
-            AI.setDev(c.checked);
-            route();
-          },
-        });
-        return h('label', { class: 'field check' }, c, h('span', null, 'Developer testing mode'), h('small', { class: 'muted' }, 'For testing only: allows longer prompts and retesting a switched-off model. Larger prompts can make iOS end the app. Ordinary use never needs it.'));
-      })(),
-      AI.getDev() ? h('p', { class: 'small' }, twoTap('Clear run history', () => AI.clearHistory())) : null,
-    ),
-    h('section', null, h('h2', null, 'This device'), h('table', { class: 'kv' }, rows.map(([k, v]) => h('tr', null, h('th', null, k), h('td', null, String(v)))))),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Diagnostics'),
-      h('p', { class: 'small muted' }, 'Every download, load and run, step by step, with how long it took and where and why anything failed. Kept on this device, bounded, and never sent anywhere. By default it holds no page text, questions or answers.'),
+      h('h2', null, 'Log'),
       h(
         'p',
         { class: 'small' },
-        h('button', { type: 'button', class: 'link', onclick: async () => copy(await AI.report({ detail: detailBox.checked }), 'report') }, 'Copy report'),
+        h('button', { type: 'button', class: 'link', onclick: async () => copy(await AI.report(), 'report') }, 'Copy report'),
         ' · ',
-        h('button', { type: 'button', class: 'link', onclick: async () => copy(await AI.reportJson({ detail: detailBox.checked }), 'report as JSON') }, 'Copy as JSON'),
-        copyNote,
-      ),
-      h('label', { class: 'field check' }, detailBox, h('span', null, 'Include my last question and the titles of its sources'), h('small', { class: 'muted' }, 'Private: this puts text you wrote into the report. Leave it off unless you are sending the report to someone you trust.')),
-      h(
-        'p',
-        { class: 'small' },
-        h('button', { type: 'button', class: 'link', onclick: async () => (await AI.resetEngine(), route()) }, 'Reset AI engine'),
-        ' (stops anything running and restarts the engine; downloaded models are kept) · ',
+        h('button', { type: 'button', class: 'link', onclick: async () => copy(await AI.reportJson(), 'report as JSON') }, 'Copy as JSON'),
+        ' · ',
         filterBtn,
         ' · ',
         twoTap('Clear log', () => AI.clearLog()),
+        copyNote,
       ),
       entries.length ? logList : h('p', { class: 'small muted' }, 'Nothing logged yet.'),
+      h('p', { class: 'small' }, h('button', { type: 'button', class: 'link', onclick: async () => (await AI.resetEngine(), route()) }, 'Reset AI engine'), ' (stops anything running and restarts it; downloaded models are kept)'),
     ),
     h(
       'section',
       null,
       h('h2', null, 'Remove'),
       h('p', { class: 'small' }, twoTap('Remove all AI data from this device', () => AI.removeAll())),
-      h('p', { class: 'small muted' }, 'Deletes every model, the engine, the meaning index, summaries, questions, this log and the safety history.'),
+      h('p', { class: 'small muted' }, 'Deletes every model, the engines, the meaning index, summaries, questions and this log.'),
     ),
+    h('p', { class: 'small muted' }, h('a', { href: '#/ai-lab' }, 'AI lab'), ' (experimental model tests)'),
   );
   aiUnsub = AI.on((type, data) => {
     if (currentPath() !== '/ai') return;
     if (type === 'log') logList.prepend(logItem(data));
-    if (type === 'op' || type === 'loaded') drawStatus();
+    if (type === 'op' || type === 'loaded') setTimeout(drawStatus, 60); // the event fires just before the engine clears its active task
     if (type === 'safety') {
       clearTimeout(netPageTimer);
       netPageTimer = setTimeout(route, 300);
@@ -2240,7 +2066,7 @@ async function showAI(id) {
     if (type === 'download' && !data.done) {
       const el = document.getElementById(`ai-status-${data.id}`);
       if (el)
-        el.textContent = `Downloading ${Math.round((100 * data.have) / data.total)}% · ${AL.size(data.have)} of ${AL.size(data.total)} · ${AL.size(data.rate)}/s${data.eta ? ` · ${AL.eta(data.eta)} left` : ''}`;
+        el.textContent = `Downloading ${Math.round((100 * data.have) / data.total)}% · ${AL.size(data.have)} of ${AL.size(data.total)}${data.rate ? ` · ${AL.size(data.rate)}/s` : ''}${data.eta ? ` · ${AL.eta(data.eta)} left` : ''}`;
       const prog = el?.nextElementSibling;
       if (prog?.tagName === 'PROGRESS') {
         prog.hidden = false;
@@ -2455,7 +2281,6 @@ async function start() {
   [settings, netLog, netTotals] = await Promise.all([
     S.kvGet('settings', {}).then((s) => {
       const merged = { ...DEFAULTS, ...s };
-      if (merged.aiPromptLimit === 300 && !merged.aiPromptChosen) merged.aiPromptLimit = null; // 300 was the old default, not a choice
       if (!L.FREE_ENGINE_IDS.includes(merged.engine)) merged.engine = DEFAULTS.engine; // the paid engine is never the default
       return merged;
     }),

@@ -57,7 +57,7 @@ export const PACKAGES = {
     kind: 'chat',
     name: 'LFM2.5 350M Instruct',
     short: 'LFM2.5 350M',
-    role: 'Lightweight AI (recommended on phones): short summaries and answers from your saved pages, with small, conservative limits. Needs WebGPU on phones.',
+    role: 'Small and quick: short summaries and answers from your saved pages. Needs WebGPU.',
     repo: 'LiquidAI/LFM2.5-350M-ONNX',
     revision: 'd11593fd9eb408e322667926656598896c2d5ff9',
     license: 'LFM Open License 1.0',
@@ -91,7 +91,7 @@ export const PACKAGES = {
     kind: 'chat',
     name: 'LFM2.5 230M Instruct',
     short: 'LFM2.5 230M',
-    role: 'Smallest AI: the lowest-memory fallback for short summaries and answers. Needs WebGPU.',
+    role: 'Smallest: the lowest-memory choice. Needs WebGPU.',
     repo: 'LiquidAI/LFM2.5-230M-ONNX',
     revision: 'c6f46e4e3f885ebcad164d14059a49f90e27eb4d',
     license: 'LFM Open License 1.0',
@@ -112,48 +112,12 @@ export const PACKAGES = {
     // This export has no `num_logits_to_keep`: scores for every prompt position (full sequence).
     graph: { vocab: 65_536, lastTokenLogits: false, logitsBytes: 4, logitsCast: false, kvBytesPerToken: 6 * 2 * 8 * 64 * 4 },
   },
-  lfm12: {
-    id: 'lfm12',
-    kind: 'chat',
-    name: 'LFM2.5 1.2B Instruct',
-    short: 'LFM2.5 1.2B',
-    role: 'Experimental on phones: better answers than the smaller models, but it uses more memory and iOS has ended the app with it before. Opt in below.',
-    repo: 'LiquidAI/LFM2.5-1.2B-Instruct-ONNX',
-    revision: '10f72e70abf67ac0fd7ebf15bc5854726891d864',
-    license: 'LFM Open License 1.0',
-    common: [
-      ['config.json', 1599],
-      ['generation_config.json', 131],
-      ['tokenizer.json', 3_297_799],
-      ['tokenizer_config.json', 2391],
-      ['chat_template.jinja', 1783],
-    ],
-    variants: {
-      q4f16: [
-        ['onnx/model_q4f16.onnx', 182_795],
-        ['onnx/model_q4f16.onnx_data', 760_279_040],
-      ],
-      q4: [
-        ['onnx/model_q4.onnx', 183_173],
-        ['onnx/model_q4.onnx_data', 850_059_264],
-      ],
-      q8: [
-        ['onnx/model_quantized.onnx', 185_703],
-        ['onnx/model_quantized.onnx_data', 1_520_558_080],
-      ],
-    },
-    cpu: 'q8', // the q4 exports use GatherBlockQuantized, which only the WebGPU backend implements
-    // Prompts stay short: this export computes scores over its whole 65,536-word vocabulary at every
-    // prompt position (and holds a 16-bit copy that is cast to 32-bit), so a 3,000-token prompt needs
-    // over 1 GB on top of the weights. See SAFETY in ai-policy.js for the limits that follow.
-    graph: { vocab: 65_536, lastTokenLogits: false, logitsBytes: 4, logitsCast: true, kvBytesPerToken: 6 * 2 * 8 * 64 * 4 },
-  },
   bge: {
     id: 'bge',
     kind: 'embed',
     name: 'BGE small (English)',
     short: 'BGE small',
-    role: 'Context retrieval: finds saved passages by meaning, not just matching words. Runs on the CPU.',
+    role: 'Finds saved passages by meaning, not just matching words. Runs on the CPU.',
     repo: 'Xenova/bge-small-en-v1.5',
     revision: 'ea104dacec62c0de699686887e3f920caeb4f3e3',
     license: 'MIT',
@@ -177,51 +141,22 @@ export const PACKAGES = {
     needs: 'webllm',
     name: 'Llama 3.2 1B Instruct',
     short: 'Llama 3.2 1B',
-    role: 'Experimental on phones: the strongest answers of the small models tried (5 of 8 test questions on a computer), through WebLLM. Needs WebGPU with 16-bit floats. Not yet tried on an iPhone: opt in below.',
+    role: 'The best answers of the small models tried, through WebLLM. Needs WebGPU with 16-bit floats.',
     modelId: 'Llama-3.2-1B-Instruct-q4f16_1-MLC',
     dtype: 'q4f16_1',
     size: 704_522_448 + 6_099_798, // weights + the compiled GPU library, from Hugging Face and GitHub
     revision: `webllm-${WEBLLM_VERSION}`,
     license: 'Llama 3.2 Community License',
     source: 'Hugging Face and GitHub, through WebLLM',
-    contextWindow: { ios: 1024, mobile: 1024, desktop: 2048 }, // tokens of conversation WebLLM reserves memory for
+    contextWindow: 2048, // tokens of conversation WebLLM reserves memory for
     // 16 layers × 8 key/value heads × 64 values × 2 (keys and values) × 2 bytes (16-bit) per token
     graph: { vocab: 128_256, lastTokenLogits: true, logitsBytes: 4, logitsCast: false, kvBytesPerToken: 16 * 8 * 64 * 2 * 2 },
   },
-  lfm26: {
-    id: 'lfm26',
-    kind: 'chat',
-    experimental: true,
-    name: 'LFM2.5 2.6B (experimental)',
-    short: 'LFM2.5 2.6B',
-    role: 'Experimental, for computers only. Too big for a phone: on a test iPhone, iOS ended the app while loading it, so it is blocked there.',
-    repo: 'LiquidAI/LFM2.5-2.6B-ONNX',
-    revision: '66826372fd4fa166f53be0371c9315745c07cace',
-    license: 'LFM Open License 1.0',
-    common: [
-      ['config.json', 1728],
-      ['generation_config.json', 146],
-      ['tokenizer.json', 17_905_598],
-      ['tokenizer_config.json', 6063],
-      ['chat_template.jinja', 5404],
-    ],
-    variants: {
-      q4f16: [
-        ['onnx/model_q4f16.onnx', 222_160],
-        ['onnx/model_q4f16.onnx_data', 1_063_972_864],
-        ['onnx/model_q4f16.onnx_data_1', 469_958_656],
-      ],
-      q4: [
-        ['onnx/model_q4.onnx', 315_101],
-        ['onnx/model_q4.onnx_data', 1_854_562_304],
-      ],
-    },
-    cpu: null, // no export of this model runs on the CPU backend (its 8-bit one is 3.9 GB)
-    graph: { vocab: 128_000, lastTokenLogits: true, logitsBytes: 4, logitsCast: false, kvBytesPerToken: 8 * 2 * 8 * 64 * 4 },
-  },
 };
 
-export const MODEL_IDS = ['lfm350', 'lfm230', 'lfm12', 'llama32', 'bge', 'lfm26'];
+export const MODEL_IDS = ['lfm350', 'lfm230', 'llama32', 'bge'];
+/** Models that were offered before and are gone: their files are deleted at startup to give the space back. */
+export const RETIRED_IDS = ['lfm12', 'lfm26'];
 /** Packages that hold only an engine (code), not a model. */
 export const ENGINE_IDS = ['engine', 'webllm'];
 export const CHAT_IDS = MODEL_IDS.filter((id) => PACKAGES[id].kind === 'chat');
@@ -253,7 +188,7 @@ export function pickVariant(pkg, gpu) {
 export const textBudget = (maxPrompt, overhead = 90) => Math.max(200, Math.round((maxPrompt - overhead) * 2.8));
 
 /** Changes whenever the AI files change shape; the page and the worker compare it to catch a half-updated app. */
-export const AI_BUILD = '2026-10-15.2';
+export const AI_BUILD = '2026-10-15.3';
 
 /** How many external weight files a variant has (Transformers.js must be told for some exports). */
 export const dataChunks = (pkg, dtype) => (pkg.variants?.[dtype] ?? []).filter(([path]) => /\.onnx_data(_\d+)?$/.test(path)).length;

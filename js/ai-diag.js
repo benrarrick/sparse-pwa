@@ -9,8 +9,6 @@
 /** code -> what to tell a person (no jargon), and whether trying again can work. */
 export const ERRORS = {
   MODEL_NOT_INSTALLED: { text: 'The AI model is not on this device. Download it on the AI page.', retry: false },
-  MODEL_NOT_ENABLED: { text: 'This model is experimental on this device and is switched off. Turn it on in AI settings to use it.', retry: false },
-  MODEL_QUARANTINED: { text: 'This model was switched off because it was interrupted unexpectedly. Your saved pages are untouched. See AI settings.', retry: false },
   MODEL_LOAD_FAILED: { text: 'The model could not be loaded into memory.', retry: true },
   MODEL_INCOMPATIBLE: { text: 'This model cannot run on this device.', retry: false },
   GPU_UNAVAILABLE: { text: 'This needs the GPU (WebGPU), which is not available here.', retry: false },
@@ -265,16 +263,12 @@ export function buildReport(d) {
   push('CURRENT STATE', line('scheduler', d.scheduler?.state), line('active operation', d.scheduler?.active), line('queue depth', d.scheduler?.queue?.length), line('worker', d.worker), line('loaded', d.loaded?.join(', ') || 'nothing'), '');
   push('INSTALLED MODELS');
   for (const r of d.models ?? []) push(`  ${r.id}: ${r.status}${r.dtype ? ` ${r.dtype}/${r.device}` : ''}${r.revision ? ` rev ${r.revision.slice(0, 8)}` : ''}${r.have ? `, ${r.have} bytes` : ''}${r.failures ? `, ${r.failures} failures` : ''}`);
-  push('', 'SAFETY PROFILES (this device class)');
-  for (const p of d.profiles ?? []) push(`  ${p.id}: ${p.status}${p.maxInput ? ` · input ≤ ${p.maxInput}, new ≤ ${p.maxNew}, total ≤ ${p.maxTotal}, time ≤ ${Math.round(p.maxMs / 1000)} s` : ''}${p.why ? ` · ${p.why}` : ''}${p.optIn !== undefined ? ` · opted in: ${p.optIn}` : ''}`);
-  push('', 'QUARANTINE');
-  for (const q of d.quarantine?.length ? d.quarantine : [null]) push(q ? `  ${q.key}: ${q.category} (${q.confidence}), ${iso(q.at)}` : '  none');
-  push('', 'CONFIGURATION HISTORY (clean runs / failures / unexplained interruptions)');
-  for (const [k, h] of Object.entries(d.history ?? {})) push(`  ${k}: ${h.ok} / ${h.failed} / ${h.interrupted}, last ${h.last?.outcome ?? '?'} ${iso(h.last?.at)}`);
+  push('', 'TOKEN LIMITS (prompt / answer / total / time)');
+  for (const [id, l] of Object.entries(d.limits ?? {})) push(`  ${id}: ${l.maxInput} / ${l.maxNew} / ${l.maxTotal} / ${Math.round(l.maxMs / 1000)} s`);
   push('', 'LAST INTERRUPTION AT LAUNCH');
   if (d.interruption) {
     const i = d.interruption;
-    push(`  ${i.category} (confidence ${i.confidence}) · quarantined: ${i.quarantine ? 'yes' : 'no'}`, `  ${i.message}`, `  last stage: ${i.checkpoint?.stage} · model ${i.checkpoint?.pkg} ${i.checkpoint?.dtype}/${i.checkpoint?.device} · input ${i.checkpoint?.inputTokens ?? '?'} tokens, output budget ${i.checkpoint?.maxNew ?? '?'}`);
+    push(`  ${i.category} (confidence ${i.confidence})`, `  ${i.message}`, `  last stage: ${i.checkpoint?.stage} · model ${i.checkpoint?.pkg} ${i.checkpoint?.dtype}/${i.checkpoint?.device} · input ${i.checkpoint?.inputTokens ?? '?'} tokens, output budget ${i.checkpoint?.maxNew ?? '?'}`);
     push(`  started ${iso(i.checkpoint?.started)} · last progress ${iso(i.checkpoint?.progress)} · tokens so far ${i.checkpoint?.tokens} · page was ${i.checkpoint?.vis}, hidden for ${i.checkpoint?.hiddenMs ?? 0} ms`);
     for (const r of i.reasons ?? []) push(`  - ${r}`);
   } else push('  none');
@@ -284,8 +278,6 @@ export function buildReport(d) {
   else push('  none this session');
   const p = d.performance ?? {};
   push('', 'PERFORMANCE (recent events)', `  runs ${p.runs} · median first token ${p.medianTtftMs ?? '–'} ms · median ${p.medianTokensPerSec?.toFixed?.(1) ?? '–'} tokens/s · median run ${p.medianRunMs ?? '–'} ms`, `  loads ${p.loads} · median load ${p.medianLoadMs ?? '–'} ms · retrievals ${p.retrievals} · median retrieval ${p.medianRetrievalMs ?? '–'} ms`, `  failures ${p.failures} ${JSON.stringify(p.failuresByCode ?? {})}`);
-  push('', 'EXPECTED ALLOCATIONS (estimates from tensor shapes in the model files, not measurements)');
-  for (const a of d.estimates ?? []) push(`  ${a}`);
   push('', `LOGGER ${JSON.stringify(d.logger ?? {})}`);
   if (d.detail) push('', 'DETAIL (includes text you asked about; you opted in to this)', ...(d.detail ?? []).map((x) => `  ${x}`));
   push('', 'RECENT EVENTS (newest first)');

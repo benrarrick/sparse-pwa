@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import * as D from '../js/ai-diag.js';
 
 test('every error code has a plain explanation', () => {
-  for (const code of ['MODEL_NOT_INSTALLED', 'MODEL_QUARANTINED', 'MODEL_LOAD_FAILED', 'MODEL_INCOMPATIBLE', 'GPU_UNAVAILABLE', 'GPU_DEVICE_LOST', 'TOKEN_BUDGET_EXCEEDED', 'TOKENIZATION_FAILED', 'INFERENCE_FAILED', 'INFERENCE_TIMEOUT', 'WORKER_FAILED', 'WORKER_UNRESPONSIVE', 'MODEL_DISPOSE_FAILED', 'STORAGE_ERROR', 'POSSIBLE_MEMORY_EXHAUSTION', 'UNEXPECTED_INTERRUPTION'])
+  for (const code of ['MODEL_NOT_INSTALLED', 'MODEL_LOAD_FAILED', 'MODEL_INCOMPATIBLE', 'GPU_UNAVAILABLE', 'GPU_DEVICE_LOST', 'TOKEN_BUDGET_EXCEEDED', 'TOKENIZATION_FAILED', 'INFERENCE_FAILED', 'INFERENCE_TIMEOUT', 'WORKER_FAILED', 'WORKER_UNRESPONSIVE', 'MODEL_DISPOSE_FAILED', 'STORAGE_ERROR', 'POSSIBLE_MEMORY_EXHAUSTION', 'UNEXPECTED_INTERRUPTION'])
     assert.ok(D.ERRORS[code]?.text.length > 10, code);
 });
 
@@ -129,22 +129,19 @@ test('the report is readable, complete and private by default', () => {
     worker: { state: 'responsive' },
     loaded: [],
     models: [{ id: 'lfm350', status: 'ready', dtype: 'q4f16', device: 'webgpu', revision: 'd11593fd9eb4', have: 258 }],
-    profiles: [{ id: 'lfm350', status: 'provisional', maxInput: 220, maxNew: 80, maxTotal: 280, maxMs: 90000 }],
-    quarantine: [{ key: 'lfm350@d11593fd|webgpu|q4f16', category: 'UNEXPECTED_INTERRUPTION', confidence: 'low', at: 1 }],
-    history: { 'lfm350@d11593fd|webgpu|q4f16': { ok: 3, failed: 0, interrupted: 1, last: { outcome: 'interrupted', at: 2 } } },
-    interruption: { category: 'UNEXPECTED_INTERRUPTION', confidence: 'low', quarantine: true, message: 'Previous inference was interrupted unexpectedly (x). iOS did not provide a termination reason.', reasons: ['r1'], checkpoint: { stage: 'prefill', pkg: 'lfm350', dtype: 'q4f16', device: 'webgpu', inputTokens: 180, maxNew: 60, started: 1, progress: 2, tokens: 0, vis: 'visible', hiddenMs: 0 } },
+    limits: { lfm350: { maxInput: 600, maxNew: 200, maxTotal: 760, maxMs: 120000 } },
+    interruption: { category: 'UNEXPECTED_INTERRUPTION', confidence: 'low', message: 'Previous inference was interrupted unexpectedly (x). iOS did not provide a termination reason.', reasons: ['r1'], checkpoint: { stage: 'prefill', pkg: 'lfm350', dtype: 'q4f16', device: 'webgpu', inputTokens: 180, maxNew: 60, started: 1, progress: 2, tokens: 0, vis: 'visible', hiddenMs: 0 } },
     lastInference: { status: 'ok', pkg: 'lfm350', dtype: 'q4f16', backend: 'webgpu', m: { inputTokens: 180, tokens: 50, requestedNew: 60, ttft: 400, tps: 20.1, ms: 3000, stopReason: 'eos' } },
     performance: { runs: 1, loads: 1, retrievals: 0, failures: 0, failuresByCode: {} },
-    estimates: ['LFM2.5 350M: scores for the last position only'],
     logger: { events: 3 },
     events: [{ t: 1, level: 'info', ev: 'ai.model.load.completed', op: 'op1', msg: 'Loaded', m: { ms: 1 } }],
     detail: null,
   };
   const { text, json } = D.buildReport(data);
-  for (const heading of ['APP', 'DEVICE', 'MEMORY INDICATORS', 'CURRENT STATE', 'INSTALLED MODELS', 'SAFETY PROFILES', 'QUARANTINE', 'LAST INTERRUPTION AT LAUNCH', 'LAST INFERENCE', 'PERFORMANCE', 'EXPECTED ALLOCATIONS', 'RECENT EVENTS']) assert.ok(text.includes(heading), heading);
+  for (const heading of ['APP', 'DEVICE', 'MEMORY INDICATORS', 'CURRENT STATE', 'INSTALLED MODELS', 'TOKEN LIMITS', 'LAST INTERRUPTION AT LAUNCH', 'LAST INFERENCE', 'PERFORMANCE', 'RECENT EVENTS']) assert.ok(text.includes(heading), heading);
   assert.match(text, /iOS did not provide a termination reason/);
   assert.match(text, /JS heap: unavailable/, 'unavailable memory is said to be unavailable, not invented');
-  assert.match(text, /estimates from tensor shapes.*not measurements/);
+  assert.match(text, /lfm350: 600 \/ 200 \/ 760 \/ 120 s/);
   assert.ok(!text.includes('DETAIL'));
   assert.equal(json.eventsCount, 1);
   const detailed = D.buildReport({ ...data, detail: ['question: why is the sky blue'] }).text;

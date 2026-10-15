@@ -69,12 +69,12 @@ const msgs = (n) => [{ role: 'system', content: 'be brief' }, { role: 'user', co
 const load = (s, id, extra = {}) => s.engine.handle({ type: 'load', id, pkg: 'llama32', dtype: 'q4f16_1', device: 'webgpu', cls: 'ios', ...extra });
 const gen = (s, id, n = 50, extra = {}) => s.engine.handle({ type: 'generate', id, pkg: 'llama32', messages: msgs(n), maxTokens: 20, ...extra });
 
-test('WebLLM load: asks for the pinned model with a window sized to the device class, and reports progress', async () => {
+test('WebLLM load: asks for the model with a fixed conversation window, and reports progress', async () => {
   const s = setup();
   await load(s, 'l1');
   assert.equal(s.of('loaded', 'l1').length, 1);
   assert.equal(s.calls.reload[0].id, ID);
-  assert.equal(s.calls.reload[0].opts.context_window_size, 1024, 'a phone reserves a small window');
+  assert.equal(s.calls.reload[0].opts.context_window_size, 2048, 'above the model token limit');
   assert.equal(s.calls.config.appConfig.cacheBackend, 'indexeddb');
   assert.deepEqual(s.calls.config.appConfig.model_list.map((r) => r.model_id), [ID], 'only this model, nothing else can be fetched');
   const p = s.of('progress', 'l1');
@@ -112,20 +112,20 @@ test('WebLLM generate: streams tokens, reports figures, uses greedy decoding and
 test('WebLLM generate fails closed over the budget, counting with the model tokenizer', async () => {
   const s = setup();
   await load(s, 'l1');
-  await gen(s, 'g1', 500); // phone limit is 400 prompt tokens
+  await gen(s, 'g1', 900); // the limit is 800 prompt tokens
   const e = s.of('error', 'g1')[0];
   assert.equal(e.code, 'TOKEN_BUDGET_EXCEEDED');
   assert.equal(s.calls.create.length, 0, 'nothing was sent to the model');
-  await gen(s, 'g2', 500, { fit: true });
+  await gen(s, 'g2', 900, { fit: true });
   assert.equal(s.of('done', 'g2').length, 1, 'with fit, the end of the text is cut to the limit instead');
   assert.ok(s.of('done', 'g2')[0].stats.trimmed > 0);
-  assert.ok(s.of('done', 'g2')[0].stats.promptTokens <= 400 + 20, 'what the library counted stays near the limit');
+  assert.ok(s.of('done', 'g2')[0].stats.promptTokens <= 800 + 20, 'what the library counted stays near the limit');
 });
 
 test('WebLLM without a reachable tokenizer still refuses a long prompt (a high estimate stands in)', async () => {
   const s = setup({ noTokenizer: true });
   await load(s, 'l1');
-  await gen(s, 'g1', 300); // ~1,400 characters ≈ 540 estimated tokens at 2.6 characters per token
+  await gen(s, 'g1', 520); // ~2,300 characters ≈ 880 estimated tokens at 2.6 characters per token
   assert.equal(s.of('error', 'g1')[0]?.code, 'TOKEN_BUDGET_EXCEEDED');
 });
 
@@ -151,10 +151,9 @@ test('WebLLM: a model the library does not list, or a failing load, is a clear e
   assert.deepEqual(b.engine.models(), []);
 });
 
-test('WebLLM unload releases it, and loading it on a desktop reserves a larger window', async () => {
+test('WebLLM unload releases it', async () => {
   const s = setup();
-  await load(s, 'l1', { cls: 'desktop' });
-  assert.equal(s.calls.reload[0].opts.context_window_size, 2048);
+  await load(s, 'l1');
   await s.engine.handle({ type: 'unload', id: 'u1', pkg: 'llama32' });
   assert.equal(s.calls.unload, 1);
   assert.deepEqual(s.engine.models(), []);

@@ -137,32 +137,32 @@ test('a model cannot be released while it is generating', async () => {
 test('the prompt is counted exactly and the budget is enforced before anything runs', async () => {
   const s = setup();
   await load(s, 'l1');
-  await gen(s, 'g1', 400); // 400 words + template > 220-token input limit on a phone
+  await gen(s, 'g1', 700); // 700 words + template: over the 600-token input limit
   const err = s.of('error', 'g1')[0];
   assert.equal(err.code, 'TOKEN_BUDGET_EXCEEDED');
   assert.ok(!s.trace.includes('+generate'), 'the model was never invoked');
   assert.equal(s.of('done').length, 0);
-  // a limit asked for by the page can never exceed the profile's
-  await gen(s, 'g2', 400, { limits: { maxInput: 5000, maxNew: 5000, maxTotal: 9999, maxMs: 1e9 } });
+  // a limit asked for by the page can never exceed the model's own
+  await gen(s, 'g2', 700, { limits: { maxInput: 5000, maxNew: 5000, maxTotal: 9999, maxMs: 1e9 } });
   assert.equal(s.of('error', 'g2')[0].code, 'TOKEN_BUDGET_EXCEEDED');
-  // ... unless developer mode is on (a deliberate act)
-  await gen(s, 'g3', 400, { limits: { maxInput: 900, maxNew: 40, maxTotal: 1000, maxMs: 60000 }, dev: true, maxTokens: 10 });
-  assert.equal(s.of('done', 'g3').length, 1);
+  // ... but it can ask for a lower one
+  await gen(s, 'g3', 500, { limits: { maxInput: 300 } });
+  assert.equal(s.of('error', 'g3')[0].code, 'TOKEN_BUDGET_EXCEEDED');
   // at the limit it is allowed
-  await gen(s, 'g4', 180, { maxTokens: 10 });
+  await gen(s, 'g4', 590, { maxTokens: 10 });
   assert.equal(s.of('done', 'g4').length, 1);
 });
 
 test('input + new tokens never exceed the combined limit', async () => {
   const s = setup();
   await load(s, 'l1');
-  await gen(s, 'g1', 200, { maxTokens: 500 }); // 208 prompt tokens; profile total 280
+  await gen(s, 'g1', 580, { maxTokens: 500 }); // 588 prompt tokens; the model's total is 760
   const done = s.of('done', 'g1')[0];
-  assert.equal(done.stats.promptTokens, 208);
-  assert.ok(done.stats.promptTokens + done.stats.maxNew <= 280);
-  assert.equal(done.stats.maxNew, 72);
+  assert.equal(done.stats.promptTokens, 588);
+  assert.ok(done.stats.promptTokens + done.stats.maxNew <= 760);
+  assert.equal(done.stats.maxNew, 172);
   assert.equal(done.stats.clamped, true);
-  assert.equal(done.stats.tokens, 72);
+  assert.equal(done.stats.tokens, 172);
   assert.equal(done.stats.stopReason, 'length');
   assert.equal(done.stats.lastTokenLogits, true, 'read from the loaded graph, not assumed');
   assert.equal(done.stats.est.positions, 1);
@@ -179,24 +179,24 @@ test('a prompt that cannot be measured is refused, not run', async () => {
 test('fit cuts the end of the last message, counted exactly, instead of refusing', async () => {
   const s = setup();
   await load(s, 'l1');
-  await gen(s, 'g1', 600, { fit: true, maxTokens: 10 });
+  await gen(s, 'g1', 900, { fit: true, maxTokens: 10 });
   const done = s.of('done', 'g1')[0];
   assert.ok(done, JSON.stringify(s.of('error', 'g1')));
-  assert.ok(done.stats.promptTokens <= 220);
+  assert.ok(done.stats.promptTokens <= 600);
   assert.ok(done.stats.trimmed >= 1);
   assert.ok(s.out.some((m) => m.type === 'log' && /Trimmed the end of the text/.test(m.msg)));
   assert.equal(trimTail('First sentence. Second sentence. Third', 20), 'First sentence.');
   assert.equal(trimTail('short', 20), 'short');
 });
 
-test('the 303-over-300 case: a prompt a few tokens over is trimmed and runs', async () => {
+test('a prompt a few tokens over the limit is trimmed and runs (with fit), or refused with a reason (without)', async () => {
   const s = setup();
-  await load(s, 'l1', 'lfm12');
-  // 1.2B on a phone: 300-token limit. 297 words + 6 template = 303 tokens.
-  await s.engine.handle({ type: 'generate', id: 'g1', pkg: 'lfm12', messages: [{ role: 'user', content: words(297) }], maxTokens: 20, fit: true });
+  await load(s, 'l1');
+  // 595 words + 6 template tokens = 601, one over the 600-token limit
+  await s.engine.handle({ type: 'generate', id: 'g1', pkg: 'lfm350', messages: [{ role: 'user', content: words(595) }], maxTokens: 20, fit: true });
   const done = s.of('done', 'g1')[0];
-  assert.ok(done && done.stats.promptTokens <= 300, JSON.stringify(s.of('error', 'g1')));
-  await s.engine.handle({ type: 'generate', id: 'g2', pkg: 'lfm12', messages: [{ role: 'user', content: words(297) }], maxTokens: 20 });
+  assert.ok(done && done.stats.promptTokens <= 600, JSON.stringify(s.of('error', 'g1')));
+  await s.engine.handle({ type: 'generate', id: 'g2', pkg: 'lfm350', messages: [{ role: 'user', content: words(595) }], maxTokens: 20 });
   assert.equal(s.of('error', 'g2')[0].code, 'TOKEN_BUDGET_EXCEEDED', 'without fit it is refused with a clear reason');
 });
 
@@ -280,17 +280,15 @@ test('stage messages are posted in order, with exact token counts', async () => 
   assert.deepEqual(loads, ['load.start', 'load.initialising', 'load.ready']);
 });
 
-test('unsupported and unqualified configurations are refused at load', async () => {
+test('configurations that cannot work are refused at load', async () => {
   const s = setup();
-  await load(s, 'a', 'lfm26'); // not on a phone
+  await load(s, 'a', 'lfm12'); // no longer offered
   assert.equal(s.of('error', 'a')[0].code, 'MODEL_INCOMPATIBLE');
   await s.engine.handle({ type: 'load', id: 'b', pkg: 'lfm350', dtype: 'q8', device: 'wasm', chunks: 1, cls: 'ios' }); // no silent CPU fallback
   assert.equal(s.of('error', 'b')[0].code, 'MODEL_INCOMPATIBLE');
   await s.engine.handle({ type: 'load', id: 'c', pkg: 'nope', dtype: 'q4', device: 'webgpu' });
   assert.equal(s.of('error', 'c')[0].code, 'MODEL_INCOMPATIBLE');
   assert.deepEqual(s.engine.models(), []);
-  await s.engine.handle({ type: 'load', id: 'd', pkg: 'lfm26', dtype: 'q4f16', device: 'webgpu', chunks: 2, cls: 'desktop' });
-  assert.equal(s.of('loaded', 'd').length, 1, 'allowed on a desktop');
 });
 
 test('a lost GPU device stops further GPU work until the engine is restarted', async () => {

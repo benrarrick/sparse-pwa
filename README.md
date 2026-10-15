@@ -34,43 +34,32 @@ DuckDuckGo's own results pages can't be read by a web page. The app opens them i
 
 Open **Settings → On-device AI** (`#/ai`). Nothing downloads until you tap Download, every model can be removed again, and **the browser works fully without any of it**. After the download, everything runs on the device with no connection, and nothing you read or ask is sent anywhere.
 
-The full write-up (safety policy, what was measured, observability guide, benchmarks, tests, a manual iPhone test plan, known limits) is in **[docs/ai.md](docs/ai.md)**. In short:
-
-| Model | On a phone | Download |
+| Model | Download | Notes |
 |---|---|---|
-| LFM2.5 350M Instruct | provisional, the default; WebGPU | 258 MB (q4f16) / 297 MB (q4) |
-| LFM2.5 230M Instruct | provisional, the lowest-memory fallback; WebGPU | 216 MB |
-| LFM2.5 1.2B Instruct | **experimental: off until you opt in** | 764 MB (q4f16), 854 MB (q4), 1.52 GB (CPU, computers) |
-| Llama 3.2 1B Instruct (through WebLLM) | **experimental: off until you opt in**; WebGPU with 16-bit floats | 711 MB (kept by WebLLM) + 6 MB engine |
-| LFM2.5 2.6B | **blocked** (iOS ended the app while loading it); computers, opt in | 1.53 GB |
-| BGE small en v1.5 | finds saved passages by meaning; CPU | 35 MB |
-| AI engine (Transformers.js 4.3.0, ONNX Runtime Web) | needed by all | 27 MB (about 6 MB on the wire) |
+| LFM2.5 350M Instruct | 258 MB (q4f16) / 297 MB (q4) | small and quick; WebGPU |
+| LFM2.5 230M Instruct | 216 MB | the smallest; WebGPU |
+| Llama 3.2 1B Instruct (through WebLLM) | 711 MB, kept by WebLLM, + a 6 MB engine | the best answers of the small models tried; WebGPU with 16-bit floats |
+| BGE small (English) | 35 MB | finds saved passages by meaning; runs on the CPU |
 
-"Provisional" means conservative limits that have **not been proven on a real device**, not a claim of safety. Licences: LFM Open License 1.0 for the LFM models, Llama 3.2 Community License for Llama, MIT for BGE.
+Licences: LFM Open License 1.0 for the LFM models, Llama 3.2 Community License for Llama, MIT for BGE. (Earlier versions also offered LFM2.5 1.2B and 2.6B; they are removed, and their files are deleted from the device the next time the app starts.)
 
 **What it does**
-1. **Summarise** a reader page: sentences are picked from the whole page (not just its start), one pass when possible, a bounded number of notes plus a combine only when one pass would see too little. The card says how much of the page was read. Summaries are kept with the page, keyed by model, method and page text.
-2. **Ask from saved pages and searches** (`#/ask`): keyword (BM25, updated incrementally) plus meaning (BGE) matching over every saved page, a hard evidence budget, cited answers `[1]`. **If no model may run** (not downloaded, switched off, no WebGPU), it shows the closest passages with their sources instead.
+1. **Summarise** a reader page: sentences are picked from the whole page (not just its start), one pass when possible, a bounded number of notes plus a combine only when one pass would see too little. Summaries are kept with the page.
+2. **Ask from saved pages and searches** (`#/ask`): keyword (BM25, updated incrementally) plus meaning (BGE) matching over every saved page, a hard evidence budget, cited answers `[1]`. With no model available it shows the closest passages with their sources instead.
 3. **Ask from the model's own knowledge**, labelled as possibly wrong.
 
-**How it is kept from destabilising the app** (iOS can end a page that uses too much memory, with no error to catch)
-- Each model has per-device **token budgets** (prompt, answer, and combined), counted exactly with the model's tokenizer, enforced inside the engine, and refused rather than risked. Ordinary settings can lower them, never raise them.
-- **One operation at a time**: loads, embeddings, generations, unloads and resets queue in one scheduler, enforced again inside the worker. Stop is never queued. One model in memory at a time; BGE is released before a chat model loads.
-- **Checkpoints** are written before each risky stage. A leftover one at the next launch is *classified* (backgrounded, closed, GPU lost, unexplained, repeated) rather than assumed to be an out-of-memory crash; an unexplained foreground interruption **switches that model setup off** until you retest it in developer mode.
-- The AI stops if the app goes to the background; it never runs on the page itself on a phone; a half-updated app is detected.
+**Keeping the app steady** (iOS can end a page that uses too much memory, with no error to catch)
+- Each model has **token limits** (prompt, answer, combined), counted with the model's own tokenizer and enforced inside the engine; they are in one place, `SAFETY` in `js/ai-policy.js`, and the same on every device.
+- **One operation at a time**, one model in memory at a time; the AI stops if the app goes to the background; a half-updated app is detected.
+- **Checkpoints** are written before each risky stage. If the app is ended in the middle of one, the next launch says so on the AI page and in the log, with a plain diagnosis (backgrounded, closed, GPU lost, unexplained). Nothing is switched off because of it.
 
-**Diagnostics** (AI page): live status, last inference, performance medians, recent failures and recovery actions, safety profiles, the structured log, and **Copy report** / **Copy as JSON**. Reports hold ids, counts and timings, never page text or questions unless you tick the opt-in. See docs/ai.md for how to read one.
+**The AI page** shows each model with Download / Pause / Test / Remove, the model chooser, a one-line status, and the log (every download, load and run, with where and why anything failed), with **Copy report** / **Copy as JSON**. Reports hold ids, counts and timings, never page text or questions. See docs/ai.md.
 
-**Downloads** resume where they stopped (8 MB pieces in IndexedDB, HTTP Range, retries, wait for the connection), keep the screen on, check free storage first, pin revisions, check sizes, and verify the engine's SHA-256.
+**Downloads** (Transformers.js models) resume where they stopped, keep the screen on, check free storage first, pin revisions and verify sizes and the engine's SHA-256. Llama's weights are fetched by WebLLM itself.
 
-**Memory facts, briefly** (details and caveats in docs/ai.md)
-- Read from the model files: the 350M and 2.6B exports score only the last prompt position; the 1.2B and 230M score every prompt position, which is why long prompts hurt the 1.2B (an estimated 125 MB at 300 tokens, 1.25 GB at 3,000, against 8 MB and 74 MB for the 350M).
-- Observed on a test iPhone with the 1.2B: 338-token prompts worked, about 650 ended the app, and the 2.6B ended the app while loading. Those runs predate this work; **none of the new models or limits has been run on an iPhone yet.**
-- Safari does not report memory, so figures are labelled estimates. `tools/add_logits_to_keep.py` reproducibly rewrites a full-sequence graph to the last-token form (verified in ONNX Runtime on the 230M, not shipped).
+**Testing:** `npm test`; `node bench/run.mjs` (source selection and retrieval benchmark). `localStorage['sparse-ai-class']` can be set to `"ios"` or `"mobile"` to make the app treat the device as a phone in its logs.
 
-**Testing:** `npm test` (96 tests); `node bench/run.mjs` (source selection and retrieval benchmark on `bench/fixtures`). Settings for testers: developer testing mode (AI page → Safety) allows longer prompts, a software GPU and retesting a switched-off model; `localStorage['sparse-ai-class']` can be set to `"ios"` or `"mobile"` to apply stricter limits on a device (it can never loosen them).
-
-Files: `js/ai.js` (page side: downloads, worker, safety state, checkpoints, retrieval), `js/ai-engine.js` + `js/ai-worker.js` (run the models), `js/ai-policy.js` (profiles, budgets, interruption diagnosis), `js/ai-ops.js` (scheduler), `js/ai-diag.js` (events, error codes, report), `js/ai-select.js` (summary evidence and retrieval selection), `js/ai-store.js` (IndexedDB `sparse-ai`), `js/ai-lib.js` (catalog, prompts, BM25).
+Files: `js/ai.js` (page side: downloads, worker, checkpoints, retrieval), `js/ai-engine.js` + `js/ai-worker.js` (run the models), `js/ai-policy.js` (limits, interruption diagnosis), `js/ai-ops.js` (scheduler), `js/ai-diag.js` (events, error codes, report), `js/ai-select.js` (summary evidence and retrieval selection), `js/ai-store.js` (IndexedDB `sparse-ai`), `js/ai-lib.js` (catalog, prompts, BM25), `vendor/` (WebLLM).
 
 ## Activity and network details
 

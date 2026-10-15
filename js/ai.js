@@ -5,9 +5,8 @@
 //     safe) and its health
 //   - ONE operation at a time (ai-ops.js): loading, embedding, generating, unloading and resetting
 //     queue here, and are enforced again inside the engine
-//   - safety (ai-policy.js): per-model profiles and token budgets, checkpoints written before each
-//     risky stage, a diagnosis of the last launch's interruption, and quarantine of configurations
-//     that were interrupted unexpectedly
+//   - limits (ai-policy.js): per-model token budgets, checkpoints written before each risky stage, and
+//     a diagnosis of the last launch's interruption (shown, never acted on)
 //   - the diagnostics log (ai-diag.js): structured events, kept on the device and bounded
 //   - retrieval over saved pages and searches (keywords + BGE vectors), and summaries
 import * as AL from './ai-lib.js';
@@ -21,16 +20,14 @@ import { record } from './net.js';
 import { serviceOf } from './lib.js';
 
 const P = AL.PACKAGES;
+const OLD_KEYS = ['sparse-ai-quarantine', 'sparse-ai-history', 'sparse-ai-safety']; // from versions that had safety switches
 const K = {
   cp: 'sparse-ai-cp', // the checkpoint of the work in progress
-  quarantine: 'sparse-ai-quarantine',
-  history: 'sparse-ai-history',
-  safety: 'sparse-ai-safety', // developer mode and the models opted in to
   legacy: 'sparse-ai-busy', // the older, single-marker crash detection
   interruption: 'sparse-ai-interruption', // the diagnosis made at the last launch
 };
 /** Errors that say nothing about the model's health (refused up front, or stopped on purpose). */
-const BENIGN = new Set(['CANCELLED', 'BACKGROUNDED', 'TOKEN_BUDGET_EXCEEDED', 'TOKENIZATION_FAILED', 'MODEL_NOT_INSTALLED', 'MODEL_QUARANTINED', 'MODEL_NOT_ENABLED', 'MODEL_INCOMPATIBLE', 'NOT_FOREGROUND', 'VERSION_MISMATCH', 'QUEUE_FULL', 'GPU_UNAVAILABLE']);
+const BENIGN = new Set(['CANCELLED', 'BACKGROUNDED', 'TOKEN_BUDGET_EXCEEDED', 'TOKENIZATION_FAILED', 'MODEL_NOT_INSTALLED', 'MODEL_INCOMPATIBLE', 'NOT_FOREGROUND', 'VERSION_MISMATCH', 'QUEUE_FULL', 'GPU_UNAVAILABLE']);
 const CHUNK = 8 * 1024 * 1024;
 const STALL_MS = 45_000;
 const LOAD_LIMIT_MS = 240_000;
@@ -143,7 +140,7 @@ async function save(rec) {
 // ---------- device ----------
 
 /** WebGPU worth using: a software fallback (SwiftShader) is slower than the CPU path, so it counts only in developer testing mode. */
-export const usableGpu = (d) => (d.gpu.gpu && (!d.gpu.fallback || safety.dev) ? d.gpu : null);
+export const usableGpu = (d) => (d.gpu.gpu && !d.gpu.fallback ? d.gpu : null);
 
 let deviceInfo = null;
 const cls = PO.deviceClass(undefined, jget('sparse-ai-class', null));
@@ -172,50 +169,28 @@ export async function device(force = false) {
   return deviceInfo;
 }
 
-// ---------- safety state: developer mode, opt-ins, quarantine, history ----------
+// ---------- state ----------
 
-const safety = { dev: false, optIn: [], ...jget(K.safety, {}) };
-let quarantine = new Map(Object.entries(jget(K.quarantine, {})));
-let history = jget(K.history, {});
 let gpuLost = false;
 let versionMismatch = false;
 let lastInference = null;
 let interruption = jget(K.interruption, null);
 
-const policyState = () => ({ cls, dev: safety.dev, optIn: new Set(safety.optIn), quarantine, gpuLost });
-const saveSafety = () => {
-  jset(K.safety, safety);
-  emit('safety');
-};
-
-export const getDev = () => safety.dev;
-export function setDev(on) {
-  safety.dev = !!on;
-  saveSafety();
-  event('ai.safety.developer_mode', { level: 'warn', msg: `Developer testing mode turned ${on ? 'on' : 'off'}` });
-}
-export const optedIn = (id) => safety.optIn.includes(id);
-export function setOptIn(id, on) {
-  safety.optIn = [...new Set(on ? [...safety.optIn, id] : safety.optIn.filter((x) => x !== id))];
-  saveSafety();
-  event('ai.safety.opt_in', { msg: `${P[id]?.short ?? id}: experimental use turned ${on ? 'on' : 'off'}`, pkg: id });
-}
-
-/** Whether a downloaded model may run now (profile, opt-in, quarantine, GPU), and why not. */
+/** Whether a downloaded model can run now, and why not. */
 export function mayRun(id) {
   const r = recs.get(id);
   if (!r?.dtype || r.status !== 'ready') return { ok: false, code: 'MODEL_NOT_INSTALLED', why: `${P[id]?.short ?? id} is not downloaded` };
   // a weights file this browser's engine already failed to load is not tried again until it is replaced
   if (r.incompatible && r.incompatible.dtype === r.dtype && r.incompatible.device === r.device)
     return { ok: false, code: 'MODEL_INCOMPATIBLE', why: `The ${r.dtype} weights could not be loaded on ${r.device === 'webgpu' ? 'WebGPU' : 'the CPU'} here (${r.incompatible.message}). Remove ${P[id].short} and download it again to retry` };
-  return PO.mayRun(id, r.device, r.dtype, policyState());
+  return PO.mayRun(id, r.device, r.dtype, { gpuLost });
 }
 
-/** The chat model to use: the preferred one if it may run, else a provisional one that may. Never an experimental one unless chosen. */
+/** The chat model to use: the one chosen if it can run, else the first downloaded one that can. */
 export function chatModel(preferred) {
   const ok = (id) => ready.has(id) && P[id]?.kind === 'chat' && mayRun(id).ok;
   if (preferred && ok(preferred)) return preferred;
-  return AL.CHAT_IDS.find((id) => ok(id) && PO.profileFor(id, cls).status === 'provisional') ?? null;
+  return AL.CHAT_IDS.find(ok) ?? null;
 }
 export const anyChat = (preferred) => chatModel(preferred) !== null;
 
@@ -226,36 +201,13 @@ export function chatBlockers() {
     .filter((x) => !x.ok);
 }
 
-export const profile = (id) => PO.profileFor(id, cls);
+export const profile = (id) => PO.profileFor(id);
 export const lowMemory = () => PO.isLowMemory(cls);
 export { explain };
-/** Prompt limits a person may pick for a model: lower than the profile's, or higher only in developer mode. */
-export const limitChoices = (id) => PO.promptLimitChoices(PO.profileFor(id, cls), safety.dev);
-export const limitsFor = (id, promptLimit) => PO.effectiveLimits(PO.profileFor(id, cls), { promptLimit, dev: safety.dev });
-
-export const quarantined = () => [...quarantine.entries()].map(([key, q]) => ({ key, ...q }));
-
-/** Developer mode only: clears a quarantine so the configuration can be tested again. */
-export function retest(key) {
-  if (!safety.dev) throw new AiError('MODEL_QUARANTINED', 'Turn on developer testing mode to retest a model that was switched off');
-  const q = quarantine.get(key);
-  quarantine.delete(key);
-  jset(K.quarantine, Object.fromEntries(quarantine));
-  event('ai.quarantine.released', { level: 'warn', msg: `Retest allowed for ${key}`, key, category: q?.category });
-  emit('safety');
-}
-
-function setQuarantine(key, q) {
-  quarantine.set(key, q);
-  jset(K.quarantine, Object.fromEntries(quarantine));
-  event('ai.quarantine.added', { level: 'error', msg: `Switched off ${key}: ${q.category}`, key, category: q.category, confidence: q.confidence });
-  emit('safety');
-}
-
-function noteOutcome(key, outcome, detail) {
-  history[key] = PO.noteOutcome(history[key], outcome, detail);
-  jset(K.history, history);
-}
+export const limitsFor = (id) => {
+  const p = PO.profileFor(id);
+  return { maxInput: p.maxInput, maxNew: p.maxNew, maxTotal: p.maxTotal, maxMs: p.maxMs };
+};
 
 // ---------- checkpoints: written BEFORE each risky stage ----------
 
@@ -708,11 +660,6 @@ async function noteFailure(id, phase, e) {
   event('ai.operation.error', { level: 'error', msg: `${P[id]?.short ?? id}: ${e.message}`, code, stage: cp?.stage ?? phase, op: cp?.op, ...modelFields(id), detail: e.detail });
 }
 
-const cfgKey = (id) => {
-  const r = recs.get(id);
-  return PO.configKey(id, r?.device, r?.dtype);
-};
-
 /** Opens an operation's checkpoint (before anything risky happens). */
 function begin(ctx, type, id, extra = {}) {
   const r = recs.get(id);
@@ -753,7 +700,7 @@ export function unload(id) {
  * `maxPrompt` can only lower the profile's input limit (unless developer mode is on). `fit` lets
  * the engine cut the END of the last message to fit, counting exactly.
  */
-export function generate(id, messages, { maxTokens = 128, onToken, onProgress, label = 'run', maxPrompt = null, fit = false, owner = null, meta = {} } = {}) {
+export function generate(id, messages, { maxTokens = 128, onToken, onProgress, label = 'run', fit = false, owner = null, meta = {} } = {}) {
   return sched.run({ type: 'generate', pkg: id, label, owner }, async (ctx) => {
     begin(ctx, 'generate', id);
     const key = ctx.id;
@@ -771,7 +718,7 @@ export function generate(id, messages, { maxTokens = 128, onToken, onProgress, l
       preflight(id, 'generate');
       await ctx.child({ type: 'load', pkg: id, label: 'load' }, (c) => loadStep(c, id, { onProgress }));
       if (ctx.cancelled()) throw new Cancelled('Stopped');
-      const limits = limitsFor(id, maxPrompt);
+      const limits = limitsFor(id);
       current = key;
       cpStage('tokenize', { maxNew: Math.min(maxTokens, limits.maxNew) });
       // the engine stops itself at maxMs; if it cannot (stuck in one long call), the page ends it
@@ -781,7 +728,7 @@ export function generate(id, messages, { maxTokens = 128, onToken, onProgress, l
       }, limits.maxMs + 20_000);
       setWorker('busy', `${P[id].short} is working`);
       const { stats } = await request(
-        { type: 'generate', id: key, pkg: id, messages, maxTokens, limits, fit, dev: safety.dev, vis: document.visibilityState },
+        { type: 'generate', id: key, pkg: id, messages, maxTokens, limits, fit, vis: document.visibilityState },
         {
           token: (t) => {
             last = Date.now();
@@ -806,7 +753,6 @@ export function generate(id, messages, { maxTokens = 128, onToken, onProgress, l
         ...modelFields(id),
         m,
       });
-      noteOutcome(cfgKey(id), completed || stats.stopped ? 'ok' : 'failed', { stage: 'generate.done' });
       if (stats.stopReason === 'timeout') throw new AiError('INFERENCE_TIMEOUT', `Stopped after ${Math.round(limits.maxMs / 1000)} s`, { partial: true });
       // a long prompt leaves memory reserved: give it back right away on phones
       if (PO.isLowMemory(cls) && stats.promptTokens > limits.maxInput * 0.85) {
@@ -832,7 +778,6 @@ export function generate(id, messages, { maxTokens = 128, onToken, onProgress, l
         detail: e.detail,
       });
       if (!BENIGN.has(code)) {
-        noteOutcome(cfgKey(id), 'failed', { code, stage });
         await noteFailure(id, 'run', e);
       }
       recycleIfNeeded(code, e.message);
@@ -869,14 +814,12 @@ export function withEmbedder(fn, { owner = null, label = 'embed' } = {}) {
         cancelled: () => ctx.cancelled(),
       };
       const out = await fn(e);
-      noteOutcome(cfgKey('bge'), 'ok', {});
       return out;
     } catch (err) {
       const code = err.code && err.code !== 'UNKNOWN' ? err.code : classifyError(err, { stage: cp?.stage, gpuLost });
       err.code = code;
       event('ai.embed.failed', { level: code === 'CANCELLED' || code === 'BACKGROUNDED' ? 'warn' : 'error', msg: `Embedding failed: ${err.message}`, code, op: ctx.id, stage: cp?.stage, ...modelFields('bge') });
       if (!BENIGN.has(code)) {
-        noteOutcome(cfgKey('bge'), 'failed', { code, stage: cp?.stage });
         await noteFailure('bge', 'embed', err);
       }
       recycleIfNeeded(code, err.message);
@@ -1128,7 +1071,7 @@ async function run(j) {
 /**
  * A WebLLM model downloads through WebLLM itself, which keeps the files in its own IndexedDB store: the engine loads
  * the model once with `fetchOnly` and releases it. That is a real GPU load, so it runs as a queued, checkpointed
- * operation like any other load (an iOS kill during it is diagnosed, and quarantines the model). Pieces already
+ * operation like any other load (an iOS kill during it is diagnosed on the next launch). Pieces already
  * stored are not fetched again, so a retry continues roughly where the last attempt stopped.
  */
 async function fetchWebllm(j, id, spec, rec) {
@@ -1304,7 +1247,7 @@ async function deleteWebllmStore() {
   );
 }
 
-/** Deletes every AI file, vector, summary and log entry, the safety history, and the database itself. */
+/** Deletes every AI file, vector, summary and log entry, and the database itself. */
 export async function removeAll() {
   queue.splice(0);
   if (job) {
@@ -1321,13 +1264,9 @@ export async function removeAll() {
   } catch {
     // no Cache Storage
   }
-  for (const k of Object.values(K)) jdel(k);
+  for (const k of [...Object.values(K), ...OLD_KEYS]) jdel(k);
   cp = null;
-  quarantine = new Map();
-  history = {};
   interruptionRec = null;
-  safety.dev = false;
-  safety.optIn = [];
   gpuLost = false;
   lastInference = null;
   vecCache.clear();
@@ -1351,24 +1290,23 @@ export function ackInterruption() {
   emit('safety');
 }
 
-/** True when automatic summaries may run: nothing has been switched off for safety. */
-export const autoAllowed = () => quarantine.size === 0 && !gpuLost && !versionMismatch;
+/** True when automatic summaries may run: the GPU is fine and the app is fully updated. */
+export const autoAllowed = () => !gpuLost && !versionMismatch;
 
 /**
  * Looks at the checkpoint (or the older busy marker) that the last launch left behind, decides what it
- * most likely means, and acts on it: counts it, switches the configuration off when the evidence
- * calls for it, and keeps a note for the AI page. A leftover checkpoint is not proof of a crash.
+ * most likely means, and keeps a note for the AI page. A leftover checkpoint is not proof of a crash,
+ * and nothing is switched off because of one.
  */
 async function recoverFromInterruption(old, legacy) {
   jdel(K.cp);
   jdel(K.legacy);
   const stale = old && old.v !== PO.POLICY_VERSION;
   const c = old && !stale ? old : { legacy: true, v: 1, type: legacy?.what ?? old?.type, pkg: legacy?.pkg ?? old?.pkg, stage: 'unknown', started: legacy?.at ?? old?.started ?? Date.now(), progress: legacy?.at ?? old?.progress ?? Date.now(), vis: 'unknown', hiddenMs: 0 };
-  const key = c.pkg && c.device && c.dtype ? `${c.pkg}@${(c.rev ?? '').slice(0, 8)}|${c.device}|${c.dtype}` : null;
-  const diag = PO.classifyInterruption(c, { history: key ? (history[key] ?? {}) : {} });
-  const unexplained = diag.category === 'UNEXPECTED_INTERRUPTION' || diag.category === 'POSSIBLE_MEMORY_EXHAUSTION';
+  const diag = PO.classifyInterruption(c);
+  const unexplained = diag.category === 'UNEXPECTED_INTERRUPTION';
   event('ai.recovery.interrupted', {
-    level: unexplained && diag.quarantine ? 'error' : 'warn',
+    level: unexplained ? 'error' : 'warn',
     msg: diag.message,
     code: diag.category,
     op: c.op,
@@ -1376,12 +1314,8 @@ async function recoverFromInterruption(old, legacy) {
     pkg: c.pkg,
     dtype: c.dtype,
     backend: c.device,
-    m: { confidence: diag.confidence, quarantine: diag.quarantine, reasons: diag.reasons, inputTokens: c.inputTokens, maxNew: c.maxNew, tokens: c.tokens, vis: c.vis, hiddenMs: c.hiddenMs, startedAt: c.started, progressAt: c.progress, previousSession: c.sid },
+    m: { confidence: diag.confidence, reasons: diag.reasons, inputTokens: c.inputTokens, maxNew: c.maxNew, tokens: c.tokens, vis: c.vis, hiddenMs: c.hiddenMs, startedAt: c.started, progressAt: c.progress, previousSession: c.sid },
   });
-  if (key && unexplained) noteOutcome(key, 'interrupted', { category: diag.category, stage: c.stage });
-  if (key && diag.quarantine) {
-    setQuarantine(key, { at: Date.now(), category: diag.category, confidence: diag.confidence, reasons: diag.reasons, stage: c.stage, pkg: c.pkg, dtype: c.dtype, device: c.device, inputTokens: c.inputTokens });
-  }
   const r = c.pkg ? await AS.get('pkgs', c.pkg).catch(() => null) : null;
   if (r && r.status !== 'none') {
     Object.assign(r, { crashes: (r.crashes ?? 0) + (unexplained ? 1 : 0), lastCrash: { stage: c.stage, category: diag.category, found: Date.now() } });
@@ -1408,6 +1342,16 @@ export async function init() {
   addEventListener('pagehide', onPageHide);
   event('ai.app.launch', { msg: `AI session started (${cls}, build ${AL.AI_BUILD})`, m: { cls, standalone: matchMedia('(display-mode: standalone)').matches || navigator.standalone === true } });
   if (old || legacy) await recoverFromInterruption(old, legacy);
+  for (const k of OLD_KEYS) jdel(k);
+  for (const id of AL.RETIRED_IDS) {
+    // models that are no longer offered: give their space back
+    const r = await AS.get('pkgs', id).catch(() => null);
+    if (!r) continue;
+    await AS.removePackage(id).catch(() => {});
+    await AS.del('pkgs', id).catch(() => {});
+    await AS.delPrefix('notes', `sum|${id}|`).catch(() => {});
+    await log('info', 'storage', `Removed ${id}, which is no longer offered${r.have ? `: freed about ${AL.size(r.have)}` : ''}`);
+  }
   for (const id of Object.keys(P)) {
     const r = await AS.get('pkgs', id).catch(() => null);
     if (!r) continue;
@@ -1577,28 +1521,12 @@ export const status = () => ({
   worker: workerInfo(),
   loaded: [...loaded.entries()].map(([id, i]) => ({ id, ...i })),
   cls,
-  dev: safety.dev,
-  quarantine: quarantined(),
   gpuLost,
   versionMismatch,
   lastInference,
   interruption: lastInterruption(),
   logger: logger.stats(),
 });
-
-export const history_ = () => history;
-
-/** One row per model for this device class: status, limits, whether it may run. */
-export function profileTable() {
-  return Object.keys(P)
-    .filter((id) => P[id].kind !== 'engine')
-    .map((id) => {
-      const p = PO.profileFor(id, cls);
-      const r = recs.get(id);
-      const may = r?.dtype ? PO.mayRun(id, r.device, r.dtype, policyState()) : null;
-      return { id, ...p, optIn: p.status === 'experimental' ? optedIn(id) : undefined, runnable: may ? may.ok : null, blockedBy: may && !may.ok ? may.code : null };
-    });
-}
 
 let debugCapsule = null;
 /** In memory only, never stored: the question and source titles of the last answer, for an opted-in detailed report. */
@@ -1608,17 +1536,11 @@ export const noteDetail = (d) => {
 
 export async function diagnostics({ detail = false } = {}) {
   const [d, st, entries, jsStore] = await Promise.all([device(true), states(), readLog(300), navigator.storage?.estimate?.().catch(() => null) ?? null]);
-  const estimates = AL.CHAT_IDS.map((id) => {
-    const lim = PO.profileFor(id, cls);
-    if (!lim.maxInput) return `${P[id].short}: no limits on this device (${lim.status})`;
-    const est = PO.estimateAllocations(id, lim.maxInput);
-    return `${P[id].short}: ${est.positions === 1 ? 'scores for the last position only' : `scores for all ${est.positions} prompt positions`}: ≈${AL.size(est.logits + est.castCopy)} (${AL.size(est.logits)} scores${est.castCopy ? ` + ${AL.size(est.castCopy)} 16→32-bit copy` : ''}), key/value cache ≈${AL.size(est.kv)}, at the ${lim.maxInput}-token limit`;
-  });
   const data = {
     now: Date.now(),
     formatVersion: 2,
     build: AL.AI_BUILD,
-    runtimeVersions: 'Transformers.js 4.3.0 · ONNX Runtime Web 1.31.0-dev.20260914',
+    runtimeVersions: `Transformers.js 4.3.0 · ONNX Runtime Web 1.31.0-dev.20260914 · WebLLM ${AL.WEBLLM_VERSION}`,
     mode: conn?.mode ?? 'not started',
     deviceClass: cls,
     device: d,
@@ -1627,13 +1549,10 @@ export async function diagnostics({ detail = false } = {}) {
     worker: workerInfo(),
     loaded: [...loaded.keys()],
     models: Object.values(st).map((r) => ({ id: r.id, status: r.status, dtype: r.dtype, device: r.device, revision: P[r.id]?.revision, have: r.have, failures: r.failures, crashes: r.crashes })),
-    profiles: profileTable(),
-    quarantine: quarantined().map((q) => ({ key: q.key, category: q.category, confidence: q.confidence, at: q.at })),
-    history,
+    limits: Object.fromEntries(AL.CHAT_IDS.map((id) => [id, limitsFor(id)])),
     interruption: interruptionRec,
     lastInference,
     performance: performanceSummary(entries),
-    estimates,
     logger: logger.stats(),
     events: entries,
     detail: detail && debugCapsule ? [`question: ${debugCapsule.question}`, ...(debugCapsule.sources ?? []).map((s, i) => `source ${i + 1}: ${s}`)] : detail ? ['no question has been asked in this session'] : null,
@@ -1648,11 +1567,4 @@ export async function report(opts = {}) {
 }
 export async function reportJson(opts = {}) {
   return JSON.stringify(buildReport(await diagnostics(opts)).json, null, 1);
-}
-
-/** Developer mode: clears the stored history of runs (not quarantine). */
-export function clearHistory() {
-  history = {};
-  jset(K.history, history);
-  emit('safety');
 }

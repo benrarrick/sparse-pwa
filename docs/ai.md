@@ -1,5 +1,7 @@
 # On-device AI: safety, stability and diagnostics
 
+> **v2.2 simplified the AI.** The models are now LFM2.5 350M and 230M, Llama 3.2 1B (WebLLM) and BGE small. The 1.2B and 2.6B are gone, and so are developer mode, the experimental opt-in, per-device-class limits, the prompt-limit picker and quarantine. The limits are one set per model, and an interrupted run is diagnosed and shown but never switches anything off. Sections below that describe measurements and benchmarks (1.2B and 2.6B numbers, the 338/650-token iPhone observation) are history and are left as they were.
+
 This describes how the optional on-device AI is kept from destabilising the app, how it is observed, and what has and has not been verified. The app is a reader first: **with the AI off, broken or unavailable, browsing, saved pages and searching saved pages all still work.**
 
 > iOS can end a web process without any error the page can catch. Nothing here can guarantee that never happens. The approach is to refuse work that is known or suspected to be unsafe, to stop before limits, to switch off a setup that was interrupted unexpectedly, and to record enough to explain what happened next time.
@@ -8,21 +10,18 @@ This describes how the optional on-device AI is kept from destabilising the app,
 
 ## Models
 
-| Model | Status on a phone | Status on a computer | Weights | Needs | Phone limits (prompt / answer / total tokens, time) |
-|---|---|---|---|---|---|
-| LFM2.5 **350M** Instruct | provisional (default) | provisional | 258 MB (q4f16) or 297 MB (q4) | WebGPU | 220 / 80 / 280, 90 s |
-| LFM2.5 **230M** Instruct | provisional (fallback) | provisional | 216 MB (q4) | WebGPU | 200 / 80 / 260, 90 s |
-| LFM2.5 **1.2B** Instruct | **experimental: off until you opt in** | experimental (opt in) | 764 MB (q4f16), 854 MB (q4), 1.52 GB (8-bit, CPU) | WebGPU, or CPU on a computer | 300 / 128 / 380, 120 s |
-| Llama **3.2 1B** Instruct (WebLLM) | **experimental: off until you opt in** | experimental (opt in) | 711 MB (q4f16_1, WebLLM's own store) + 6 MB engine | WebGPU with 16-bit floats | 400 / 128 / 500, 150 s |
-| LFM2.5 **2.6B** | **blocked** (iOS ended the app while loading it) | experimental (opt in) | 1.53 GB | WebGPU | 600 / 200 / 700 (computer only) |
-| BGE small en v1.5 | provisional | provisional | 35 MB, CPU | none | batches of 4, ≤ 1,200 characters each, ≤ 64 passages per question |
+| Model | Weights | Needs | Token limits (prompt / answer / total, time) |
+|---|---|---|---|
+| LFM2.5 **350M** Instruct | 258 MB (q4f16) or 297 MB (q4) | WebGPU | 600 / 200 / 760, 120 s |
+| LFM2.5 **230M** Instruct | 216 MB (q4) | WebGPU | 500 / 200 / 650, 120 s |
+| Llama **3.2 1B** Instruct (WebLLM) | 711 MB (q4f16_1, WebLLM's own store) + 6 MB engine | WebGPU with 16-bit floats | 800 / 256 / 1,000, 180 s |
+| BGE small en v1.5 | 35 MB, CPU | none | batches of 4, ≤ 1,200 characters each, ≤ 64 passages per question |
 
-- **Provisional** means conservative limits that have **not been proven on a real device**. It is allowed to be chosen automatically; it is not a claim of safety. A smaller model is not treated as safe because it loads.
-- **Experimental** runs only after you tick "Allow this experimental model to run" on its card, and is never chosen automatically.
-- Every entry has a pinned commit of the Hugging Face repository. Repository ids, file names, sizes and tensor names were checked against the live repositories while writing this (see [what was measured](#what-was-measured-about-memory)).
-- Previously downloaded models and all saved data are kept. A 1.2B downloaded earlier stays on the device; it just needs the opt-in before it runs.
-- **Licence:** the LFM2.5 models are under the *LFM Open License 1.0* (Liquid AI; the model cards link the terms, which include conditions for commercial use). BGE small is MIT. Transformers.js and ONNX Runtime are Apache-2.0 / MIT. Models are downloaded by you, from Hugging Face, to your own device; this repository does not redistribute them.
-- **No silent CPU fallback on a phone.** The 350M and 230M exports have no CPU-compatible version (the 350M's 8-bit export failed with "Could not find an implementation for GatherBlockQuantized" when tried), so without WebGPU they are simply not offered, and written answers are off. Saved pages can still be searched.
+- The limits are guesses that were more cautious before (220 tokens on a phone) and are now the same everywhere. They are the numbers to lower if a model runs out of memory on a device: `SAFETY` in `js/ai-policy.js`.
+- Every Transformers.js entry has a pinned commit of the Hugging Face repository. Repository ids, file names, sizes and tensor names were checked against the live repositories (see [what was measured](#what-was-measured-about-memory)).
+- A model removed from the app (1.2B, 2.6B) has its files deleted at the next start, and the old developer-mode and quarantine settings are cleared.
+- **Licence:** the LFM2.5 models are under the *LFM Open License 1.0* (Liquid AI; the model cards link the terms, which include conditions for commercial use). Llama 3.2 is under the Llama 3.2 Community License. BGE small is MIT. Transformers.js, ONNX Runtime and WebLLM are Apache-2.0 / MIT. Models are downloaded by you to your own device; this repository does not redistribute them (it does keep the WebLLM library in `vendor/`).
+- **No silent CPU fallback.** The 350M and 230M exports have no CPU-compatible version (the 350M's 8-bit export failed with "Could not find an implementation for GatherBlockQuantized" when tried), so without WebGPU they are simply not offered, and written answers are off. Saved pages can still be searched.
 
 ### Llama 3.2 1B through WebLLM (added in v2.1)
 
@@ -30,39 +29,37 @@ The one model here that does not run on Transformers.js. It came out best in the
 
 - **Engine:** WebLLM 0.2.86, kept in the repository (`vendor/web-llm-0.2.86.js`, SHA-256 in `js/ai-lib.js`) and downloaded once with the model like the other engine files. It then runs from the device, offline.
 - **Model files:** WebLLM downloads and keeps them itself (its own IndexedDB store). The app's downloader does not manage them, so there is no byte-level resume: shards already stored are skipped when you retry. The weights are *not* pinned to a revision (WebLLM always asks for the latest); the recorded identity is the library version.
-- **The download is a real GPU load**, run as a queued, checkpointed operation that releases the model straight away. If iOS ends the app during it, that is diagnosed and quarantines the model like any other load.
-- **Budgets:** counted with WebLLM's own tokenizer (an over-high estimate if it cannot be reached), refused or trimmed against the same limits, and the library's own count is logged next to it. The memory WebLLM reserves for the conversation is 1,024 tokens on phones (2,048 on computers), above the profile's combined limit.
-- **Needs shader-f16** (WebGPU 16-bit floats). Without it the card says so and nothing is offered: there is no CPU or 32-bit fallback.
-- **Tested** end to end in a desktop browser: download, checksum, load, answer, and a second run with the network blocked. **Not tested on an iPhone**, which is why it is experimental.
+- **The download is a real GPU load**, run as a queued, checkpointed operation that releases the model straight away. If iOS ends the app during it, the next launch says so, like any other load.
+- **Budgets:** counted with WebLLM's own tokenizer (an over-high estimate if it cannot be reached), refused or trimmed against the same limits, and the library's own count is logged next to it. The memory WebLLM reserves for the conversation is 2,048 tokens, above the model's combined limit.
+- **Needs shader-f16** (WebGPU 16-bit floats). Without it the card says so: there is no CPU or 32-bit fallback.
+- **Tested** end to end in a desktop browser: download, checksum, load, answer, and a second run with the network blocked. **Not tested on an iPhone.**
 
-*Safety profiles are in `js/ai-policy.js` (`SAFETY`). A configuration with no entry is unsupported.*
+*Limits are in `js/ai-policy.js` (`SAFETY`). A model with no entry is unsupported.*
 
-## Safety policy
+## Limits and diagnosis
 
-**Token budgets (fail closed).** Before any inference the engine counts the prompt with the model's own tokenizer (system prompt, chat template, sources, question and all). If counting fails, nothing runs (`TOKENIZATION_FAILED`). It then enforces `input ≤ maxInput` and `input + new ≤ maxTotal`; a request for more output is cut to what remains, and refused if that leaves less than 24 tokens. The limits asked for by the page are clamped to the model's profile again inside the engine, so a stale or modified page cannot ask for more. Ordinary settings can only lower the prompt limit. *Developer testing mode* (AI page → Safety) can raise it, and is a deliberate act.
+**Token budgets (fail closed).** Before any inference the engine counts the prompt with the model's own tokenizer (system prompt, chat template, sources, question and all). If counting fails, nothing runs (`TOKENIZATION_FAILED`). It then enforces `input ≤ maxInput` and `input + new ≤ maxTotal`, and an answer is never allowed less than 24 tokens of room. A prompt over the limit is refused, or, where the caller allows it (source text, summary parts), its end is cut to fit, counting again after each cut. The page can only ask for lower limits than the model's own.
 
-**One operation at a time.** Loading, embedding, generating, switching models, unloading and resetting go through one scheduler (`js/ai-ops.js`) with an explicit queue (at most 8 waiting) and these states: idle, loading, embedding, generating, unloading, recovering, failed. It is used in the page and again inside the engine, so even overlapping messages cannot overlap work: two models never load together, a model is never released while it works, and a model being replaced is fully released before the next loads. A step inside an operation (generate → load the model) runs under the same lock, so there are no deadlocks. An error always releases the lock. Stop is out of band: it is never queued behind the work it stops. Reset abandons whatever is running, drops the queue and restarts the engine; a late result from the abandoned work is ignored. Rapid repeated questions replace one another instead of piling up. Auto-summaries queue behind other work.
+**One operation at a time.** Loading, embedding, generating, switching models, unloading and resetting go through one scheduler (`js/ai-ops.js`) with an explicit queue (at most 8 waiting). The same scheduler runs again inside the engine, so a second request there is queued and logged, never run alongside. Stop is never queued behind the work it stops.
 
-**Preflight.** Before work starts: the model is downloaded, its profile allows this backend on this device, it is not switched off, the app is on screen, the GPU has not been lost, and the page and worker are the same build (a half-updated app gets "close and reopen" instead of a mysterious failure). Any failure is a plain-language, recoverable error.
+**Preflight.** Before work starts: the model is downloaded, it can run on this backend, the app is on screen, the GPU has not been lost, and the page and worker are the same build (a half-updated app gets "close and reopen it, twice").
 
 **Foreground only.** If the app goes to the background while the AI writes, the AI is stopped and the text so far is kept, labelled incomplete.
 
-**Memory habits.** One model is resident at a time. BGE is released (disposed) as soon as retrieval finishes, before a chat model loads. Phone models are released two minutes after last use (1.2B: one minute), and straight after a prompt above 85% of the limit. A model that fails to release cleanly causes the whole engine to be restarted rather than reused. The engine is also restarted after a lost GPU, a suspected memory failure, a hung call or a failed load. The AI never runs on the page itself on a phone (it would freeze the screen and is not qualified): if the worker cannot start, the AI is off.
+**Memory habits.** One model is resident at a time. BGE is released as soon as retrieval finishes, before a chat model loads. Phone models are released two minutes after last use, and straight after a prompt above 85% of the limit.
 
-**Checkpoints, crash diagnosis and quarantine.** Before each risky stage the page writes a small versioned checkpoint to `localStorage` (a synchronous call, though the browser may flush it to disk a moment later, so the last instants before a sudden kill can be lost): session, operation, operation type, model, revision, backend, weights, token counts, stage, start and last-progress times, visibility and time spent hidden, runtime build. It is removed when the operation ends. If one is found at the next launch it is **classified, not assumed to be a crash**:
+**Checkpoints and what the next launch says.** Before each risky stage the page writes a small versioned checkpoint to `localStorage`: model, backend, token counts, stage, start and last-progress times, visibility. It is deleted when the work ends. A leftover one at the next launch is classified and shown on the AI page and in the log:
 
-| Diagnosis | When | Held against the model? |
-|---|---|---|
-| `GPU_DEVICE_LOST` | the engine reported the GPU lost before the app ended | no |
-| `APP_CLOSED` | the page reported it was being closed | no |
-| `BACKGROUNDED` | the app had been in the background during the work | no |
-| `UNEXPECTED_INTERRUPTION` (low confidence) | foreground, in a memory-heavy stage, nothing reported, first time | **yes: that configuration is switched off** |
-| `POSSIBLE_MEMORY_EXHAUSTION` (medium) | the same, and the same configuration was interrupted that way before | yes |
-| `UNEXPECTED_INTERRUPTION` (low) | a stage that uses little memory, or an older marker | no |
+| Diagnosis | When |
+|---|---|
+| `GPU_DEVICE_LOST` | the engine reported the GPU lost before the app ended |
+| `APP_CLOSED` | the page reported it was being closed |
+| `BACKGROUNDED` | the app had been in the background during the work |
+| `UNEXPECTED_INTERRUPTION` (low confidence) | everything else: in the foreground, nothing reported |
 
-The message never claims a cause it cannot show: "*Previous inference was interrupted unexpectedly. iOS did not provide a termination reason.*" A swipe-away from the app switcher mid-generation looks the same as an unexplained termination, so a rare false quarantine is possible; it costs one tap in developer mode to undo. A switched-off configuration (model + pinned revision + backend + weights) stays off across launches, stops automatic summaries, and is shown on the AI page with the reasons. **Retrying it needs a deliberate act:** developer testing mode on, then "Allow a retest". Saved pages, summaries and downloads are untouched. Nothing automatically repeats the operation that preceded the interruption.
+The message never claims a cause it cannot show: "*The app was ended while working with … iOS did not say why; running out of memory is one possible cause.*" A swipe-away from the app switcher looks the same as an unexplained termination. Nothing is switched off because of it: the model count of unexplained interruptions is shown on its card.
 
-**If no safe model is available**, Ask shows the closest passages from saved pages and searches (keyword, plus meaning if BGE is allowed) with their sources, and says why no written answer is offered. It does not try another unvalidated model.
+**If no model is available**, Ask shows the closest passages from saved pages and searches (keyword, plus meaning if BGE is installed) with their sources, and says why no written answer is offered.
 
 ## What was measured about memory
 
@@ -109,21 +106,21 @@ Replies are drawn as plain text, at most every 100 ms, into one text node; lists
 
 Everything stays on the device (IndexedDB, bounded to the newest ~600 events; in-memory ring of 300). Nothing is uploaded. By default **no page text, question, answer, search term or address is recorded**: events carry ids, counts, lengths and timings, free text is scrubbed of addresses/tokens, and private field names are dropped. Writes are batched off the token path and a failing store is counted, never thrown.
 
-**Events** (all carry `sid` session, `op` operation, `parent`, model `pkg`/`rev`, `dtype`, `backend`, `mode`, `stage`, `code`, timings, and `m` metrics): `ai.operation.queued/started/stage/completed/failed/cancelled/timeout/abandoned`, `ai.model.load.started/completed`, `ai.prompt.tokenized`, `ai.inference.prefill.started`, `ai.inference.first_token`, `ai.inference.completed/failed/stop_requested`, `ai.model.dispose.started/completed/failed`, `ai.retrieval.completed`, `ai.ui.render`, `ai.worker.started/initialised/responsive/busy/unresponsive/terminated/restarted/reset/gpu_lost/version_mismatch`, `ai.recovery.interrupted`, `ai.quarantine.added/released`, `ai.app.visibility`, `ai.checkpoint.stale_cleared`, `ai.engine.overlap`, `ai.storage.vectors_discarded`.
+**Events** (all carry `sid` session, `op` operation, `parent`, model `pkg`/`rev`, `dtype`, `backend`, `mode`, `stage`, `code`, timings, and `m` metrics): `ai.operation.queued/started/stage/completed/failed/cancelled/timeout/abandoned`, `ai.model.load.started/completed`, `ai.prompt.tokenized`, `ai.inference.prefill.started`, `ai.inference.first_token`, `ai.inference.completed/failed/stop_requested`, `ai.model.dispose.started/completed/failed`, `ai.retrieval.completed`, `ai.ui.render`, `ai.worker.started/initialised/responsive/busy/unresponsive/terminated/restarted/reset/gpu_lost/version_mismatch`, `ai.recovery.interrupted`, `ai.app.visibility`, `ai.checkpoint.stale_cleared`, `ai.engine.overlap`, `ai.storage.vectors_discarded`.
 
 **Recorded per generation:** load time and mode, input tokens (exact), allowed budget, tokenizing time, time to first token (prefill is *inferred* to end at the first token: the runtime reports nothing in between), tokens, tokens/s, requested vs actual output, stop reason (`eos`, `length`, `stopped`, `timeout`, `error`), queue wait. **Per retrieval:** index build/reuse, keyword time, BGE load and embed time, new vs cached vectors, ranking and fusion time, passages considered/selected/excluded/excerpted. **Resources:** dispose time, worker starts/terminations/resets, GPU loss, queue depth, device and adapter limits, and the memory indicators that exist (otherwise "unavailable"). Allocation sizes are in the report under *Expected allocations (estimates)*, separate from measurements.
 
-**Error codes:** `MODEL_NOT_INSTALLED, MODEL_NOT_ENABLED, MODEL_QUARANTINED, MODEL_LOAD_FAILED, MODEL_INCOMPATIBLE, GPU_UNAVAILABLE, GPU_DEVICE_LOST, TOKEN_BUDGET_EXCEEDED, TOKENIZATION_FAILED, INFERENCE_FAILED, INFERENCE_TIMEOUT, WORKER_FAILED, WORKER_UNRESPONSIVE, MODEL_DISPOSE_FAILED, STORAGE_ERROR, POSSIBLE_MEMORY_EXHAUSTION, UNEXPECTED_INTERRUPTION` (plus `NOT_FOREGROUND, BACKGROUNDED, VERSION_MISMATCH, QUEUE_FULL, CANCELLED`). A code is only assigned when the error text or the stage supports it; otherwise `UNKNOWN`. Original messages and stacks are kept.
+**Error codes:** `MODEL_NOT_INSTALLED, MODEL_LOAD_FAILED, MODEL_INCOMPATIBLE, GPU_UNAVAILABLE, GPU_DEVICE_LOST, TOKEN_BUDGET_EXCEEDED, TOKENIZATION_FAILED, INFERENCE_FAILED, INFERENCE_TIMEOUT, WORKER_FAILED, WORKER_UNRESPONSIVE, MODEL_DISPOSE_FAILED, STORAGE_ERROR, POSSIBLE_MEMORY_EXHAUSTION, UNEXPECTED_INTERRUPTION` (plus `NOT_FOREGROUND, BACKGROUNDED, VERSION_MISMATCH, QUEUE_FULL, CANCELLED`). A code is only assigned when the error text or the stage supports it; otherwise `UNKNOWN`. Original messages and stacks are kept.
 
 **Worker health:** states none → starting → initialised → responsive ⇄ busy → unresponsive/terminated → restarted. An *idle* worker answers a ping at once, so a ping before a model loads tells a dead worker from a busy one; a busy worker is judged by phase (load: 4 min; generation: the profile's time limit + 20 s). A worker that cannot be stopped is terminated and recreated.
 
-**AI page** (Settings → On-device AI): live status (state, current stage, queue, engine, what is in memory, health, what is switched off), last inference, performance (medians), recent failures and recovery actions, safety profiles and estimates, the log, Copy report / Copy as JSON, Reset AI engine, Clear log. Source text goes into a report only if you tick the opt-in box (kept in memory only; never stored).
+**AI page** (Settings → On-device AI): the models with Download / Pause / Test / Remove, the model chooser, one line of live status (what is running, what is in memory, GPU or update problems), the log with an errors-only filter, Copy report / Copy as JSON, Reset AI engine, and Remove all.
 
 ### Reading a report
 
 1. **LAST INTERRUPTION AT LAUNCH** says what the previous run left behind, its category, confidence and the reasons. `BACKGROUNDED`/`APP_CLOSED` are normal. `UNEXPECTED_INTERRUPTION` + `stage: prefill` + `input 180` means the app ended while the model read a 180-token prompt.
 2. **RECENT EVENTS** (newest first): find the `op=` of the failed operation and read its events in order. The last `stage=` before silence is where it stopped. A `ai.operation.failed` carries the stage it failed in.
-3. **QUARANTINE / CONFIGURATION HISTORY** shows ok / failed / unexplained counts per setup. Several unexplained interruptions at the same stage and input size point at a limit; a spread of stages points elsewhere.
+3. **TOKEN LIMITS** lists the limits each model ran under, to compare with the input size in the last interruption.
 4. **PERFORMANCE** and **LAST INFERENCE** show whether it was slow (first token, tokens/s) before it failed.
 5. `ai.worker.gpu_lost`, `ai.worker.unresponsive`, `ai.engine.overlap` and `ai.worker.version_mismatch` are explicit causes; `WORKER_FAILED` with "often a sign it ran out of memory" is a hint, not a diagnosis.
 
@@ -137,23 +134,20 @@ APP        build: 2026-10-15.1 · engine: Transformers.js 4.3.0 · ONNX Runtime 
 DEVICE     class: ios (forced) · WebGPU: software adapter · storage persistent: false
 INSTALLED MODELS
   lfm350: ready q4/webgpu rev d11593fd, 297118588 bytes, 2 failures
-SAFETY PROFILES (this device class)
-  lfm350: provisional · input ≤ 220, new ≤ 80, total ≤ 280, time ≤ 90 s
-QUARANTINE
-  lfm350@d11593fd|webgpu|q4: UNEXPECTED_INTERRUPTION (low)
+TOKEN LIMITS (prompt / answer / total / time)
+  lfm350: 600 / 200 / 760 / 120 s
 LAST INTERRUPTION AT LAUNCH
-  UNEXPECTED_INTERRUPTION (confidence low) · quarantined: yes
-  Previous inference was interrupted unexpectedly (LFM2.5 350M (generate), last stage "prefill"). iOS did not provide a termination reason.
+  UNEXPECTED_INTERRUPTION (confidence low)
+  The app was ended while working with LFM2.5 350M (generate), last stage "prefill". iOS did not say why; running out of memory is one possible cause.
   last stage: prefill · model lfm350 q4/webgpu · input 180 tokens, output budget 60
   - the app was in the foreground and nothing was reported
-  - first time this configuration was interrupted
 RECENT EVENTS (newest first)
 … ERROR ai.inference.failed op=op7 lfm350 stage=prefill code=INFERENCE_TIMEOUT LFM2.5 350M: Stopped after 90 s {"inputTokens":187,"tokens":4}
 … OK    ai.inference.first_token op=op8 stage=first_token First token after 69878 ms
 … INFO  ai.prompt.tokenized op=op8 Prompt is 187 tokens (limit 300); up to 50 may be written (total limit 380)
 ```
 
-(Separately, during testing the harness did kill the browser mid-generation once, and the next launch diagnosed and quarantined it as shown: the mechanism worked as designed.)
+(Separately, during testing the harness did kill the browser mid-generation once, and the next launch diagnosed it as shown: the mechanism worked as designed.)
 
 ## Benchmarks
 
@@ -206,11 +200,11 @@ Reading it honestly:
 - **Questions:** 4/4 answers present in the evidence vs 3/4, and the budget is never exceeded (the old code exceeded it on 3 of 5 questions).
 - **Index:** 79 ms to rebuild and search 4,496 passages vs 23 ms for each later question (116 ms the first time). These are Node timings on a development PC, not a phone.
 - **Not measured here:** answer faithfulness (needs a model and a judge), time to first token and tokens per second on real hardware, peak memory, and "no termination in qualified workloads" (needs the iPhone). The only model timings available were from a *software* GPU (≈0.2 tokens/s, 25-70 s to first token) and say nothing about phone speed. The earlier iPhone figures still stand for the 1.2B: loads in about 2.8 s, 10-23 tokens/s.
-- A model-based benchmark (summaries and questions through the loaded model on the device, with the same fixtures) should be run from the AI page in developer mode on the phone; the events above (`ai.inference.completed`, `ai.retrieval.completed`) carry the numbers.
+- A model-based benchmark (summaries and questions through the loaded model on the device, with the same fixtures) should be run on the phone; the events above (`ai.inference.completed`, `ai.retrieval.completed`) carry the numbers.
 
 ## Tests actually run
 
-`npm test` (`node --test`): **96 tests, all passing**, in Node. They cover the catalog and pinned revisions; token budgets (null/NaN/over-limit/combined-limit, clamping); the 303-over-300 case; concurrency in the scheduler and in the engine with a fake runtime (simultaneous generations, generation during embed or load, model switching, release during generation, stop while running / queued / embedding, worker exceptions, GPU loss, tokenizer failure, disposal failure, background refusal, a failure not locking the queue); quarantine and opt-in rules; interruption classification (foreground, repeated, backgrounded, closed, GPU lost, legacy marker); logging (unique ids, stage order, parent/child, failures keep stage, no source text, bounded storage, store failures harmless); report layout; summary selection and planning; retrieval budgeting (huge first passage, duplicates, per-page cap, late-page text findable, snippet replaced by saved page, damaged vectors); the incremental index against a full rebuild.
+`npm test` (`node --test`): **104 tests, all passing**, in Node. They cover the catalog and pinned revisions; token budgets (null/NaN/over-limit/combined-limit, clamping); the 303-over-300 case; concurrency in the scheduler and in the engine with a fake runtime (simultaneous generations, generation during embed or load, model switching, release during generation, stop while running / queued / embedding, worker exceptions, GPU loss, tokenizer failure, disposal failure, background refusal, a failure not locking the queue); the backend and GPU-loss rules; interruption classification (foreground, backgrounded, closed, GPU lost, legacy marker); logging (unique ids, stage order, parent/child, failures keep stage, no source text, bounded storage, store failures harmless); report layout; summary selection and planning; retrieval budgeting (huge first passage, duplicates, per-page cap, late-page text findable, snippet replaced by saved page, damaged vectors); the incremental index against a full rebuild.
 
 Also run, outside `npm test`, in **headless Chrome 155 on Linux** against the real files from Hugging Face and jsDelivr (CPU for BGE, a *software* WebGPU adapter for the chat model, so correct but slow): downloads and checksums of the 350M, BGE and the engine; loading and generating with the 350M (and confirming from the loaded graph that it scores the last position only); three generations + an embed + an unload submitted at once ran strictly one after another; retrieval over fixture pages with BGE released afterwards, vectors reused on later questions and a hard budget; engine reset and recovery; a simulated interrupted run → diagnosis, quarantine, the Ask page falling back to passages, backgrounded not quarantined, repeat escalation, developer-mode retest; a report with none of the saved text in it; a generation hitting its time limit with the partial text kept and a plain-language message. (A failed load leaving the ONNX runtime unusable for the next model was seen; the fix, restarting the engine after such a failure, is covered by design and unit tests of the error handling but was not re-run against the real runtime.)
 
@@ -229,7 +223,7 @@ Install to the home screen, open **Settings → On-device AI**, download the 350
 7. **Background it:** start a summary, lock the phone or switch apps. On return the reply should say it was stopped and keep its text; the AI page should show `BACKGROUNDED` at most, and **no** model should be switched off.
 8. **Offline:** turn on airplane mode, force-quit and reopen, ask a question. It must work (it did before, with the 1.2B).
 9. **Worker failure:** use Reset AI engine (AI page) mid-reply; the reply should stop with a clear message and the next question should work.
-10. **Interrupted run:** start a summary, then swipe the app away from the app switcher mid-reply. On the next launch expect the home screen and AI page to say the previous inference was interrupted unexpectedly (low confidence), that model switched off, saved pages untouched, and Ask still listing passages. Then retest in developer mode.
+10. **Interrupted run:** start a summary, then swipe the app away from the app switcher mid-reply. On the next launch expect the home screen and AI page to say the previous inference was interrupted unexpectedly (low confidence), saved pages untouched, and Ask still working. Nothing is switched off.
 
 After any problem, **Copy report** and read it as above (or paste it to a developer). Mark results honestly: only what you ran on the phone counts.
 
@@ -237,7 +231,7 @@ After any problem, **Copy report** and read it as above (or paste it to a develo
 
 - Llama 3.2 1B: the weights are not pinned; WebLLM stores them in IndexedDB, and large shards there are untested on iOS. Pausing a download restarts the engine. See the section above.
 - iOS may end the app at any time, for reasons it does not disclose; no code here can prevent that. All limits are conservative guesses, not qualified limits. The first real-device runs decide whether 220 tokens is safe, too cautious, or still too much.
-- A swipe-away during generation is indistinguishable from an OS termination, so it can cause a (reversible) quarantine.
+- A swipe-away during generation is indistinguishable from an OS termination, so the next launch reports it as an unexplained interruption.
 - Prefill is a single runtime call: it can be neither interrupted nor observed in between, so a stuck prefill is only ended by restarting the engine after the time limit.
 - Memory cannot be measured on Safari; allocation numbers are estimates. Whether disposal returns GPU memory is unverified.
 - The 350M/230M need WebGPU; phones without it get saved-page search only.
@@ -248,6 +242,6 @@ After any problem, **Copy report** and read it as above (or paste it to a develo
 ## Next recommended steps (after real-device results)
 
 1. Run the manual plan on an iPhone, read the reports, and tighten or relax the 350M/230M limits from evidence; promote a profile from provisional only with a record of clean runs.
-2. Try the last-token transform on the 230M/1.2B in a browser (load, equality of output, timing). If it helps, offer it as an opt-in variant with a documented source of the file.
+2. Try the last-token transform on the 230M/1.2B in a browser (load, equality of output, timing). If it helps, offer it as a variant with a documented source of the file.
 3. Add a model-in-the-loop benchmark and a faithfulness check (answer contains only supported facts) to compare 350M, 230M and 1.2B on the same fixtures.
 4. Measure whether disposal frees GPU memory on Safari (run N load/unload cycles and watch for termination), and whether a newer ONNX Runtime Web build helps.

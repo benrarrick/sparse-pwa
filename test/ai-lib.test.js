@@ -6,8 +6,10 @@ import * as A from '../js/ai-lib.js';
 const P = A.PACKAGES;
 
 test('catalog: pinned files, variants and sizes', () => {
-  assert.deepEqual(A.MODEL_IDS, ['lfm350', 'lfm230', 'lfm12', 'llama32', 'bge', 'lfm26']);
-  assert.deepEqual(A.CHAT_IDS, ['lfm350', 'lfm230', 'lfm12', 'llama32', 'lfm26']);
+  assert.deepEqual(A.MODEL_IDS, ['lfm350', 'lfm230', 'llama32', 'bge']);
+  assert.deepEqual(A.CHAT_IDS, ['lfm350', 'lfm230', 'llama32']);
+  assert.deepEqual(A.RETIRED_IDS, ['lfm12', 'lfm26'], 'models that are gone get their files deleted at startup');
+  for (const gone of A.RETIRED_IDS) assert.equal(P[gone], undefined);
   for (const id of A.MODEL_IDS.filter((x) => !P[x].runtime)) {
     assert.match(P[id].revision, /^[0-9a-f]{40}$/, `${id} is pinned to a commit`);
     for (const dtype of Object.keys(P[id].variants)) {
@@ -18,41 +20,30 @@ test('catalog: pinned files, variants and sizes', () => {
     }
   }
   // the weights only resume when they're big; small JSON files restart
-  const lfm = A.filesFor(P.lfm12, 'q4f16');
+  const lfm = A.filesFor(P.lfm350, 'q4f16');
   assert.equal(lfm.find((f) => f.path === 'config.json').resume, false);
   assert.equal(lfm.find((f) => f.path === 'onnx/model_q4f16.onnx_data').resume, true);
-  assert.equal(Math.round(A.totalSize(lfm) / 1e6), 764);
-  assert.equal(Math.round(A.totalSize(A.filesFor(P.lfm350, 'q4f16')) / 1e6), 258);
+  assert.equal(Math.round(A.totalSize(lfm) / 1e6), 258);
   assert.equal(Math.round(A.totalSize(A.filesFor(P.lfm230, 'q4')) / 1e6), 216);
-  // the 2.6B q4f16 weights come in two parts, as its config says
-  assert.deepEqual(
-    A.filesFor(P.lfm26, 'q4f16')
-      .filter((f) => f.path.includes('_data'))
-      .map((f) => f.path),
-    ['onnx/model_q4f16.onnx_data', 'onnx/model_q4f16.onnx_data_1'],
-  );
   const engine = A.filesFor(P.engine);
   assert.equal(engine.length, 2);
   for (const f of engine) assert.match(f.sha256, /^[0-9a-f]{64}$/);
 });
 
 test('pickVariant matches weights to the device', () => {
-  assert.deepEqual(A.pickVariant(P.lfm12, { f16: true }), { dtype: 'q4f16', device: 'webgpu' });
-  assert.deepEqual(A.pickVariant(P.lfm12, { f16: false }), { dtype: 'q4', device: 'webgpu' });
-  assert.deepEqual(A.pickVariant(P.lfm12, null), { dtype: 'q8', device: 'wasm' }); // q4 needs WebGPU
-  assert.deepEqual(A.pickVariant(P.lfm26, null), { dtype: null, device: null }); // no CPU export
+  assert.deepEqual(A.pickVariant(P.lfm350, { f16: true }), { dtype: 'q4f16', device: 'webgpu' });
+  assert.deepEqual(A.pickVariant(P.lfm350, { f16: false }), { dtype: 'q4', device: 'webgpu' });
   assert.deepEqual(A.pickVariant(P.lfm350, null), { dtype: null, device: null }); // its 8-bit export fails on the CPU backend
   assert.deepEqual(A.pickVariant(P.lfm230, { f16: true }), { dtype: 'q4', device: 'webgpu' }); // no q4f16 export of the 230M
   assert.deepEqual(A.pickVariant(P.lfm230, null), { dtype: null, device: null });
-  assert.equal(A.dataChunks(P.lfm26, 'q4f16'), 2);
-  assert.equal(A.dataChunks(P.lfm12, 'q8'), 1);
+  assert.equal(A.dataChunks(P.lfm350, 'q4f16'), 1);
   assert.equal(A.dataChunks(P.bge, 'q8'), 0);
   assert.deepEqual(A.pickVariant(P.bge, { f16: true }), { dtype: 'q8', device: 'wasm' }); // BGE stays on the CPU
 });
 
 test('parseModelUrl finds the package behind a Transformers.js cache key', () => {
-  const u = A.fileUrl(P.lfm12, 'onnx/model_q4f16.onnx_data');
-  assert.deepEqual(A.parseModelUrl(u), { repo: P.lfm12.repo, revision: P.lfm12.revision, path: 'onnx/model_q4f16.onnx_data', pkg: 'lfm12', pinned: true });
+  const u = A.fileUrl(P.lfm350, 'onnx/model_q4f16.onnx_data');
+  assert.deepEqual(A.parseModelUrl(u), { repo: P.lfm350.repo, revision: P.lfm350.revision, path: 'onnx/model_q4f16.onnx_data', pkg: 'lfm350', pinned: true });
   assert.equal(A.parseModelUrl(`https://huggingface.co/${P.bge.repo}/resolve/main/config.json`).pinned, false);
   assert.equal(A.parseModelUrl('https://huggingface.co/someone/else/resolve/main/x.json').pkg, null);
   assert.equal(A.parseModelUrl('/models/x/config.json'), null);
@@ -123,7 +114,7 @@ test('prompts, answers and citations', () => {
   ]);
   assert.deepEqual(A.citations('Yes [1], and [2, 3].'), [{ text: 'Yes ' }, { cite: 1 }, { text: ', and ' }, { cite: 2 }, { cite: 3 }, { text: '.' }]);
   assert.equal(A.describeRun({ tokens: 100, ms: 6000, ttft: 1000, promptTokens: 500 }), '100 tokens in 6.0 s (20.0/s), first after 1.0 s, prompt 500 tokens');
-  assert.ok(A.crashText({ what: 'load', pkg: 'lfm26' }).includes('loading LFM2.5 2.6B'));
+  assert.ok(A.crashText({ what: 'load', pkg: 'lfm350' }).includes('loading LFM2.5 350M'));
   assert.equal(A.textBudget(300), 588);
   assert.ok(A.textBudget(60) >= 200);
   assert.equal(A.hash('abc'), A.hash('abc'));
@@ -145,5 +136,5 @@ test('catalog: a WebLLM model is a stand-in download, needs 16-bit GPUs, and its
   assert.equal(e.kind, 'engine');
   assert.match(e.files[0].sha256, /^[0-9a-f]{64}$/);
   assert.ok(A.ENGINE_IDS.includes('webllm') && A.ENGINE_IDS.includes('engine'));
-  assert.ok(m.contextWindow.ios >= 1024 && m.contextWindow.ios > 500, 'the reserved window is above the phone combined limit');
+  assert.ok(m.contextWindow >= 1536, 'the reserved window is above the combined token limit');
 });
