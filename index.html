@@ -24,11 +24,13 @@
   </head>
   <body>
     <!-- At the top: iOS home-screen apps can cut off whatever is pinned to the bottom edge. -->
-    <nav class="navbtns" aria-label="Navigation">
-      <button type="button" id="nav-back" aria-label="Back" disabled>‹ Back</button>
-      <button type="button" id="nav-fwd" aria-label="Forward" disabled>Forward ›</button>
-      <button type="button" id="nav-home" aria-label="Home">⌂ Home</button>
-    </nav>
+    <header class="appbar">
+      <button type="button" id="nav-back" class="iconbtn" aria-label="Back" disabled>‹</button>
+      <button type="button" id="nav-fwd" class="iconbtn" aria-label="Forward" disabled>›</button>
+      <button type="button" id="nav-home" class="brand" aria-label="Sparse home">Sparse</button>
+      <button type="button" id="menu-btn" class="menu-btn" aria-expanded="false" aria-controls="menu">Menu</button>
+      <nav id="menu" class="menu-panel" aria-label="Pages" hidden></nav>
+    </header>
     <p id="offline" class="offline" hidden>Offline: showing what is saved on this device</p>
     <main id="main"><p class="status">Loading…</p></main>
     <footer class="netbar">

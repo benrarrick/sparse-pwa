@@ -67,11 +67,15 @@ Licences: LFM Open License 1.0 for the LFM models, Llama 3.2 Community License f
 
 Files: `js/ai.js` (page side: downloads, worker, checkpoints, retrieval), `js/ai-engine.js` + `js/ai-worker.js` (run the models), `js/ai-policy.js` (limits, interruption diagnosis), `js/ai-ops.js` (scheduler), `js/ai-diag.js` (events, error codes, report), `js/ai-select.js` (summary evidence and retrieval selection), `js/ai-store.js` (IndexedDB `sparse-ai`), `js/ai-lib.js` (catalog, prompts, BM25), `vendor/` (WebLLM).
 
+## Layout
+
+One sticky bar (Back, Forward, Sparse for home, and a Menu for Network, On-device AI and Settings). Each screen is a stack of titled cards; Settings uses collapsible ones. Notices such as an AI interruption or a model error are banners with a × to dismiss them, on the home page too. Styles are in `style.css`: colour tokens at the top, then components (`.group`, `.banner`, `.chip`, `.rows`, `.button`).
+
 ## Activity and network details
 
 The app tells you what it is doing and what it costs:
 
-- **Activity log, on every screen.** A timestamped list of each step, for example:
+- **Activity log, on every screen** (collapsed by default; Settings → Reading expands it). A timestamped list of each step, for example:
   - "Looking on this device for saved results…"
   - "Skipped Mojeek: no API key in Settings"
   - "Trying Marginalia…" then "Marginalia failed: timed out; trying Mwmbl"

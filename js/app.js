@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '3.0';
+const APP_VERSION = '4.0';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -33,7 +33,7 @@ const DEFAULTS = {
   openIn: 'reader',
   cacheHours: 6,
   jinaKey: '',
-  showActivity: true,
+  showActivity: false,
   weatherDetail: 'basic',
   wikipedia: true,
   aiModel: 'lfm350',
@@ -89,6 +89,37 @@ function twoTap(label, action) {
     route();
   });
   return b;
+}
+
+/** A titled card, the unit of layout. `action` (optional) sits at the right of the title. */
+function group(title, action, ...body) {
+  return h('section', { class: 'group' }, title ? h('div', { class: 'group-head' }, h('h2', null, title), action) : null, ...body);
+}
+
+/** A collapsible group (settings, logs): closed unless `open`. */
+function fold(title, open, ...body) {
+  return h('details', { class: 'group', open }, h('summary', null, title), ...body);
+}
+
+/** A notice with an optional dismiss (×) button. kind: 'info' | 'warn' | 'bad'. */
+function banner(kind, content, { actions = [], onDismiss } = {}) {
+  const el = h(
+    'div',
+    { class: `banner ${kind === 'info' ? '' : kind}`.trim(), role: kind === 'bad' ? 'alert' : 'status' },
+    h('div', { class: 'banner-text' }, h('p', null, content), actions.length ? h('div', { class: 'banner-actions' }, actions) : null),
+    onDismiss
+      ? h('button', {
+          type: 'button',
+          class: 'dismiss',
+          'aria-label': 'Dismiss',
+          onclick: async () => {
+            await onDismiss();
+            el.remove();
+          },
+        }, '×')
+      : null,
+  );
+  return el;
 }
 
 function describe(e) {
@@ -154,6 +185,39 @@ function initNav() {
     else location.hash = '#/';
   });
 }
+// The menu holds the pages that aren't Home, so the bar stays one row.
+const menuBtn = document.getElementById('menu-btn');
+const menuPanel = document.getElementById('menu');
+
+function closeMenu() {
+  menuPanel.hidden = true;
+  menuBtn.setAttribute('aria-expanded', 'false');
+}
+
+function openMenu() {
+  const here = currentPath();
+  const item = (path, label, note) =>
+    h('a', { href: `#${path}`, 'aria-current': here === path ? 'page' : null }, label, note ? h('small', null, note) : null);
+  const canAsk = AL.MODEL_IDS.some((x) => AI.isReady(x) && x !== 'engine');
+  fill(
+    menuPanel,
+    item('/', 'Home'),
+    canAsk ? item('/ask', 'Ask', 'on-device AI') : null,
+    item('/net', 'Network', 'data used'),
+    item('/ai', 'On-device AI'),
+    item('/settings', 'Settings'),
+  );
+  menuPanel.hidden = false;
+  menuBtn.setAttribute('aria-expanded', 'true');
+}
+
+function initMenu() {
+  menuBtn.addEventListener('click', () => (menuPanel.hidden ? openMenu() : closeMenu()));
+  menuPanel.addEventListener('click', (e) => e.target.closest('a') && closeMenu());
+  document.addEventListener('click', (e) => !menuPanel.hidden && !e.target.closest('.appbar') && closeMenu());
+  document.addEventListener('keydown', (e) => e.key === 'Escape' && closeMenu());
+}
+
 let idleTimer;
 const active = new Map();
 
@@ -526,7 +590,7 @@ function searchForm(q = '') {
     type: 'search',
     name: 'q',
     value: q,
-    placeholder: 'Search or paste a web address',
+    placeholder: 'Search or paste a link',
     autocomplete: 'off',
     autocapitalize: 'off',
     spellcheck: 'false',
@@ -549,7 +613,10 @@ function searchForm(q = '') {
   );
 }
 
-const topbar = (q) => h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), searchForm(q));
+const topbar = (q) => searchForm(q);
+
+/** The page title, with optional links at its right. */
+const pageHead = (title, ...extra) => h('div', { class: 'group-head page-head' }, h('h1', null, title), extra);
 
 function snippetNodes(snippet) {
   return snippet.map((s) => (s.bold ? h('b', null, s.text) : s.text));
@@ -642,9 +709,35 @@ function homeWeather(id) {
   return box;
 }
 
+/** A list that shows the first few rows, with a toggle for the rest. */
+function rowList(items, limit, row) {
+  const ul = h('ul', { class: 'rows' });
+  const more = h('button', { type: 'button', class: 'link small' });
+  let all = false;
+  const draw = () => {
+    fill(ul, (all ? items : items.slice(0, limit)).map(row));
+    more.hidden = items.length <= limit;
+    more.textContent = all ? 'Show fewer' : `Show all ${items.length}`;
+  };
+  more.addEventListener('click', () => {
+    all = !all;
+    draw();
+  });
+  draw();
+  return h('div', null, ul, more);
+}
+
+const compactUse = (t) => (t.requests ? `${t.estimated ? '≈' : ''}${B(t.wire)} · ${plural(t.requests, 'request')}` : 'nothing yet');
+
 async function showHome(id) {
   document.title = 'Sparse';
-  const [history, queue, ready, pages] = await Promise.all([S.kvGet('history', []), S.kvGet('queue', []), S.kvGet('ready', []), S.entries('pages')]);
+  const [history, queue, ready, pages, models] = await Promise.all([
+    S.kvGet('history', []),
+    S.kvGet('queue', []),
+    S.kvGet('ready', []),
+    S.entries('pages'),
+    AI.states().catch(() => ({})),
+  ]);
   if (id !== renderId) return;
   const saved = pages
     .map(([, p]) => p)
@@ -656,105 +749,99 @@ async function showHome(id) {
       ? h('a', { href: hashFor('/s', { q: x.q, ...(x.engine !== settings.engine && { e: x.engine }) }) }, x.q)
       : h('a', { href: hashFor('/r', { u: x.url }) }, L.hostOf(x.url) || x.url);
   const s = N.session;
+
+  // Notices that can be dismissed from here: the AI's last interruption, and errors kept on model records.
+  const interruption = AI.lastInterruption();
+  const modelErrors = Object.values(models).filter((m) => m.lastError || m.crashes);
+  const notices = [
+    interruption
+      ? banner('warn', interruption.message, {
+          actions: [h('a', { href: '#/ai' }, 'Details')],
+          onDismiss: () => AI.ackInterruption(),
+        })
+      : null,
+    modelErrors.length
+      ? banner('bad', `${modelErrors.map((m) => AL.PACKAGES[m.id]?.short ?? m.id).join(', ')}: ${modelErrors[0].lastError ? `last error was “${modelErrors[0].lastError.message}”` : 'the app was ended unexpectedly while using it'}`, {
+          actions: [h('a', { href: '#/ai' }, 'Details')],
+          onDismiss: () => AI.clearErrors(),
+        })
+      : null,
+  ];
+
+  const failedReady = ready.filter((x) => x.error);
   render(
-    h(
-      'header',
-      { class: 'bar' },
-      h('span', { class: 'brand' }, 'Sparse'),
-      h(
-        'nav',
-        { class: 'links' },
-        AL.MODEL_IDS.some((x) => AI.isReady(x) && x !== 'engine') ? h('a', { href: '#/ask' }, 'Ask') : null,
-        h('a', { href: '#/net' }, 'Network'),
-        h('a', { href: '#/settings' }, 'Settings'),
-      ),
-    ),
+    notices,
     searchForm(),
-    AI.lastInterruption() ? h('p', { class: 'small warn' }, AI.lastInterruption().message, ' ', h('a', { href: '#/ai' }, 'AI diagnostics')) : null,
     h(
       'p',
-      { class: 'muted small' },
-      engine
-        ? `${L.ENGINES[engine].name}${settings.fallback ? ', with free fallback' : ''}${L.canTryMojeek(settings) ? ', Mojeek on request' : ''} · `
-        : 'No engine set · ',
-      'add ',
+      { class: 'tip' },
+      engine ? `${L.ENGINES[engine].name}` : 'No engine set',
+      ' · add ',
       h('code', null, '!bang'),
       ' to search on DuckDuckGo',
     ),
-    homeWeather(id),
-    h(
-      'p',
-      { class: 'quick small' },
-      h('span', { class: 'muted' }, 'Near you: '),
-      P.QUICK_SEARCHES.flatMap(([label, q], i) => [i ? ' · ' : null, h('a', { href: hashFor('/s', { q }) }, label)]),
-    ),
-    h('p', { class: 'muted small', id: 'version' }, `Sparse v${APP_VERSION}`),
-    h(
-      'section',
-      { class: 'data' },
-      h('p', { class: 'small', id: 'appload' }, appLoadText()),
-      h('p', { class: 'small' }, `This session: ${amount({ ...s, estimated: true })}${s.errors ? `, ${plural(s.errors, 'failure')}` : ''}.`),
-      netTotals.requests
-        ? h(
-            'p',
-            { class: 'small' },
-            `Since ${new Date(netTotals.since).toLocaleDateString()}: ${amount({ ...netTotals, estimated: true })}. `,
-            h('a', { href: '#/net' }, 'Details'),
-          )
-        : null,
+    group(
+      'Around you',
+      null,
+      homeWeather(id),
+      h('p', { class: 'muted small' }, 'Places near you'),
+      h('div', { class: 'chips quick' }, P.QUICK_SEARCHES.map(([label, q]) => h('a', { class: 'chip', href: hashFor('/s', { q }) }, label))),
     ),
     queue.length > 0 &&
-      h(
-        'section',
+      group(
+        'Waiting for a connection',
         null,
-        h('h2', null, 'Waiting for a connection'),
-        h(
-          'ul',
-          { class: 'plain' },
-          queue.map((x) => h('li', null, x.kind === 'search' ? x.q : x.url, h('span', { class: 'muted small' }, ` · queued ${L.relTime(x.at)}`))),
-        ),
+        h('ul', { class: 'rows' }, queue.map((x) => h('li', null, x.kind === 'search' ? x.q : x.url, h('span', { class: 'muted small' }, `queued ${L.relTime(x.at)}`)))),
       ),
     ready.length > 0 &&
-      h(
-        'section',
-        null,
-        h('h2', null, 'Ready'),
-        h(
-          'ul',
-          { class: 'plain' },
-          ready.map((x) => h('li', null, itemLink(x), h('span', { class: 'muted small' }, x.error ? ` · ${x.error}` : ` · fetched ${L.relTime(x.doneAt)}`))),
-        ),
+      group(
+        'Ready',
+        failedReady.length ? twoTap('Clear failed', () => S.kvSet('ready', ready.filter((x) => !x.error))) : null,
+        rowList(ready, 5, (x) => {
+          const li = h(
+            'li',
+            null,
+            itemLink(x),
+            h('span', { class: `small ${x.error ? 'bad' : 'muted'}` }, x.error ? x.error : `fetched ${L.relTime(x.doneAt)}`),
+            h('button', {
+              type: 'button',
+              class: 'row-x',
+              'aria-label': 'Remove from this list',
+              onclick: async () => {
+                await clearReady(x.key);
+                li.remove();
+              },
+            }, '×'),
+          );
+          return li;
+        }),
       ),
     history.length > 0 &&
-      h(
-        'section',
-        null,
-        h('h2', null, 'Recent'),
-        h(
-          'ul',
-          { class: 'plain' },
-          history.map((x) => h('li', null, h('a', { href: hashFor('/s', { q: x.q }) }, x.q), h('span', { class: 'muted small' }, ` · ${L.relTime(x.at)}`))),
-        ),
-        twoTap('Clear recent searches', () => S.kvSet('history', [])),
+      group(
+        'Recent searches',
+        twoTap('Clear', () => S.kvSet('history', [])),
+        rowList(history, 5, (x) => h('li', null, h('a', { href: hashFor('/s', { q: x.q }) }, x.q), h('span', { class: 'muted small' }, L.relTime(x.at)))),
       ),
     saved.length > 0 &&
-      h(
-        'section',
+      group(
+        'Saved pages',
         null,
-        h('h2', null, 'Saved pages'),
-        h(
-          'ul',
-          { class: 'plain' },
-          saved.map((p) =>
-            h(
-              'li',
-              null,
-              h('a', { href: hashFor('/r', { u: p.url }) }, p.title),
-              h('span', { class: 'muted small' }, ` · ${L.hostOf(p.url)} · ${B(new Blob([p.markdown]).size)} on device`),
-            ),
-          ),
+        rowList(saved, 5, (p) =>
+          h('li', null, h('a', { href: hashFor('/r', { u: p.url }) }, p.title), h('span', { class: 'muted small' }, `${L.hostOf(p.url)} · ${B(new Blob([p.markdown]).size)}`)),
         ),
       ),
+    group(
+      'Data used',
+      h('a', { class: 'small', href: '#/net' }, 'Details'),
+      h(
+        'div',
+        { class: 'stats' },
+        h('span', null, 'This session ', h('b', null, compactUse({ ...s, estimated: true })), s.errors ? ` · ${plural(s.errors, 'failure')}` : ''),
+        netTotals.requests ? h('span', null, `Since ${new Date(netTotals.since).toLocaleDateString()} `, h('b', null, compactUse({ ...netTotals, estimated: true }))) : null,
+      ),
+      h('p', { class: 'muted small', id: 'appload' }, appLoadText()),
+    ),
+    h('p', { class: 'version', id: 'version' }, `Sparse v${APP_VERSION}`),
   );
   settle();
 }
@@ -1705,7 +1792,7 @@ async function showRead(id, raw, reload = false) {
   const host = arch ? `${L.hostOf(arch.original)} (archived ${formatDate(arch.at)})` : url ? L.hostOf(url) : '';
   const act = activity(`Opening ${host || 'page'}…`);
   const status = h('div', { class: 'status' });
-  const article = h('article', { class: 'reader' });
+  const article = h('article', { class: 'reader group' });
   render(topbar(''), act.el, status, article);
   if (!url) {
     act.warn('That is not a web address this app can open');
@@ -1732,7 +1819,7 @@ async function showRead(id, raw, reload = false) {
         h('button', { type: 'button', class: 'link', onclick: () => showRead(++renderId, url, true) }, 'Reload'),
       ),
     );
-    const save = h('button', { type: 'button', class: 'link' }, rec.saved ? 'Saved ✓' : 'Save for offline');
+    const save = h('button', { type: 'button', class: 'button secondary small' }, rec.saved ? 'Saved ✓' : 'Save for offline');
     save.addEventListener('click', async () => {
       rec.saved = !rec.saved;
       await S.put('pages', url, rec);
@@ -1743,8 +1830,8 @@ async function showRead(id, raw, reload = false) {
     const blocks = L.trimNav(L.parseMarkdown(rec.markdown, rec.source || url));
     const box = h('div', { class: 'archive card', hidden: true });
     const summary = h('div', { class: 'ai-out card', hidden: true });
-    const sumBtn = AI.anyChat(settings.aiModel) ? h('button', { type: 'button', class: 'link', onclick: () => summarise(rec, url, summary, act, id, { redo: !summary.hidden }) }, 'Summarise') : null;
-    const archived = h('button', { type: 'button', class: 'link' }, 'Archived copy');
+    const sumBtn = AI.anyChat(settings.aiModel) ? h('button', { type: 'button', class: 'button secondary small', onclick: () => summarise(rec, url, summary, act, id, { redo: !summary.hidden }) }, 'Summarise') : null;
+    const archived = h('button', { type: 'button', class: 'button secondary small' }, 'Archived copy');
     archived.addEventListener('click', () => {
       archived.disabled = true;
       box.hidden = false;
@@ -1756,14 +1843,13 @@ async function showRead(id, raw, reload = false) {
       arch ? h('p', { class: 'small muted' }, `Archived copy from ${formatDate(arch.at)}, read from the Internet Archive.`) : null,
       h(
         'p',
-        { class: 'actions small' },
+        { class: 'actions' },
         arch
-          ? [external(arch.original, 'Open live page ↗'), ' · ', external(L.waybackViewUrl(arch.ts, arch.original), 'Open in the archive ↗')]
-          : [external(url, 'Open original ↗'), ' · ', archived],
-        ' · ',
+          ? [external(arch.original, 'Open live page ↗', 'button secondary small'), external(L.waybackViewUrl(arch.ts, arch.original), 'Open in the archive ↗', 'button secondary small')]
+          : [external(url, 'Open original ↗', 'button secondary small'), archived],
         save,
-        sumBtn ? [' · ', sumBtn] : null,
-        rec.published ? h('span', { class: 'muted' }, ` · ${formatDate(rec.published)}`) : null,
+        sumBtn,
+        rec.published ? h('span', { class: 'muted small' }, formatDate(rec.published)) : null,
       ),
       box,
       summary,
@@ -1866,11 +1952,8 @@ async function showNet(id) {
   const row = (label, value) => h('tr', null, h('th', null, label), h('td', null, value));
   const services = Object.entries(netTotals.by).sort((a, b) => b[1].received - a[1].received);
   render(
-    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'Network')),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Connection'),
+    pageHead('Network'),
+    group('Connection', null,
       h(
         'table',
         { class: 'kv' },
@@ -1885,10 +1968,7 @@ async function showNet(id) {
           : row('Type and speed', 'Not shared by this browser (Safari keeps them private). Speeds below are measured from real requests.'),
       ),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'This session'),
+    group('This session', null,
       h(
         'table',
         { class: 'kv' },
@@ -1899,10 +1979,7 @@ async function showNet(id) {
         row('Average speed', s.ms ? `≈${L.formatSpeed(s.wire, s.ms)}` : '?'),
       ),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, `By service, since ${new Date(netTotals.since).toLocaleDateString()}`),
+    group(`By service, since ${new Date(netTotals.since).toLocaleDateString()}`, null,
       services.length
         ? h(
             'div',
@@ -1947,10 +2024,7 @@ async function showNet(id) {
         await S.kvSet('netlog', netLog);
       }),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Screen'),
+    group('Screen', null,
       h(
         'table',
         { class: 'kv' },
@@ -1963,10 +2037,7 @@ async function showNet(id) {
       ),
       h('p', { class: 'muted small' }, 'If parts of the screen are cut off, these numbers show what iOS reports to the page.'),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'App files on this launch'),
+    group('App files on this launch', null,
       h('p', { class: 'small' }, appLoadText()),
       h(
         'ul',
@@ -1985,10 +2056,7 @@ async function showNet(id) {
         ),
       ),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Stored on this device'),
+    group('Stored on this device', null,
       h(
         'table',
         { class: 'kv' },
@@ -1997,10 +2065,7 @@ async function showNet(id) {
         row('Total storage used', est ? B(est.usage) : 'not available'),
       ),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, `Recent requests (${netLog.length})`),
+    group(`Recent requests (${netLog.length})`, null,
       netLog.length
         ? h(
             'ol',
@@ -2026,10 +2091,7 @@ async function showNet(id) {
           )
         : h('p', { class: 'muted small' }, 'None yet.'),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'How this is measured'),
+    group('How this is measured', null,
       h(
         'ul',
         { class: 'small' },
@@ -2169,7 +2231,7 @@ async function showAsk(id, q0) {
     act.finish(`Answered on this device · ${AL.describeRun(r.stats)}`);
   };
   render(
-    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'Ask'), h('a', { href: '#/ai' }, 'AI settings')),
+    pageHead('Ask', h('a', { href: '#/ai' }, 'AI settings')),
     !pkg
       ? h(
           'div',
@@ -2201,10 +2263,7 @@ async function showAsk(id, q0) {
     act.el,
     out,
     asks.length > 0 &&
-      h(
-        'section',
-        null,
-        h('h2', null, 'Earlier questions'),
+      group('Earlier questions', null,
         asks.map((a) =>
           h(
             'details',
@@ -2257,7 +2316,10 @@ function pkgCard(id, rec, dev) {
     notes.push(h('p', { class: 'small bad' }, spec.runtime === 'webllm' ? 'Needs WebGPU with 16-bit floats, which this browser’s GPU doesn’t offer.' : `Needs WebGPU, which this browser doesn't offer${dev.gpu.fallback ? ' (only a software version)' : ''}.`));
   const limitsRow = spec.kind === 'chat' ? limitFields(id) : null;
   if (rec.crashes) notes.push(h('p', { class: 'small warn' }, `The app was ended unexpectedly ${plural(rec.crashes, 'time')} while using this${rec.lastCrash ? `, last ${L.relTime(rec.lastCrash.found)} (at “${rec.lastCrash.stage ?? '?'}”)` : ''}. iOS does not say why; the log below shows what was recorded.`));
-  if (rec.lastError) notes.push(h('p', { class: 'small bad' }, `Last error (${rec.lastError.phase}, ${L.relTime(rec.lastError.at)}): ${rec.lastError.message}`));
+  if (rec.lastError)
+    notes.push(
+      h('p', { class: 'small bad' }, `Last error (${rec.lastError.phase}, ${L.relTime(rec.lastError.at)}): ${rec.lastError.message} `, h('button', { type: 'button', class: 'link small', onclick: async () => (await AI.clearErrors(), route()) }, 'Dismiss')),
+    );
   return h(
     'div',
     { class: 'card pkg' },
@@ -2392,23 +2454,22 @@ async function showAI(id) {
   drawStatus();
 
   render(
-    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'On-device AI'), usable.length ? h('a', { href: '#/ask' }, 'Ask') : null),
-    h('p', null, 'Optional AI that runs on this device, with no connection once downloaded. Nothing downloads until you tap Download. Use Wi-Fi and keep the app open.'),
+    pageHead('On-device AI', usable.length ? h('a', { href: '#/ask' }, 'Ask') : null),
+    h('p', { class: 'muted small' }, 'Optional AI that runs on this device, with no connection once downloaded. Nothing downloads until you tap Download. Use Wi-Fi and keep the app open.'),
     interruption
-      ? h(
-          'div',
-          { class: 'card warn-card' },
-          h('p', null, h('strong', null, 'Last time: '), interruption.message, ' ', h('button', { type: 'button', class: 'link', onclick: () => (AI.ackInterruption(), route()) }, 'Dismiss')),
-          h('details', null, h('summary', { class: 'small' }, 'Why this diagnosis'), h('ul', { class: 'small' }, interruption.reasons.map((r) => h('li', null, r)))),
-        )
+      ? (() => {
+          const b = banner('warn', [h('strong', null, 'Last time: '), interruption.message], { onDismiss: () => AI.ackInterruption() });
+          b.querySelector('.banner-text').append(h('details', null, h('summary', { class: 'small' }, 'Why this diagnosis'), h('ul', { class: 'small' }, interruption.reasons.map((r) => h('li', null, r)))));
+          return b;
+        })()
       : null,
-    h('h2', null, 'Models'),
-    ['lfm350', 'lfm230', 'llama32', 'bge'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
-    h('p', { class: 'small muted' }, 'Each model also downloads a small engine to run it. Only one model is in memory at a time.'),
-    h(
-      'section',
+    group(
+      'Models',
       null,
-      h('h2', null, 'Use'),
+      ['lfm350', 'lfm230', 'llama32', 'bge'].map((x) => pkgCard(x, dl?.id === x ? { ...st[x], status: 'downloading' } : st[x], dev)),
+      h('p', { class: 'small muted' }, 'Each model also downloads a small engine to run it. Only one model is in memory at a time.'),
+    ),
+    group('Use', null,
       usable.length > 1
         ? h(
             'label',
@@ -2436,17 +2497,11 @@ async function showAI(id) {
       ),
       usable.length ? h('p', { class: 'small' }, h('a', { href: '#/ask' }, 'Ask a question'), ': from your saved pages and searches, or the model’s own knowledge.') : null,
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Status'),
+    group('Status', null,
       live,
       h('p', { class: 'small muted' }, `${gpuText}${dev.storage ? ` · ${AL.size(dev.storage.usage)} of about ${AL.size(dev.storage.quota)} storage used by this app` : ''}`),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Log'),
+    fold('Log', false,
       h(
         'p',
         { class: 'small' },
@@ -2462,10 +2517,7 @@ async function showAI(id) {
       entries.length ? logList : h('p', { class: 'small muted' }, 'Nothing logged yet.'),
       h('p', { class: 'small' }, h('button', { type: 'button', class: 'link', onclick: async () => (await AI.resetEngine(), route()) }, 'Reset AI engine'), ' (stops anything running and restarts it; downloaded models are kept)'),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Remove'),
+    fold('Remove', false,
       h('p', { class: 'small' }, twoTap('Remove all AI data from this device', () => AI.removeAll())),
       h('p', { class: 'small muted' }, 'Deletes every model, the engines, the meaning index, summaries, questions and this log.'),
     ),
@@ -2535,37 +2587,25 @@ async function showSettings(id) {
   const est = (await navigator.storage?.estimate?.().catch(() => null)) ?? null;
   if (id !== renderId) return;
   render(
-    h('header', { class: 'bar' }, h('a', { href: '#/', class: 'brand' }, 'Sparse'), h('span', { class: 'muted' }, 'Settings')),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Search'),
+    pageHead('Settings'),
+    fold(
+      'Search',
+      true,
       field(
         'Search engine',
         select('engine', { mwmbl: 'Mwmbl (free)', marginalia: 'Marginalia (free, often busy)' }),
         'Searches always start with a free engine. Mojeek is never used automatically.',
       ),
-      field(
-        'Mojeek API key',
-        text('mojeekKey', 'paste your key'),
-        'From mojeek.com/services/search/web-search-api. Mojeek is paid, so it never runs automatically: with a key set, a “Try Mojeek” button appears with your results. The key stays on this device and is sent only to Mojeek.',
-      ),
-      field(
-        'Marginalia API key',
-        text('marginaliaKey', 'public'),
-        '“public” is shared by everyone and is often busy. You can email Marginalia for your own key.',
-      ),
       checkField('Try other engines when one fails or finds nothing', check('fallback')),
-      field(
-        'Jina Reader API key',
-        text('jinaKey', 'optional'),
-        'Reader view works without a key, but Jina may refuse anonymous requests from some networks (401). A free key from jina.ai fixes that and raises the limit to 200 pages a minute. Stays on this device and is sent only to Jina.',
-      ),
-      field('Region', select('region', L.REGIONS), 'Used by Mojeek and the DuckDuckGo button.'),
       checkField('Safe search', check('safe')),
       checkField('Instant answers (DuckDuckGo)', check('instant')),
+      field('Region', select('region', L.REGIONS), 'Used by Mojeek and the DuckDuckGo button.'),
       field('Tapping a result opens', select('openIn', { reader: 'Reader view (light)', site: 'The website' })),
       field('DuckDuckGo button opens', select('ddg', { lite: 'DuckDuckGo Lite', html: 'DuckDuckGo HTML' })),
+    ),
+    fold(
+      'Reading',
+      false,
       checkField(
         'Read Wikipedia directly',
         check('wikipedia'),
@@ -2591,38 +2631,48 @@ async function showSettings(id) {
         })(),
         'Repeat searches within this time load from the device with no data used.',
       ),
+      checkField(
+        'Show the activity log expanded',
+        check('showActivity'),
+        'Each screen lists every step and request as it happens. When this is off, the log starts collapsed and you can tap it to open it.',
+      ),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'On-device AI'),
+    fold(
+      'API keys',
+      false,
+      field(
+        'Mojeek API key',
+        text('mojeekKey', 'paste your key'),
+        'From mojeek.com/services/search/web-search-api. Mojeek is paid, so it never runs automatically: with a key set, a “Try Mojeek” button appears with your results. The key stays on this device and is sent only to Mojeek.',
+      ),
+      field(
+        'Marginalia API key',
+        text('marginaliaKey', 'public'),
+        '“public” is shared by everyone and is often busy. You can email Marginalia for your own key.',
+      ),
+      field(
+        'Jina Reader API key',
+        text('jinaKey', 'optional'),
+        'Reader view works without a key, but Jina may refuse anonymous requests from some networks (401). A free key from jina.ai fixes that and raises the limit to 200 pages a minute. Stays on this device and is sent only to Jina.',
+      ),
+    ),
+    group(
+      'On-device AI',
+      h('a', { class: 'small', href: '#/ai' }, 'Open'),
       h(
         'p',
         { class: 'small' },
         AL.MODEL_IDS.some((x) => AI.isReady(x))
           ? `On this device: ${AL.MODEL_IDS.filter((x) => AI.isReady(x))
               .map((x) => AL.PACKAGES[x].short)
-              .join(', ')}. `
-          : 'Off: nothing is downloaded until you choose a model. ',
-        h('a', { href: '#/ai' }, 'On-device AI'),
-        ': summaries, answers from saved pages, downloads and diagnostics.',
+              .join(', ')}.`
+          : 'Off: nothing is downloaded until you choose a model.',
       ),
+      h('p', { class: 'muted small' }, 'Summaries, answers from saved pages, downloads and diagnostics.'),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Activity and network'),
-      checkField(
-        'Show the activity log expanded',
-        check('showActivity'),
-        'Each screen lists every step and request as it happens. When this is off, the log starts collapsed and you can tap it to open it.',
-      ),
-      h('p', { class: 'small' }, h('a', { href: '#/net' }, 'Network details'), ': every request, totals per service, and how the app loaded.'),
-    ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Storage'),
+    fold(
+      'Storage',
+      false,
       h('p', { class: 'small' }, est ? `About ${B(est.usage)} used on this device.` : 'Storage use is not available.'),
       h(
         'p',
@@ -2642,10 +2692,9 @@ async function showSettings(id) {
         }),
       ),
     ),
-    h(
-      'section',
-      null,
-      h('h2', null, 'Who sees what'),
+    fold(
+      'Who sees what',
+      false,
       h(
         'ul',
         { class: 'small' },
@@ -2658,6 +2707,7 @@ async function showSettings(id) {
         h('li', null, 'History, saved results and pages stay on this device.'),
       ),
     ),
+    h('p', { class: 'version' }, `Sparse v${APP_VERSION} · `, h('a', { href: '#/net' }, 'Network details')),
   );
   settle();
 }
@@ -2670,6 +2720,7 @@ function currentPath() {
 
 function route() {
   const id = ++renderId;
+  closeMenu();
   aiUnsub?.();
   aiUnsub = null;
   AI.stop('left the screen', String(id - 1)); // a reply for a screen that's gone: stop it and drop its waiting tasks
@@ -2711,6 +2762,7 @@ async function start() {
     S.kvGet('nettotals', null).then((t) => t ?? emptyTotals()),
   ]);
   initNav();
+  initMenu();
   addEventListener('hashchange', (e) => {
     scrollPos.set(new URL(e.oldURL).hash, window.scrollY);
     trackHistory();

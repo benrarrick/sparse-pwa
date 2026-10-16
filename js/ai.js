@@ -1340,6 +1340,16 @@ export async function removeAll() {
 
 let interruptionRec = interruption;
 
+/** Forgets the "last error" and crash notes kept on each model record, so they stop showing up. Models and downloads are untouched. */
+export async function clearErrors() {
+  for (const id of Object.keys(P)) {
+    const r = await state(id);
+    if (!r.lastError && !r.crashes && !r.lastCrash) continue;
+    const { lastError, lastCrash, crashes, ...rest } = r;
+    await save(rest);
+  }
+}
+
 export const lastInterruption = () => (interruptionRec && !interruptionRec.acknowledged ? interruptionRec : null);
 export function ackInterruption() {
   if (!interruptionRec) return;
