@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '4.1';
+const APP_VERSION = '4.2';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -598,6 +598,13 @@ function searchForm(q = '') {
     enterkeyhint: 'search',
     'aria-label': 'Search',
   });
+  const clear = h('button', { type: 'button', class: 'clear', 'aria-label': 'Clear search', hidden: !q }, '×');
+  input.addEventListener('input', () => (clear.hidden = !input.value));
+  clear.addEventListener('click', () => {
+    input.value = '';
+    clear.hidden = true;
+    input.focus();
+  });
   return h(
     'form',
     {
@@ -609,7 +616,7 @@ function searchForm(q = '') {
         submitQuery(input.value);
       },
     },
-    input,
+    h('span', { class: 'search-box' }, input, clear),
     h('button', { type: 'submit' }, 'Search'),
   );
 }
