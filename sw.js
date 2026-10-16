@@ -14,6 +14,7 @@ const FILES = [
   './js/convert.js',
   './js/places.js',
   './js/wiki.js',
+  './js/speed.js',
   './js/ai.js',
   './js/ai-lib.js',
   './js/ai-store.js',

@@ -55,10 +55,10 @@ function concat(chunks, total) {
  * Error marked `network: true` when the request never got a response or was cut off.
  * `onProgress(entry)` is called about every 150 ms while the body arrives.
  */
-export async function request(url, { timeout = 15000, headers = {}, onProgress } = {}) {
+export async function request(url, { timeout = 15000, headers = {}, onProgress, service } = {}) {
   const entry = {
     id: nextId++,
-    service: serviceOf(url),
+    service: service ?? serviceOf(url),
     url: redactUrl(url),
     at: Date.now(),
     phase: 'connecting',

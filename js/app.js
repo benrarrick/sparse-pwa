@@ -9,13 +9,14 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '4.0';
+const APP_VERSION = '4.1';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
 import * as AI from './ai.js';
 import * as AL from './ai-lib.js';
 import * as SEL from './ai-select.js';
+import * as SP from './speed.js';
 import * as C from './convert.js';
 import * as P from './places.js';
 import * as W from './wiki.js';
@@ -1939,9 +1940,51 @@ const safeAreaInsets = () =>
 const viewportUnits = () =>
   [probe('height:100vh', (_, el) => el.offsetHeight), CSS.supports('height', '100dvh') ? probe('height:100dvh', (_, el) => el.offsetHeight) : '?'].join(' / ');
 
+// The Network page redraws itself after each request, so a running speed test keeps its state here.
+let speedRun = { running: false, text: '' };
+let speedUi = null;
+
+/** The speed test card on the Network page. Nothing is downloaded until the button is tapped. */
+function speedGroup(saved) {
+  const body = h('div');
+  const status = h('p', { class: 'muted small' });
+  const btn = h('button', { type: 'button', class: 'button secondary small' }, 'Test speed');
+  const draw = (rec) => {
+    fill(
+      body,
+      rec
+        ? [
+            h('table', { class: 'kv' }, rec.results.map((r) => h('tr', null, h('th', null, r.name), h('td', { class: r.error ? 'bad' : null }, L.speedLine(r))))),
+            h('p', { class: 'muted small' }, `Tested ${L.relTime(rec.at)}. Latency is the time to the first byte, so it includes setting up the connection.`),
+          ]
+        : h('p', { class: 'muted small' }, 'Not tested yet.'),
+    );
+  };
+  draw(saved);
+  btn.disabled = speedRun.running;
+  status.textContent = speedRun.text || 'Uses about 0.5 MB, or up to 2.5 MB on a fast connection. It tests Cloudflare and this app’s own host.';
+  speedUi = { btn, status, draw };
+  btn.addEventListener('click', async () => {
+    if (!navigator.onLine) return (status.textContent = 'You are offline.');
+    speedRun = { running: true, text: 'Starting…' };
+    btn.disabled = true;
+    const results = await SP.runAll((t) => {
+      speedRun.text = t;
+      speedUi.status.textContent = t;
+    });
+    const rec = { at: Date.now(), results };
+    await S.kvSet('speed', rec);
+    speedRun = { running: false, text: `Used ${B(results.reduce((n, r) => n + r.bytes, 0))}.` };
+    speedUi.draw(rec);
+    speedUi.status.textContent = speedRun.text;
+    speedUi.btn.disabled = false;
+  });
+  return group('Speed test', btn, body, status);
+}
+
 async function showNet(id) {
   document.title = 'Network · Sparse';
-  const [est, results, pages] = await Promise.all([navigator.storage?.estimate?.().catch(() => null) ?? null, S.entries('results'), S.entries('pages')]);
+  const [est, results, pages, speed] = await Promise.all([navigator.storage?.estimate?.().catch(() => null) ?? null, S.entries('results'), S.entries('pages'), S.kvGet('speed', null)]);
   if (id !== renderId) return;
   const s = N.session;
   const c = navigator.connection;
@@ -1968,6 +2011,7 @@ async function showNet(id) {
           : row('Type and speed', 'Not shared by this browser (Safari keeps them private). Speeds below are measured from real requests.'),
       ),
     ),
+    speedGroup(speed),
     group('This session', null,
       h(
         'table',
@@ -2704,6 +2748,7 @@ async function showSettings(id) {
         h('li', null, 'Wikipedia articles are fetched from Wikipedia itself (not Jina), which sees the article titles you open.'),
         h('li', null, 'Searches like “coffee near me” send your coordinates (or the place you named) to OpenStreetMap’s Overpass servers, and to Nominatim if they fail. Exchange rates come from Frankfurter and carry no personal data; unit conversions never leave the device.'),
         h('li', null, 'On-device AI, if you turn it on: models download once from Hugging Face, and the engine from jsDelivr. After that, summaries and answers are worked out on this device and nothing you read or ask is sent anywhere.'),
+        h('li', null, 'The speed test on the Network page downloads from Cloudflare (which sees your IP address) and from this app’s own host. Only when you tap it.'),
         h('li', null, 'History, saved results and pages stay on this device.'),
       ),
     ),

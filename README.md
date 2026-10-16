@@ -12,6 +12,7 @@ It works because every service it reads sends CORS headers, so a web page may ca
 | Weather | Open-Meteo (forecast, place lookup, air quality) | none |
 | Wikipedia articles | Wikipedia's own API (`*.wikipedia.org/w/api.php`) | none. The opening section and the list of sections load first (about 3–10 KB); other sections load when tapped; tables come through. Jina is used for every other site, and as the fallback. |
 | Exchange rates | [Frankfurter](https://frankfurter.dev) (European Central Bank reference rates) | none. One download of about 0.5 KB on the wire serves every pair for 6 hours, and offline from the saved copy. |
+| Speed test (button on the Network page) | `speed.cloudflare.com`, and static files in `speedtest/` served with the app | none. Cloudflare sees your IP address, like any service here. About 0.5 MB per test, up to 2.5 MB on a fast connection. |
 | Nearby places | OpenStreetMap through Overpass (two servers), then Nominatim as a fallback | none. Overpass is often at capacity, so Nominatim usually answers. |
 | Archived copies | Internet Archive availability lookup (`archive.org/wayback/available`) | none to find a copy; reading it in the app needs a Jina key, because Jina refuses anonymous requests for archive.org |
 | On-device AI (optional) | Models from Hugging Face, the engine (Transformers.js 4.3.0, ONNX Runtime Web) from jsDelivr: downloaded once, only when you tap Download | none |
@@ -151,6 +152,7 @@ History, cached results and saved pages stay on the device. The page's Content-S
 | `index.html` | Shell, iOS meta tags, CSP |
 | `js/app.js` | Views (home, results, reader, network, settings), activity log, bottom bar, routing, offline queue |
 | `js/net.js` | Measured requests: timings, sizes, progress events, app-load figures |
+| `js/speed.js`, `speedtest/` | The speed test: latency, then 250 KB, then 1 MB only on a fast link. `speedtest/` holds random (incompressible) files of those exact sizes |
 | `js/convert.js`, `js/places.js`, `js/wiki.js` | Pure logic for conversions and rates, nearby places and opening hours, Wikipedia's API and HTML-to-Markdown. Tested in `test/` |
 | `js/lib.js` | Pure logic: engine URLs and parsers, instant answers, weather, Jina and Markdown parsing. Tested in `test/` |
 | `js/store.js` | IndexedDB (kv, results, pages) and eviction |

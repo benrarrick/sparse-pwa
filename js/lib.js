@@ -228,6 +228,29 @@ export function formatSpeed(bytes, ms) {
   return `${formatBytes((bytes * 1000) / ms)}/s`;
 }
 
+/** Time spent actually transferring a body: total time minus the wait for the first byte (falls back to total for tiny bodies). */
+export function transferMs(entry) {
+  const t = entry.ms - (entry.ttfb ?? 0);
+  return t >= 20 ? t : entry.ms;
+}
+
+/** Megabits per second for `bytes` moved in `ms`; null when it can't be worked out. */
+export function mbit(bytes, ms) {
+  return bytes > 0 && ms > 0 ? (bytes * 8) / (ms / 1000) / 1e6 : null;
+}
+
+export function formatMbit(m) {
+  if (m == null) return '?';
+  if (m < 1) return `${Math.round(m * 1000)} kbit/s`;
+  return `${m < 10 ? m.toFixed(1) : Math.round(m)} Mbit/s`;
+}
+
+/** One speed-test result as a line: "1.8 Mbit/s down · 140 ms latency · used 250 KB". */
+export function speedLine(r) {
+  if (r.error) return `failed: ${r.error}`;
+  return `${formatMbit(r.mbit)} down · ${formatMs(r.latency)} latency · used ${formatBytes(r.bytes)}`;
+}
+
 /** Wire size text: exact when the service sent Content-Length, "≈" when estimated. */
 export function formatWire(entry) {
   if (entry.wire == null) return 'size on the wire unknown';
@@ -258,6 +281,7 @@ const SERVICES = {
   'nominatim.openstreetmap.org': 'OpenStreetMap places (Nominatim)',
   'huggingface.co': 'Hugging Face (AI models)',
   'cdn.jsdelivr.net': 'jsDelivr (AI engine)',
+  'speed.cloudflare.com': 'Cloudflare speed test',
 };
 
 export function serviceOf(url) {
