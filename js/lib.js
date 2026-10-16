@@ -252,12 +252,17 @@ const SERVICES = {
   'geocoding-api.open-meteo.com': 'Open-Meteo places',
   'air-quality-api.open-meteo.com': 'Open-Meteo air quality',
   'archive.org': 'Internet Archive',
+  'api.frankfurter.dev': 'Frankfurter (exchange rates)',
+  'overpass-api.de': 'OpenStreetMap places (Overpass)',
+  'overpass.private.coffee': 'OpenStreetMap places (Overpass)',
+  'nominatim.openstreetmap.org': 'OpenStreetMap places (Nominatim)',
   'huggingface.co': 'Hugging Face (AI models)',
   'cdn.jsdelivr.net': 'jsDelivr (AI engine)',
 };
 
 export function serviceOf(url) {
   const host = hostOf(url);
+  if (host.endsWith('.wikipedia.org')) return 'Wikipedia';
   return SERVICES[host] ?? SERVICES[`www.${host}`] ?? host;
 }
 

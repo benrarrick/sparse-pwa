@@ -305,6 +305,8 @@ test('serviceOf and redactUrl', () => {
   assert.equal(L.serviceOf('https://r.jina.ai/https://x.example/'), 'Jina Reader');
   assert.equal(L.serviceOf('https://www.mojeek.com/search?q=a'), 'Mojeek');
   assert.equal(L.serviceOf('https://other.example/'), 'other.example');
+  assert.equal(L.serviceOf('https://en.wikipedia.org/w/api.php?x=1'), 'Wikipedia');
+  assert.equal(L.serviceOf('https://api.frankfurter.dev/v2/rates'), 'Frankfurter (exchange rates)');
   assert.equal(L.redactUrl('https://www.mojeek.com/search?q=a+b&api_key=SECRET&fmt=json'), 'https://www.mojeek.com/search?q=a+b&api_key=•••&fmt=json');
   assert.equal(L.redactUrl('https://api.marginalia.nu/mykey/search/a?count=10'), 'https://api.marginalia.nu/•••/search/a?count=10');
   assert.equal(L.redactUrl('https://api.marginalia.nu/public/search/a'), 'https://api.marginalia.nu/public/search/a');

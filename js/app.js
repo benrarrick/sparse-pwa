@@ -1,7 +1,7 @@
 // Sparse: a small search PWA with no server of its own. Routes live in the URL hash:
 //   #/            home: search box, queue, recent searches, saved pages, data use
 //   #/s?q=&p=&e=  results (q = query, p = page, e = engine)
-//   #/r?u=        reader view of a page, through Jina Reader
+//   #/r?u=        reader view of a page, through Jina Reader (Wikipedia: its own API, section by section)
 //   #/net         network details: every request, totals per service, how the app loaded
 //   #/settings
 //   #/ai          on-device AI: downloads, device checks, diagnostics (all opt-in)
@@ -9,13 +9,16 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '2.6';
+const APP_VERSION = '3.0';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
 import * as AI from './ai.js';
 import * as AL from './ai-lib.js';
 import * as SEL from './ai-select.js';
+import * as C from './convert.js';
+import * as P from './places.js';
+import * as W from './wiki.js';
 
 const DEFAULTS = {
   engine: 'mwmbl',
@@ -32,6 +35,7 @@ const DEFAULTS = {
   jinaKey: '',
   showActivity: true,
   weatherDetail: 'basic',
+  wikipedia: true,
   aiModel: 'lfm350',
   aiAutoSummary: false,
 };
@@ -352,6 +356,14 @@ async function runSearch(q, page, chosen, act, knownInstant) {
 }
 
 async function loadPage(url, act) {
+  const wiki = settings.wikipedia ? W.wikiTarget(url) : null;
+  if (wiki) {
+    try {
+      return await loadWiki(url, wiki, act);
+    } catch (e) {
+      act.warn(`Wikipedia's own API failed (${describe(e)}); trying Jina Reader instead`);
+    }
+  }
   const host = L.hostOf(url);
   act.step(`Asking Jina Reader to fetch ${host} and turn it into text (${settings.jinaKey ? 'with your API key' : 'anonymous, 20 pages a minute'})…`);
   let r;
@@ -382,6 +394,50 @@ async function loadPage(url, act) {
     saved: old?.saved ?? false,
     net: { received: e.received, wire: e.wire, wireKind: e.wireKind, ms: e.ms, ttfb: e.ttfb },
   };
+  await S.put('pages', url, rec);
+  act.ok(`Stored on this device${rec.saved ? ', still marked as saved' : ''} (${B(jsonSize(rec))})`);
+  return rec;
+}
+
+/** The page record's text: the opening section, then whichever sections have been loaded, in article order. */
+const wikiText = (rec) =>
+  Object.entries(rec.wiki.parts)
+    .sort((a, b) => a[0] - b[0])
+    .map(([, md]) => md)
+    .join('\n\n');
+
+/** Wikipedia's own API: the opening section and the list of sections now, each other section only when asked. */
+async function loadWiki(url, target, act) {
+  act.step(`Asking ${target.host} for “${target.title}” directly (the opening section, and the list of sections)…`);
+  const [lead, toc] = await Promise.allSettled([act.fetch(W.leadUrl(target.host, target.title), { timeout: 20000 }), act.fetch(W.tocUrl(target.host, target.title), { timeout: 20000 })]);
+  if (lead.status === 'rejected') throw lead.reason;
+  const json = lead.value.json();
+  if (W.apiError(json)) throw new Error(W.apiError(json));
+  const { html, title } = W.parseBody(json);
+  if (!html) throw new Error('no text in the reply');
+  let sections = [];
+  if (toc.status === 'fulfilled') sections = W.parseToc(toc.value.json());
+  else act.warn(`The list of sections failed (${describe(toc.reason)}); only the opening section is shown`);
+  const entries = [lead.value.entry, ...(toc.status === 'fulfilled' ? [toc.value.entry] : [])];
+  const old = await S.get('pages', url);
+  const rec = {
+    url,
+    title: title || target.title,
+    source: W.canonicalUrl(target.host, target.title),
+    published: '',
+    at: Date.now(),
+    saved: old?.saved ?? false,
+    wiki: { host: target.host, title: target.title, sections, parts: { 0: W.htmlToMarkdown(html, target.host) }, full: false },
+    net: {
+      received: entries.reduce((n, e) => n + e.received, 0),
+      wire: entries.reduce((n, e) => n + (e.wire ?? e.received), 0),
+      wireKind: entries.every((e) => e.wireKind === 'exact') ? 'exact' : 'estimated',
+      ms: Math.max(...entries.map((e) => e.ms)),
+      ttfb: Math.min(...entries.map((e) => e.ttfb ?? Infinity)),
+    },
+  };
+  rec.markdown = wikiText(rec);
+  act.ok(`Got “${rec.title}”: ${B(new Blob([rec.markdown]).size)} of text now, ${plural(sections.length, 'more section')} to load on demand`);
   await S.put('pages', url, rec);
   act.ok(`Stored on this device${rec.saved ? ', still marked as saved' : ''} (${B(jsonSize(rec))})`);
   return rec;
@@ -626,6 +682,12 @@ async function showHome(id) {
       ' to search on DuckDuckGo',
     ),
     homeWeather(id),
+    h(
+      'p',
+      { class: 'quick small' },
+      h('span', { class: 'muted' }, 'Near you: '),
+      P.QUICK_SEARCHES.flatMap(([label, q], i) => [i ? ' · ' : null, h('a', { href: hashFor('/s', { q }) }, label)]),
+    ),
     h('p', { class: 'muted small', id: 'version' }, `Sparse v${APP_VERSION}`),
     h(
       'section',
@@ -712,8 +774,20 @@ async function showSearch(id, q, page, engineParam, force = false) {
   const key = resultsKey(q, page, chosen);
   clearReady(key);
 
+  // Answer cards above the results. The first kind that matches wins: weather, then currency, units, nearby places.
   const weather = page === 1 ? L.weatherIntent(q) : null;
-  const weatherDone = weather ? showWeather(cards, weather.place, id, act) : null;
+  const money = page === 1 && !weather ? C.currencyIntent(q) : null;
+  const units = page === 1 && !weather && !money ? C.unitIntent(q) : null;
+  const nearby = page === 1 && !weather && !money && !units ? P.placesIntent(q) : null;
+  const weatherDone = weather
+    ? showWeather(cards, weather.place, id, act)
+    : money
+      ? showCurrency(cards, money, id, act)
+      : units
+        ? showUnits(cards, units, act)
+        : nearby
+          ? showPlaces(cards, nearby, id, act)
+          : null;
 
   /** Mojeek is paid, so it only runs from this button, never automatically. */
   const tryMojeek = () =>
@@ -859,12 +933,12 @@ async function showSearch(id, q, page, engineParam, force = false) {
   }
 }
 
-function here() {
+function here(hint = 'try “weather <town>”') {
   return new Promise((resolve, reject) => {
-    if (!navigator.geolocation) return reject(new Error('location is not available; try “weather <town>”'));
+    if (!navigator.geolocation) return reject(new Error(`location is not available; ${hint}`));
     navigator.geolocation.getCurrentPosition(
       (p) => resolve({ lat: p.coords.latitude, lon: p.coords.longitude, label: 'Your location' }),
-      () => reject(new Error('location is not available; try “weather <town>”')),
+      () => reject(new Error(`location is not available; ${hint}`)),
       { maximumAge: 10 * MIN, timeout: 15000 },
     );
   });
@@ -873,8 +947,8 @@ function here() {
 /** Sums the requests behind one card, so it can say what it cost. */
 function netCounter(act) {
   const net = { requests: 0, received: 0, wire: 0, estimated: false };
-  const get = async (url) => {
-    const r = await act.fetch(url);
+  const get = async (url, opts) => {
+    const r = await act.fetch(url, opts);
     net.requests++;
     net.received += r.entry.received;
     net.wire += r.entry.wire ?? r.entry.received;
@@ -882,6 +956,197 @@ function netCounter(act) {
     return r.json();
   };
   return { net, get };
+}
+
+// ---------- conversion and nearby-place cards ----------
+
+const RATES_FRESH = 6 * HOUR;
+const PLACES_FRESH = HOUR;
+const num = (n) => C.formatNumber(n, navigator.language);
+
+/** Unit conversion is arithmetic: nothing is downloaded. */
+function showUnits(container, intent, act) {
+  const out = C.convertUnit(intent);
+  act.ok(`Units: worked out on this device, nothing downloaded (${intent.from.label} → ${intent.to.label})`);
+  container.prepend(
+    h(
+      'section',
+      { class: 'card conv' },
+      h('p', { class: 'big' }, `${num(intent.amount)} ${intent.from.label} = ${num(out)} ${intent.to.label}`),
+      h(
+        'p',
+        { class: 'muted small' },
+        intent.from.dim === 'temp' ? '' : `1 ${intent.from.label} = ${num(C.convertUnit({ ...intent, amount: 1 }))} ${intent.to.label} · `,
+        'worked out on this device, 0 B downloaded',
+      ),
+    ),
+  );
+}
+
+/** One download of ECB rates (about 1 KB) serves every currency pair for 6 hours, and offline from the saved copy. */
+async function showCurrency(container, intent, id, act) {
+  const card = h('section', { class: 'card conv' }, h('p', { class: 'muted' }, 'Exchange rate…'));
+  container.prepend(card);
+  const key = 'fx|EUR';
+  act.step(`Currency: looking on this device for exchange rates (${intent.from} → ${intent.to})…`);
+  let rec = await S.get('results', key);
+  try {
+    if (rec && Date.now() - rec.at <= RATES_FRESH) act.ok(`Currency: using the rates saved ${L.relTime(rec.at)}, nothing downloaded`);
+    else if (rec && !navigator.onLine) act.ok(`Currency: offline, using the rates saved ${L.relTime(rec.at)}`);
+    else if (!navigator.onLine) throw new Error('rates need a connection once; then they work offline');
+    else {
+      if (rec) act.step(`Currency: the saved rates are ${L.relTime(rec.at)} old (over 6 h): refreshing`);
+      const { net, get } = netCounter(act);
+      let parsed;
+      try {
+        act.step('Currency: fetching European Central Bank rates from Frankfurter…');
+        parsed = C.parseRates(await get(C.ratesUrl(), { timeout: 10000 }));
+      } catch (e) {
+        act.warn(`Currency: ${describe(e)}; trying Frankfurter's older address`);
+        parsed = C.parseRates(await get(C.ratesFallbackUrl(), { timeout: 10000 }));
+      }
+      if (!parsed) throw new Error('no rates available');
+      rec = { at: Date.now(), ...parsed, net };
+      await S.put('results', key, rec);
+      act.ok(`Currency: ${plural(Object.keys(parsed.rates).length, 'rate')} saved on this device (${amount(net)})`);
+    }
+  } catch (e) {
+    act.warn(`Currency failed: ${describe(e)}${rec ? '; showing the older saved rates' : ''}`);
+    if (!rec) {
+      if (id === renderId) fill(card, h('p', { class: 'muted small' }, `Exchange rate: ${describe(e)}`));
+      return;
+    }
+  }
+  if (id !== renderId) return;
+  const r = C.convertCurrency(intent.amount, intent.from, intent.to, rec.rates);
+  if (!r) {
+    const missing = [intent.from, intent.to].filter((c) => !rec.rates[c]).join(', ');
+    act.warn(`Currency: no rate for ${missing}`);
+    return fill(card, h('p', { class: 'muted small' }, `No rate for ${missing} in the European Central Bank list.`));
+  }
+  const back = C.convertCurrency(1, intent.to, intent.from, rec.rates);
+  fill(
+    card,
+    h('p', { class: 'big' }, `${num(intent.amount)} ${intent.from} = ${num(r.value)} ${intent.to}`),
+    h('p', { class: 'small' }, `1 ${intent.from} = ${num(r.unit)} ${intent.to} · 1 ${intent.to} = ${num(back.unit)} ${intent.from}`),
+    h('p', { class: 'muted small' }, `European Central Bank reference rates${rec.date ? ` for ${rec.date}` : ''}, via Frankfurter · saved ${L.relTime(rec.at)} · ${amount(rec.net)}`),
+  );
+}
+
+const placeFailedAt = new Map();
+
+/** Asks Overpass (two servers), then Nominatim, for places around a point. Throws if every source fails. */
+async function findPlaces(loc, radius, intent, get, act) {
+  const sources = [
+    ...P.OVERPASS_HOSTS.map((host) => ({ id: host, name: `Overpass (${L.hostOf(host)})`, url: () => P.overpassUrl(host, P.overpassQuery(loc.lat, loc.lon, radius, intent)), parse: P.parseOverpass })),
+    { id: 'nominatim', name: 'Nominatim (OpenStreetMap)', url: () => P.nominatimUrl(loc.lat, loc.lon, radius, intent), parse: P.parseNominatim },
+  ];
+  const failing = (s) => Date.now() - (placeFailedAt.get(s.id) ?? 0) < 5 * MIN;
+  const order = sources.some((s) => !failing(s)) ? [...sources.filter((s) => !failing(s)), ...sources.filter(failing)] : sources;
+  const notes = [];
+  for (const [i, s] of order.entries()) {
+    act.step(`Places: asking ${s.name} within ${P.formatDistance(radius)}${i ? ' (fallback)' : ''}…`);
+    try {
+      const json = await get(s.url(), { timeout: s.id === 'nominatim' ? 12000 : 6000 });
+      if (json?.remark && /runtime error|timed out/i.test(json.remark) && !json.elements?.length) throw new Error('the server ran out of time');
+      const places = s.parse(json, loc, { max: 10, keepUnnamed: !!intent.type && ['Toilets', 'Cash machines', 'Bus stops', 'Parking', 'Drinking water'].includes(intent.label), label: intent.label });
+      act.ok(`Places: ${s.name} returned ${plural(places.length, 'place')}`);
+      return { places, source: s.name };
+    } catch (e) {
+      placeFailedAt.set(s.id, Date.now());
+      notes.push(`${s.name}: ${describe(e)}`);
+      act.warn(`Places: ${s.name} failed: ${describe(e)}${order[i + 1] ? `; trying ${order[i + 1].name}` : ''}`);
+    }
+  }
+  throw new Error(notes.join(' · '));
+}
+
+/** "coffee near me", "pharmacy near Leeds", "Tesco near me": the nearest ten places, with hours where OpenStreetMap has them. */
+async function showPlaces(container, intent, id, act) {
+  const imperial = L.resolveUnit(settings.units, navigator.language) === 'f';
+  const where = intent.place ? `near ${intent.place}` : 'near you';
+  const card = h('section', { class: 'card places' }, h('h2', null, `${intent.label} ${where}`), h('p', { class: 'muted' }, 'Looking for places…'));
+  container.prepend(card);
+  const problem = (msg) => id === renderId && fill(card, h('h2', null, `${intent.label} ${where}`), h('p', { class: 'muted small' }, msg));
+  let loc;
+  try {
+    if (intent.place) {
+      const known = (await S.get('results', `geo|${intent.place.toLowerCase()}`)) ?? null;
+      if (known) loc = known.loc;
+      else {
+        if (!navigator.onLine) throw new Error('looking up a place needs a connection');
+        act.step(`Places: looking up “${intent.place}” with Open-Meteo…`);
+        const { net, get } = netCounter(act);
+        loc = L.parseGeocode(await get(L.geocodeUrl(intent.place)));
+        if (!loc) throw new Error(`couldn't find “${intent.place}”`);
+        await S.put('results', `geo|${intent.place.toLowerCase()}`, { at: Date.now(), loc, net });
+        act.ok(`Places: ${loc.label} (${loc.lat.toFixed(2)}, ${loc.lon.toFixed(2)})`);
+      }
+    } else {
+      act.step('Places: asking this device for your location…');
+      loc = await here(`try “${intent.term} near <town>”`);
+      act.ok('Places: got your location');
+    }
+  } catch (e) {
+    act.warn(`Places failed: ${describe(e)}`);
+    return problem(describe(e));
+  }
+
+  const key = `near|${intent.type ? intent.type[3] : intent.term}|${loc.lat.toFixed(3)},${loc.lon.toFixed(3)}`;
+  act.step('Places: looking on this device for saved places…');
+  let rec = await S.get('results', key);
+  try {
+    if (rec && Date.now() - rec.at <= PLACES_FRESH) act.ok(`Places: using the list saved ${L.relTime(rec.at)}, nothing downloaded`);
+    else if (rec && !navigator.onLine) act.ok(`Places: offline, using the list saved ${L.relTime(rec.at)}`);
+    else if (!navigator.onLine) throw new Error('places need a connection; this search is not queued');
+    else {
+      const { net, get } = netCounter(act);
+      let found = await findPlaces(loc, 800, intent, get, act);
+      let radius = 800;
+      if (found.places.length < 3) {
+        act.step('Places: fewer than 3 close by; widening the search');
+        radius = intent.type ? 3000 : 5000;
+        found = await findPlaces(loc, radius, intent, get, act);
+      }
+      rec = { at: Date.now(), loc: { lat: loc.lat, lon: loc.lon }, places: found.places, source: found.source, radius, net };
+      await S.put('results', key, rec);
+      act.ok(`Places: saved on this device (${amount(net)})`);
+    }
+  } catch (e) {
+    act.warn(`Places failed: ${describe(e)}${rec ? '; showing the older saved list' : ''}`);
+    if (!rec) return problem(`Couldn't get places (${describe(e)}).`);
+  }
+  if (id !== renderId) return;
+  if (!rec.places.length) return problem(`Nothing found within ${P.formatDistance(rec.radius, imperial)} in OpenStreetMap.`);
+  const items = rec.places.map((p) => {
+    const status = !intent.place && p.hours ? P.openStatus(p.hours) : null;
+    return h(
+      'li',
+      null,
+      h('strong', null, p.name),
+      h('span', { class: 'muted small' }, ` · ${[p.kind && p.kind !== p.name.toLowerCase() ? p.kind : '', `${P.formatDistance(p.dist, imperial)} ${p.dir}`].filter(Boolean).join(' · ')}`),
+      status ? h('div', { class: `small ${status.open ? 'open' : 'closed'}` }, status.text) : null,
+      p.hours && !status ? h('div', { class: 'small muted' }, `Hours: ${p.hours.slice(0, 120)}`) : null,
+      p.address ? h('div', { class: 'small muted' }, p.address) : null,
+      h(
+        'div',
+        { class: 'small' },
+        external(`https://maps.apple.com/?${new URLSearchParams({ ll: `${p.lat},${p.lon}`, q: p.name })}`, 'Map ↗'),
+        p.phone && /^[+\d][\d\s().-]{4,}$/.test(p.phone) ? [' · ', h('a', { href: `tel:${p.phone.replace(/[^\d+]/g, '')}` }, 'Call')] : null,
+        p.web ? [' · ', external(p.web, 'Website ↗')] : null,
+      ),
+    );
+  });
+  fill(
+    card,
+    h('h2', null, `${intent.label} ${where}`),
+    h('ul', { class: 'plain' }, items),
+    h(
+      'p',
+      { class: 'muted small' },
+      `Map data © OpenStreetMap contributors, via ${rec.source} · within ${P.formatDistance(rec.radius, imperial)}${intent.place ? ` of ${loc.label}` : ''} · saved ${L.relTime(rec.at)} · ${amount(rec.net)}. Opening hours are what OpenStreetMap volunteers recorded and may be out of date.`,
+    ),
+  );
 }
 
 const WEATHER_FRESH = 30 * MIN;
@@ -1347,6 +1612,93 @@ async function summarise(rec, url, box, act, id, { auto = false, redo = false, c
   }
 }
 
+/** A Wikipedia article: the opening section, then a button for each other section that loads it when tapped. */
+function wikiView(rec, url, act, rerender) {
+  const w = rec.wiki;
+  const base = rec.source || url;
+  const blocksOf = (md) => blockNodes(L.parseMarkdown(md, base), url);
+  const persist = () => {
+    rec.markdown = wikiText(rec);
+    return S.put('pages', url, rec);
+  };
+  const fetchHtml = async (apiUrl, what) => {
+    act.step(`Wikipedia: fetching ${what}…`);
+    const r = await act.fetch(apiUrl, { timeout: 25000 });
+    const json = r.json();
+    if (W.apiError(json)) throw new Error(W.apiError(json));
+    return { html: W.parseBody(json).html, entry: r.entry };
+  };
+  const pending = w.full ? [] : w.sections.filter((s) => w.parts[s.index] == null);
+  const loadedSections = w.full ? [] : w.sections.filter((s) => w.parts[s.index] != null);
+  const status = h('span', { class: 'muted small' });
+  const slots = new Map();
+  const nodes = [blocksOf(w.parts[0] ?? '')];
+
+  const openSection = async (sec, btn) => {
+    btn.disabled = true;
+    status.textContent = `loading “${sec.line}”…`;
+    try {
+      const { html, entry } = await fetchHtml(W.sectionUrl(w.host, w.title, sec.index), `the “${sec.line}” section`);
+      let md = W.htmlToMarkdown(html, w.host);
+      if (!/^#\s/.test(md)) md = `# ${sec.line}\n\n${md || '*Nothing in this section can be shown as text.*'}`;
+      w.parts[sec.index] = md;
+      await persist();
+      act.ok(`Wikipedia: “${sec.line}” is ${B(new Blob([md]).size)} of text, ${B(entry.wire ?? entry.received)} downloaded; saved on this device`);
+      status.textContent = '';
+      fill(slots.get(sec.index), blocksOf(md));
+    } catch (e) {
+      act.warn(`Wikipedia: “${sec.line}” failed: ${describe(e)}`);
+      status.textContent = `couldn't load “${sec.line}”: ${describe(e)}`;
+      btn.disabled = false;
+    }
+  };
+
+  for (const sec of w.full ? [] : w.sections) {
+    const slot = h('div', { class: 'wiki-slot' });
+    slots.set(sec.index, slot);
+    if (w.parts[sec.index] != null) fill(slot, blocksOf(w.parts[sec.index]));
+    else {
+      const btn = h('button', { type: 'button', class: 'button secondary wiki-open' }, `▸ ${sec.line}`);
+      btn.addEventListener('click', () => openSection(sec, btn));
+      fill(slot, btn, sec.subs ? h('span', { class: 'muted small' }, ` ${plural(sec.subs, 'subsection')} included`) : null);
+    }
+    nodes.push(slot);
+  }
+  if (pending.length) {
+    const all = h('button', { type: 'button', class: 'link' }, 'Load the whole article');
+    all.addEventListener('click', async () => {
+      all.disabled = true;
+      status.textContent = 'loading the whole article…';
+      try {
+        const { html, entry } = await fetchHtml(W.fullUrl(w.host, w.title), 'the whole article');
+        const md = W.htmlToMarkdown(html, w.host);
+        w.parts = { 0: md };
+        w.full = true;
+        await persist();
+        act.ok(`Wikipedia: whole article is ${B(new Blob([md]).size)} of text, ${B(entry.wire ?? entry.received)} downloaded; saved on this device`);
+        rerender();
+      } catch (e) {
+        act.warn(`Wikipedia: the whole article failed: ${describe(e)}`);
+        status.textContent = `couldn't load the whole article: ${describe(e)}`;
+        all.disabled = false;
+      }
+    });
+    nodes.push(
+      h(
+        'p',
+        { class: 'wiki-hint small' },
+        pending.length === w.sections.length
+          ? `Opening section only, loaded from Wikipedia directly. Tap a section to load it (usually 2–10 KB). `
+          : `${plural(loadedSections.length, 'section')} loaded, ${pending.length} to go. `,
+        all,
+        ' ',
+        status,
+      ),
+    );
+  }
+  return nodes;
+}
+
 async function showRead(id, raw, reload = false) {
   const url = L.safeHttpUrl(raw);
   const arch = url ? L.parseWaybackUrl(url) : null;
@@ -1415,9 +1767,11 @@ async function showRead(id, raw, reload = false) {
       ),
       box,
       summary,
-      blocks.length
-        ? blockNodes(blocks, url, arch ? (href) => L.unarchiveLink(href, arch.original) : undefined)
-        : h('p', { class: 'muted' }, 'The reader found no text on this page. Try opening the original.'),
+      rec.wiki
+        ? wikiView(rec, url, act, () => showPage(rec, { fromDevice: true, note: 'The whole article is loaded.' }))
+        : blocks.length
+          ? blockNodes(blocks, url, arch ? (href) => L.unarchiveLink(href, arch.original) : undefined)
+          : h('p', { class: 'muted' }, 'The reader found no text on this page. Try opening the original.'),
     );
     act.ok(`Showing ${plural(blocks.length, 'block')} of text (menus at the top removed)`);
     settle();
@@ -2212,6 +2566,11 @@ async function showSettings(id) {
       checkField('Instant answers (DuckDuckGo)', check('instant')),
       field('Tapping a result opens', select('openIn', { reader: 'Reader view (light)', site: 'The website' })),
       field('DuckDuckGo button opens', select('ddg', { lite: 'DuckDuckGo Lite', html: 'DuckDuckGo HTML' })),
+      checkField(
+        'Read Wikipedia directly',
+        check('wikipedia'),
+        'Opens Wikipedia articles through Wikipedia’s own API: the opening section first (a few KB), and any other section only when you tap it, with tables intact. Turn off to use Jina Reader for everything.',
+      ),
       field('Weather units', select('units', { auto: 'Automatic', c: '°C', f: '°F' })),
       field(
         'Weather card shows',
@@ -2293,6 +2652,8 @@ async function showSettings(id) {
         h('li', null, 'Searches go to the engine you chose (Marginalia, Mwmbl or Mojeek), and to DuckDuckGo when instant answers are on.'),
         h('li', null, 'Pages you open in reader view are fetched by Jina Reader (r.jina.ai), which sees their addresses. It allows 20 pages a minute.'),
         h('li', null, 'Weather comes from Open-Meteo, which sees the place, or your coordinates for plain “weather”.'),
+        h('li', null, 'Wikipedia articles are fetched from Wikipedia itself (not Jina), which sees the article titles you open.'),
+        h('li', null, 'Searches like “coffee near me” send your coordinates (or the place you named) to OpenStreetMap’s Overpass servers, and to Nominatim if they fail. Exchange rates come from Frankfurter and carry no personal data; unit conversions never leave the device.'),
         h('li', null, 'On-device AI, if you turn it on: models download once from Hugging Face, and the engine from jsDelivr. After that, summaries and answers are worked out on this device and nothing you read or ask is sent anywhere.'),
         h('li', null, 'History, saved results and pages stay on this device.'),
       ),

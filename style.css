@@ -224,7 +224,8 @@ button.link {
   margin: 0 0 6px;
   font-size: 0.95rem;
 }
-.weather .big {
+.weather .big,
+.conv .big {
   font-size: 1.6rem;
   margin: 0;
 }
@@ -709,3 +710,31 @@ pre.report {
 /* AI page: the prompt and answer limit fields on a model card */
 .limits label { display: inline-block; margin-right: 0.8em; }
 .limits input.num { width: 5.5em; font: inherit; font-size: 16px; }
+
+/* ---------- conversion, places and Wikipedia sections ---------- */
+.conv .big {
+  overflow-wrap: anywhere;
+}
+.places ul.plain li {
+  line-height: 1.45;
+}
+.places .open {
+  color: var(--ok, #1d7a3a);
+}
+.places .closed {
+  color: var(--muted);
+}
+.quick {
+  margin: 4px 0 10px;
+}
+.wiki-slot {
+  margin: 8px 0;
+}
+.wiki-slot > .button {
+  display: block;
+  width: 100%;
+  text-align: left;
+}
+.wiki-hint {
+  margin: 14px 0;
+}

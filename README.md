@@ -10,6 +10,9 @@ It works because every service it reads sends CORS headers, so a web page may ca
 | Instant answers | DuckDuckGo Instant Answer API | none |
 | Reader view | [Jina Reader](https://jina.ai/reader) (`r.jina.ai`) | optional: works without one at 20 pages a minute, but Jina refuses anonymous requests from some networks with a 401. A free key from jina.ai, pasted into Settings, fixes that. |
 | Weather | Open-Meteo (forecast, place lookup, air quality) | none |
+| Wikipedia articles | Wikipedia's own API (`*.wikipedia.org/w/api.php`) | none. The opening section and the list of sections load first (about 3–10 KB); other sections load when tapped; tables come through. Jina is used for every other site, and as the fallback. |
+| Exchange rates | [Frankfurter](https://frankfurter.dev) (European Central Bank reference rates) | none. One download of about 0.5 KB on the wire serves every pair for 6 hours, and offline from the saved copy. |
+| Nearby places | OpenStreetMap through Overpass (two servers), then Nominatim as a fallback | none. Overpass is often at capacity, so Nominatim usually answers. |
 | Archived copies | Internet Archive availability lookup (`archive.org/wayback/available`) | none to find a copy; reading it in the app needs a Jina key, because Jina refuses anonymous requests for archive.org |
 | On-device AI (optional) | Models from Hugging Face, the engine (Transformers.js 4.3.0, ONNX Runtime Web) from jsDelivr: downloaded once, only when you tap Download | none |
 
@@ -22,6 +25,9 @@ DuckDuckGo's own results pages can't be read by a web page. The app opens them i
 - **Cards:** an instant-answer card (Wikipedia abstracts, definitions, simple answers) and a weather card for `weather`, `weather in Leeds` or `paris weather`.
 - **Weather, basic by default:** temperature and what it feels like, rain in the next hour (15-minute steps), and 3 days, in about 0.5 KB. **More weather** on the card fetches the rest only when tapped, about 1.2 KB more: wind direction and gusts, humidity, cloud, visibility, pressure, UV, sunrise and sunset, air quality (US scale with °F, European otherwise), 24 hours (every 3 hours, or every hour with a tap) and 7 days. Both are kept on the device for 30 minutes. Settings can make the card always show everything.
 - **Archived copies:** when the reader can't load a page, the app asks the Internet Archive (about 0.2 KB) for its latest copy and offers it. Every reader page also has an **Archived copy** button that only looks when tapped. With a Jina key the copy opens in the reader as text. Without one it opens in Safari, at full size. The archive's lookup sometimes misses copies, or refuses when asked too often, so a direct link to the archive is always offered as well.
+- **Conversions:** `50 eur to usd`, `$20 in pounds`, `5 miles to km`, `72 f in c`, `500 mb to gb` show a card above the results. Units are worked out on the device and download nothing. Currency uses ECB rates, shown with their date.
+- **Nearby places:** `coffee near me`, `pharmacy near Leeds`, `Tesco near me` (and a "Near you" row on the home page) list the 10 closest places with distance, direction, address, "open until 18:00" where OpenStreetMap has opening hours (only for places near you, using the device clock), Map, Call and Website links. Saved for an hour. Your coordinates go to the OpenStreetMap servers.
+- **Wikipedia by section:** a Wikipedia link in the reader loads the opening section and an infobox summary, then a button per section; each loads only when tapped and is kept on the device. "Load the whole article" gets the rest. Turn it off in Settings to use Jina for Wikipedia too.
 - **On-device AI (optional, off until you download a model):** see below.
 - **Offline:**
   - The app opens from the service worker cache.
@@ -127,6 +133,8 @@ There is no server of yours involved, so each service sees only its own part:
 - DuckDuckGo sees them too when instant answers are on;
 - Jina sees the addresses of pages you open in reader view;
 - Open-Meteo sees the places you ask about, or your coordinates for plain `weather`;
+- Wikipedia sees the article titles you open (instead of Jina);
+- Overpass or Nominatim see your coordinates (or the place you named) for "near me" searches; Frankfurter sees only that you asked for rates;
 - the Internet Archive sees the address of a page when you ask for an archived copy;
 - Hugging Face and jsDelivr see that you downloaded the AI files, once. The AI itself sends nothing anywhere.
 
@@ -139,6 +147,7 @@ History, cached results and saved pages stay on the device. The page's Content-S
 | `index.html` | Shell, iOS meta tags, CSP |
 | `js/app.js` | Views (home, results, reader, network, settings), activity log, bottom bar, routing, offline queue |
 | `js/net.js` | Measured requests: timings, sizes, progress events, app-load figures |
+| `js/convert.js`, `js/places.js`, `js/wiki.js` | Pure logic for conversions and rates, nearby places and opening hours, Wikipedia's API and HTML-to-Markdown. Tested in `test/` |
 | `js/lib.js` | Pure logic: engine URLs and parsers, instant answers, weather, Jina and Markdown parsing. Tested in `test/` |
 | `js/store.js` | IndexedDB (kv, results, pages) and eviction |
 | `sw.js` | App-shell cache with a background refresh |
