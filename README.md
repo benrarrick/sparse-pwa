@@ -23,6 +23,7 @@ DuckDuckGo's own results pages can't be read by a web page. The app opens them i
 
 - **Results:** title, address and snippet, about 4–8 KB per search. If the chosen engine fails or finds nothing, the next one is tried. An engine that failed is skipped for 5 minutes.
 - **Reader view:** tapping a result opens the page as text through Jina Reader. Links inside it open in the reader too. "Open original ↗" opens the real site. A Wikipedia article arrives as about 28 KB.
+- **Easier reading:** the reader tidies the text with fixed rules (no AI, nothing downloaded): links in the text are quiet (dotted underline), runs of link-only lines such as menus, "related" lists and share bars fold into a collapsed "N links", addresses used as link text are shortened, and paragraphs over about 700 characters are split at sentence ends (not at `Dr.`, `U.S.` or initials). The **Display** fold on each page sets text size, serif or sans, links in the text (off gathers them in a list at the end) and **Tidy** (off shows the page exactly as Jina sent it).
 - **Cards:** an instant-answer card (Wikipedia abstracts, definitions, simple answers) and a weather card for `weather`, `weather in Leeds` or `paris weather`.
 - **Weather, basic by default:** temperature and what it feels like, rain in the next hour (15-minute steps), and 3 days, in about 0.5 KB. **More weather** on the card fetches the rest only when tapped, about 1.2 KB more: wind direction and gusts, humidity, cloud, visibility, pressure, UV, sunrise and sunset, air quality (US scale with °F, European otherwise), 24 hours (every 3 hours, or every hour with a tap) and 7 days. Both are kept on the device for 30 minutes. Settings can make the card always show everything.
 - **Archived copies:** when the reader can't load a page, the app asks the Internet Archive (about 0.2 KB) for its latest copy and offers it. Every reader page also has an **Archived copy** button that only looks when tapped. With a Jina key the copy opens in the reader as text. Without one it opens in Safari, at full size. The archive's lookup sometimes misses copies, or refuses when asked too often, so a direct link to the archive is always offered as well.
@@ -154,7 +155,7 @@ History, cached results and saved pages stay on the device. The page's Content-S
 | `js/net.js` | Measured requests: timings, sizes, progress events, app-load figures |
 | `js/speed.js`, `speedtest/` | The speed test: latency, then 250 KB, then 1 MB only on a fast link. `speedtest/` holds random (incompressible) files of those exact sizes |
 | `js/convert.js`, `js/places.js`, `js/wiki.js` | Pure logic for conversions and rates, nearby places and opening hours, Wikipedia's API and HTML-to-Markdown. Tested in `test/` |
-| `js/lib.js` | Pure logic: engine URLs and parsers, instant answers, weather, Jina and Markdown parsing. Tested in `test/` |
+| `js/lib.js` | Pure logic: engine URLs and parsers, instant answers, weather, Jina and Markdown parsing, reader tidy-up. Tested in `test/` |
 | `js/store.js` | IndexedDB (kv, results, pages) and eviction |
 | `sw.js` | App-shell cache with a background refresh |
 | `manifest.webmanifest`, `icons/` | Home-screen install |

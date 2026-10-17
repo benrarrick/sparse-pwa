@@ -926,3 +926,147 @@ export function trimNav(blocks) {
   const first = blocks.findIndex((b) => !linkOnly(b));
   return first < 0 ? blocks : blocks.slice(first);
 }
+
+// ---------- Reader tidy-up ----------
+// Deterministic clean-ups on parsed blocks: no network, no AI, same input gives the same output.
+
+const NOT_SENTENCE_END = new Set(
+  'mr mrs ms dr prof sr jr st mt vs etc inc ltd co corp no nos fig figs approx cf al eg ie jan feb mar apr jun jul aug sep sept oct nov dec vol pp ed eds rev gen sen rep gov lt col sgt capt'.split(' '),
+);
+
+/** Offsets in `text` where a new sentence starts, skipping abbreviations, initials and things like "U.S.". */
+export function sentenceStarts(text) {
+  const out = [];
+  const re = /([.!?]["'”’)\]]*)\s+(?=["“‘'(\[]?[A-Z0-9])/g;
+  for (let m; (m = re.exec(text)); ) {
+    if (m[1][0] === '.') {
+      const word = /(\S+)$/.exec(text.slice(0, m.index))?.[1] ?? '';
+      const bare = word.replace(/^["“‘'(\[]+/, '');
+      if (NOT_SENTENCE_END.has(bare.toLowerCase())) continue;
+      if (/^[A-Z]$/.test(bare)) continue; // an initial: "J. Smith"
+      if (/^(?:[A-Za-z]\.)+[A-Za-z]$/.test(bare)) continue; // "U.S", "e.g", "i.e"
+    }
+    out.push(m.index + m[0].length);
+  }
+  return out;
+}
+
+/** The part of an inline tree covering text offsets [from, to), keeping bold, italic and link wrappers. */
+export function sliceInline(nodes, from, to) {
+  const out = [];
+  let pos = 0;
+  for (const n of nodes) {
+    const len = inlineText([n]).length;
+    const s = pos;
+    pos += len;
+    if (pos <= from || s >= to) continue;
+    const a = Math.max(from, s) - s;
+    const b = Math.min(to, s + len) - s;
+    if (n.t === 'text' || n.t === 'code') out.push({ ...n, s: n.s.slice(a, b) });
+    else out.push({ ...n, c: sliceInline(n.c, a, b) });
+  }
+  return out;
+}
+
+/**
+ * Splits a long paragraph into chunks of roughly `target` characters at sentence ends.
+ * Paragraphs under `max` characters, and paragraphs with no clear sentence ends, come back as they were.
+ */
+export function splitParagraph(block, { max = 700, target = 350, minTail = 150 } = {}) {
+  const text = inlineText(block.c);
+  if (text.length <= max) return [block];
+  const cuts = [];
+  let last = 0;
+  for (const at of sentenceStarts(text)) {
+    if (at - last >= target && text.length - at >= minTail) {
+      cuts.push(at);
+      last = at;
+    }
+  }
+  if (!cuts.length) return [block];
+  const edges = [0, ...cuts, text.length];
+  return edges.slice(0, -1).map((from, i) => ({ type: 'p', c: sliceInline(block.c, from, edges[i + 1]) }));
+}
+
+function countLinks(nodes) {
+  return nodes.reduce((n, x) => n + (x.t === 'link' ? 1 : x.c ? countLinks(x.c) : 0), 0);
+}
+
+function blockLinks(b) {
+  if (b.type === 'p' || b.type === 'quote') return countLinks(b.c);
+  if (b.type === 'list') return b.items.reduce((n, it) => n + countLinks(it.c), 0);
+  if (b.type === 'table') return b.rows.reduce((n, r) => n + r.reduce((m, c) => m + countLinks(c), 0), 0);
+  return 0;
+}
+
+/**
+ * Gathers runs of link-only blocks (menus, "related" lists, footers) into {type:'links', blocks, count}
+ * so they can be shown collapsed. Runs with fewer than `min` links stay as they are, and so does a page
+ * that would be left with almost nothing else (a link index is the content there).
+ */
+export function foldLinkRuns(blocks, { min = 3 } = {}) {
+  const out = [];
+  let run = [];
+  const close = () => {
+    const count = run.reduce((n, b) => n + blockLinks(b), 0);
+    if (count >= min) out.push({ type: 'links', blocks: run, count });
+    else out.push(...run);
+    run = [];
+  };
+  for (const b of blocks) {
+    if (b.type !== 'hr' && linkOnly(b)) run.push(b);
+    else {
+      close();
+      out.push(b);
+    }
+  }
+  close();
+  return out.filter((b) => b.type !== 'links').length >= 3 ? out : blocks;
+}
+
+/** A link whose text is a bare address, shortened to host and path: "https://www.a.example/x/y?z=1" → "a.example/x/y". */
+export function linkLabel(text, max = 40) {
+  const t = String(text).trim();
+  if (!/^(?:https?:\/\/|www\.)\S+$/i.test(t)) return text;
+  const bare = t.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  return bare.length > max ? `${bare.slice(0, max - 1)}…` : bare;
+}
+
+/** Every distinct link in the running text, in order: [{href, label}]. Folded link lists are skipped: they show their own. */
+export function collectLinks(blocks) {
+  const seen = new Map();
+  const walk = (nodes) => {
+    for (const n of nodes) {
+      if (n.t === 'link') {
+        if (!seen.has(n.href)) seen.set(n.href, linkLabel(inlineText(n.c).trim()) || n.href);
+      } else if (n.c) walk(n.c);
+    }
+  };
+  for (const b of blocks) {
+    if (b.type === 'p' || b.type === 'quote') walk(b.c);
+    else if (b.type === 'list') b.items.forEach((it) => walk(it.c));
+    else if (b.type === 'table') b.rows.forEach((r) => r.forEach(walk));
+  }
+  return [...seen].map(([href, label]) => ({ href, label }));
+}
+
+function relabel(nodes) {
+  return nodes.map((n) => {
+    if (n.t === 'link' && n.c.length === 1 && n.c[0].t === 'text') return { ...n, c: [{ t: 'text', s: linkLabel(n.c[0].s) }] };
+    return n.c ? { ...n, c: relabel(n.c) } : n;
+  });
+}
+
+function relabelBlock(b) {
+  if (b.type === 'p' || b.type === 'quote') return { ...b, c: relabel(b.c) };
+  if (b.type === 'list') return { ...b, items: b.items.map((it) => ({ ...it, c: relabel(it.c) })) };
+  if (b.type === 'table') return { ...b, rows: b.rows.map((r) => r.map(relabel)) };
+  return b;
+}
+
+/** Folds link clutter, shortens bare-address link text, then splits wall-of-text paragraphs. */
+export function tidyBlocks(blocks) {
+  return foldLinkRuns(blocks)
+    .map((b) => (b.type === 'links' ? { ...b, blocks: b.blocks.map(relabelBlock) } : relabelBlock(b)))
+    .flatMap((b) => (b.type === 'p' ? splitParagraph(b) : [b]));
+}

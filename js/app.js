@@ -9,7 +9,7 @@
 // Every screen narrates what it is doing in an activity log, and every request is measured (net.js).
 // Shown on the home page so you can tell which build a phone is really running (the offline cache can lag a visit or two behind).
 // BUMP THIS WITH EVERY CHANGE: 2.0 -> 2.1 for a small change, 3.0 for a big one. See CLAUDE.md.
-const APP_VERSION = '4.2';
+const APP_VERSION = '4.3';
 import * as L from './lib.js';
 import * as N from './net.js';
 import * as S from './store.js';
@@ -39,6 +39,10 @@ const DEFAULTS = {
   wikipedia: true,
   aiModel: 'lfm350',
   aiAutoSummary: false,
+  readerSize: 1,
+  readerSerif: false,
+  readerLinks: true,
+  readerTidy: true,
 };
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
@@ -630,22 +634,25 @@ function snippetNodes(snippet) {
   return snippet.map((s) => (s.bold ? h('b', null, s.text) : s.text));
 }
 
-function inlineNodes(nodes, pageUrl, mapHref = (x) => x) {
+function inlineNodes(nodes, pageUrl, mapHref = (x) => x, plain = false) {
   const same = (a) => a.split('#')[0] === pageUrl.split('#')[0];
+  const sub = (c) => inlineNodes(c, pageUrl, mapHref, plain);
   return nodes.map((n) => {
     if (n.t === 'text') return n.s;
     if (n.t === 'code') return h('code', null, n.s);
-    if (n.t === 'b') return h('strong', null, inlineNodes(n.c, pageUrl, mapHref));
-    if (n.t === 'i') return h('em', null, inlineNodes(n.c, pageUrl, mapHref));
-    if (same(n.href)) return h('span', null, inlineNodes(n.c, pageUrl, mapHref));
-    return h('a', { href: hashFor('/r', { u: mapHref(n.href) }) }, inlineNodes(n.c, pageUrl, mapHref));
+    if (n.t === 'b') return h('strong', null, sub(n.c));
+    if (n.t === 'i') return h('em', null, sub(n.c));
+    if (plain || same(n.href)) return h('span', null, sub(n.c));
+    return h('a', { href: hashFor('/r', { u: mapHref(n.href) }) }, sub(n.c));
   });
 }
 
-function blockNodes(blocks, pageUrl, mapHref) {
-  const inl = (c) => inlineNodes(c, pageUrl, mapHref);
+function blockNodes(blocks, pageUrl, mapHref, plain = false) {
+  const inl = (c) => inlineNodes(c, pageUrl, mapHref, plain);
   return blocks.map((b) => {
     switch (b.type) {
+      case 'links':
+        return h('details', { class: 'link-fold' }, h('summary', null, plural(b.count, 'link')), blockNodes(b.blocks, pageUrl, mapHref));
       case 'h':
         return h(`h${Math.min(6, b.level + 1)}`, null, inl(b.c));
       case 'p':
@@ -1794,13 +1801,49 @@ function wikiView(rec, url, act, rerender) {
   return nodes;
 }
 
+const READER_SIZES = ['Small', 'Normal', 'Large', 'Larger', 'Largest'];
+const readerClass = () => `reader group size-${settings.readerSize}${settings.readerSerif ? ' serif' : ''}`;
+
+/** The reader's "Display" fold: text size, serif, links in the text, tidy-up. `redraw` is null for Wikipedia pages. */
+function readerOptions(redraw, article) {
+  const btn = (label, title) => h('button', { type: 'button', class: 'button secondary small', title }, label);
+  const smaller = btn('A−', 'Smaller text');
+  const larger = btn('A+', 'Larger text');
+  const serif = btn('', 'Serif or sans-serif text');
+  const links = btn('', 'Show links in the text, or gather them in a list at the end');
+  const tidy = btn('', 'Folds menus and link lists, splits very long paragraphs and shortens addresses used as link text');
+  const size = h('span', { class: 'muted small' });
+  const sync = () => {
+    article.className = readerClass();
+    smaller.disabled = settings.readerSize <= 0;
+    larger.disabled = settings.readerSize >= READER_SIZES.length - 1;
+    size.textContent = READER_SIZES[settings.readerSize];
+    serif.textContent = settings.readerSerif ? 'Serif ✓' : 'Serif';
+    links.textContent = settings.readerLinks ? 'Links in text ✓' : 'Links in text';
+    tidy.textContent = settings.readerTidy ? 'Tidy ✓' : 'Tidy';
+    for (const b of [serif, links, tidy]) b.setAttribute('aria-pressed', String(b.textContent.endsWith('✓')));
+  };
+  const set = async (key, value, again) => {
+    await saveSetting(key, value);
+    sync();
+    if (again && redraw) redraw();
+  };
+  smaller.addEventListener('click', () => set('readerSize', Math.max(0, settings.readerSize - 1)));
+  larger.addEventListener('click', () => set('readerSize', Math.min(READER_SIZES.length - 1, settings.readerSize + 1)));
+  serif.addEventListener('click', () => set('readerSerif', !settings.readerSerif));
+  links.addEventListener('click', () => set('readerLinks', !settings.readerLinks, true));
+  tidy.addEventListener('click', () => set('readerTidy', !settings.readerTidy, true));
+  sync();
+  return h('details', { class: 'reader-opts' }, h('summary', null, 'Display'), h('div', { class: 'reader-controls' }, smaller, larger, size, serif, redraw ? [links, tidy] : null));
+}
+
 async function showRead(id, raw, reload = false) {
   const url = L.safeHttpUrl(raw);
   const arch = url ? L.parseWaybackUrl(url) : null;
   const host = arch ? `${L.hostOf(arch.original)} (archived ${formatDate(arch.at)})` : url ? L.hostOf(url) : '';
   const act = activity(`Opening ${host || 'page'}…`);
   const status = h('div', { class: 'status' });
-  const article = h('article', { class: 'reader group' });
+  const article = h('article', { class: readerClass() });
   render(topbar(''), act.el, status, article);
   if (!url) {
     act.warn('That is not a web address this app can open');
@@ -1835,7 +1878,8 @@ async function showRead(id, raw, reload = false) {
       setNow(rec.saved ? 'Page kept on this device until you unsave it' : 'Page may now be cleared after 30 days');
     });
     act.step('Turning the text into a page…');
-    const blocks = L.trimNav(L.parseMarkdown(rec.markdown, rec.source || url));
+    const parsed = L.trimNav(L.parseMarkdown(rec.markdown, rec.source || url));
+    let blocks = parsed;
     const box = h('div', { class: 'archive card', hidden: true });
     const summary = h('div', { class: 'ai-out card', hidden: true });
     const sumBtn = AI.anyChat(settings.aiModel) ? h('button', { type: 'button', class: 'button secondary small', onclick: () => summarise(rec, url, summary, act, id, { redo: !summary.hidden }) }, 'Summarise') : null;
@@ -1845,6 +1889,31 @@ async function showRead(id, raw, reload = false) {
       box.hidden = false;
       archiveOffer(box, url, act, id);
     });
+    const mapHref = arch ? (href) => L.unarchiveLink(href, arch.original) : undefined;
+    const body = h('div', { class: 'reader-body' });
+    const drawBody = () => {
+      blocks = settings.readerTidy ? L.tidyBlocks(parsed) : parsed;
+      const plain = !settings.readerLinks;
+      const links = plain ? L.collectLinks(blocks) : [];
+      fill(
+        body,
+        rec.wiki
+          ? wikiView(rec, url, act, () => showPage(rec, { fromDevice: true, note: 'The whole article is loaded.' }))
+          : blocks.length
+            ? [
+                blockNodes(blocks, url, mapHref, plain),
+                links.length
+                  ? h(
+                      'details',
+                      { class: 'link-fold' },
+                      h('summary', null, `${plural(links.length, 'link')} in the text`),
+                      h('ul', null, links.map((l) => h('li', null, h('a', { href: hashFor('/r', { u: mapHref ? mapHref(l.href) : l.href }) }, l.label)))),
+                    )
+                  : null,
+              ]
+            : h('p', { class: 'muted' }, 'The reader found no text on this page. Try opening the original.'),
+      );
+    };
     fill(
       article,
       h('h1', null, rec.title),
@@ -1861,13 +1930,11 @@ async function showRead(id, raw, reload = false) {
       ),
       box,
       summary,
-      rec.wiki
-        ? wikiView(rec, url, act, () => showPage(rec, { fromDevice: true, note: 'The whole article is loaded.' }))
-        : blocks.length
-          ? blockNodes(blocks, url, arch ? (href) => L.unarchiveLink(href, arch.original) : undefined)
-          : h('p', { class: 'muted' }, 'The reader found no text on this page. Try opening the original.'),
+      readerOptions(rec.wiki ? null : drawBody, article),
+      body,
     );
-    act.ok(`Showing ${plural(blocks.length, 'block')} of text (menus at the top removed)`);
+    drawBody();
+    act.ok(`Showing ${plural(blocks.length, 'block')} of text (menus at the top removed${blocks.some((b) => b.type === 'links') ? ', link lists folded' : ''})`);
     settle();
     if (sumBtn) summarise(rec, url, summary, act, id, { auto: settings.aiAutoSummary && !fromDevice && AI.autoAllowed(), cachedOnly: !(settings.aiAutoSummary && !fromDevice && AI.autoAllowed()) });
   };
